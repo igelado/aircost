@@ -29,6 +29,7 @@ pub(crate) struct ExactControllerLeadingDualEvidenceProof {
     plugin_submission_id: i64,
     source_url: String,
     rendered_html_sha256: String,
+    extracted_listing_sha256: String,
     evidence_text: String,
 }
 
@@ -43,6 +44,10 @@ impl ExactControllerLeadingDualEvidenceProof {
 
     pub(crate) fn rendered_html_sha256(&self) -> &str {
         &self.rendered_html_sha256
+    }
+
+    pub(crate) fn extracted_listing_sha256(&self) -> &str {
+        &self.extracted_listing_sha256
     }
 
     pub(crate) fn evidence_text(&self) -> &str {
@@ -74,6 +79,7 @@ pub(crate) fn exact_controller_leading_dual_evidence_proof(
     extraction_source: &str,
     plugin_submission_id: i64,
     rendered_html_sha256: &str,
+    extracted_listing_sha256: &str,
     observation: &ListingAvionicsEvidenceObservation<'_>,
 ) -> Option<ExactControllerLeadingDualEvidenceProof> {
     let manufacturer = match observation.manufacturer {
@@ -94,6 +100,7 @@ pub(crate) fn exact_controller_leading_dual_evidence_proof(
     if model.is_empty()
         || plugin_submission_id <= 0
         || !is_lowercase_sha256(rendered_html_sha256)
+        || !is_lowercase_sha256(extracted_listing_sha256)
         || observation.quantity != 2
         || observation.configuration_action != "installed"
         || observation.source_confidence != Some("medium")
@@ -135,6 +142,7 @@ pub(crate) fn exact_controller_leading_dual_evidence_proof(
         plugin_submission_id,
         source_url: source_url.to_string(),
         rendered_html_sha256: rendered_html_sha256.to_string(),
+        extracted_listing_sha256: extracted_listing_sha256.to_string(),
         evidence_text: evidence.to_string(),
     })
 }
@@ -2680,6 +2688,7 @@ mod tests {
             &extraction_source,
             7,
             &rendered_html_sha256,
+            &"0".repeat(64),
             &ListingAvionicsEvidenceObservation {
                 manufacturer,
                 model,

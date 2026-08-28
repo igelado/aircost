@@ -570,6 +570,7 @@ BEGIN
                                 'public.plugin_installs'
                               )
                               AND trigger_definition.tgname IN (
+                                'listing_avionics_authorizations_invalidate_install_provenance',
                                 'plugin_installs_active_replay_capture_identity_frozen',
                                 'plugin_installs_replay_identity_immutable'
                               )

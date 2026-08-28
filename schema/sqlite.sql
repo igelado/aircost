@@ -259,8 +259,8 @@ VALUES
 ('trigger:compatibility_projected_package_immutable_update', 'createtriggercompatibility_projected_package_immutable_updatebeforeupdateonaircraft_factory_packageswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_factory_package_id=old.id)beginselectraise(abort,''compatibility-projectedaircraftpackagesareimmutable'');end'),
 ('trigger:compatibility_projected_package_link_immutable_delete', 'createtriggercompatibility_projected_package_link_immutable_deletebeforedeleteonaircraft_package_applicabilitywhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_factory_package_id=old.aircraft_factory_package_idandprojection.aircraft_designation_id=old.aircraft_designation_idand(old.aircraft_generation_idisnullorprojection.aircraft_generation_id=old.aircraft_generation_id))beginselectraise(abort,''compatibility-projectedpackageapplicabilityisimmutable'');end'),
 ('trigger:compatibility_projected_package_link_immutable_update', 'createtriggercompatibility_projected_package_link_immutable_updatebeforeupdateonaircraft_package_applicabilitywhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_factory_package_id=old.aircraft_factory_package_idandprojection.aircraft_designation_id=old.aircraft_designation_idand(old.aircraft_generation_idisnullorprojection.aircraft_generation_id=old.aircraft_generation_id))beginselectraise(abort,''compatibility-projectedpackageapplicabilityisimmutable'');end'),
-('trigger:listing_avionics_authorizations_invalidate_capture_delete', 'createtriggerlisting_avionics_authorizations_invalidate_capture_deleteafterdeleteonplugin_submissionsbegindeletefromaircraft_sale_listing_avionics_link_authorizationswhereevidence_capture_sha256=old.rendered_html_sha256andexists(select1fromaircraft_sale_listing_avionicslinkwherelink.id=aircraft_sale_listing_avionics_link_authorizations.listing_link_idandlink.aircraft_sale_listing_id=old.canonical_listing_idandlength(trim(coalesce(link.source_notes,'''')))>0andinstr(old.rendered_html,link.source_notes)>0andnotexists(select1fromplugin_submissionsretained_capturewhereretained_capture.canonical_listing_id=link.aircraft_sale_listing_idandretained_capture.rendered_html_sha256=aircraft_sale_listing_avionics_link_authorizations.evidence_capture_sha256andinstr(retained_capture.rendered_html,link.source_notes)>0));end'),
-('trigger:listing_avionics_authorizations_invalidate_capture_update', 'createtriggerlisting_avionics_authorizations_invalidate_capture_updateafterupdateofcanonical_listing_id,rendered_html,rendered_html_sha256,extracted_listing_json,extraction_erroronplugin_submissionsbegindeletefromaircraft_sale_listing_avionics_link_authorizationswhereevidence_capture_sha256=old.rendered_html_sha256andexists(select1fromaircraft_sale_listing_avionicslinkwherelink.id=aircraft_sale_listing_avionics_link_authorizations.listing_link_idandlink.aircraft_sale_listing_id=old.canonical_listing_idandlength(trim(coalesce(link.source_notes,'''')))>0andinstr(old.rendered_html,link.source_notes)>0andnotexists(select1fromplugin_submissionsretained_capturewhereretained_capture.canonical_listing_id=link.aircraft_sale_listing_idandretained_capture.rendered_html_sha256=aircraft_sale_listing_avionics_link_authorizations.evidence_capture_sha256andinstr(retained_capture.rendered_html,link.source_notes)>0));deletefromaircraft_sale_listing_avionics_link_authorizationswhereauthorization_kind=''same_case_grounded''andplugin_submission_id=old.id;end'),
+('trigger:listing_avionics_authorizations_invalidate_capture_delete', 'createtriggerlisting_avionics_authorizations_invalidate_capture_deleteafterdeleteonplugin_submissionsbegindeletefromaircraft_sale_listing_avionics_link_authorizationswhereplugin_submission_id=old.id;end'),
+('trigger:listing_avionics_authorizations_invalidate_capture_update', 'createtriggerlisting_avionics_authorizations_invalidate_capture_updateafterupdateofuser_id,plugin_install_id,source_url,submitted_at,signature_base64,canonical_listing_id,rendered_html,rendered_html_sha256,extracted_listing_json,extraction_erroronplugin_submissionswhennot(new.user_idisold.user_id)ornot(new.plugin_install_idisold.plugin_install_id)ornot(new.source_urlisold.source_url)ornot(new.submitted_atisold.submitted_at)ornot(new.signature_base64isold.signature_base64)ornot(new.canonical_listing_idisold.canonical_listing_id)ornot(new.rendered_htmlisold.rendered_html)ornot(new.rendered_html_sha256isold.rendered_html_sha256)ornot(new.extracted_listing_jsonisold.extracted_listing_json)ornot(new.extraction_errorisold.extraction_error)begindeletefromaircraft_sale_listing_avionics_link_authorizationswhereplugin_submission_id=old.id;end'),
 ('trigger:listing_avionics_authorizations_invalidate_model_proof_update', 'createtriggerlisting_avionics_authorizations_invalidate_model_proof_updateafterupdateofavionics_manufacturer_id,name,normalized_name,catalog_status,manufacturer_identifier_kind,manufacturer_identifier,normalized_manufacturer_identifier,identity_source_url,identity_source_title,identity_evidence_textonavionics_modelsbegindeletefromaircraft_sale_listing_avionics_link_authorizationswhereauthorization_kind=''same_case_grounded''andavionics_model_id=old.id;end'),
 ('trigger:official_dollar_normalization_immutable_delete', 'createtriggerofficial_dollar_normalization_immutable_deletebeforedeleteonofficial_dollar_normalization_factsbeginselectraise(abort,''officialdollarnormalizationfactsareimmutable'');end'),
 ('trigger:official_dollar_normalization_immutable_update', 'createtriggerofficial_dollar_normalization_immutable_updatebeforeupdateonofficial_dollar_normalization_factsbeginselectraise(abort,''officialdollarnormalizationfactsareimmutable'');end'),
@@ -8324,8 +8324,10 @@ BEGIN
 END;
 
 -- Exact authorization for one listing-link component. Manufacturer-reuse
--- authorizations bind the current global attestation; same-case authorizations
--- bind the transient grounded resolution that approved this exact association.
+-- authorizations require both the current global attestation and the exact
+-- signed submission/capture/checkpoint occurrence. Same-case authorizations
+-- bind that exact checkpoint plus the transient grounded resolution.
+-- Consumers re-hash extracted_listing_json because SQLite cannot do so here.
 CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_link_authorizations (
     listing_link_id INTEGER NOT NULL
       REFERENCES aircraft_sale_listing_avionics(id) ON DELETE CASCADE,
@@ -8339,9 +8341,9 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_link_authorizations (
     product_fingerprint TEXT NOT NULL,
     grounded_resolution_sha256 TEXT,
     evidence_capture_sha256 TEXT NOT NULL,
-    plugin_submission_id INTEGER
+    plugin_submission_id INTEGER NOT NULL
       REFERENCES plugin_submissions(id) ON DELETE CASCADE,
-    extracted_listing_sha256 TEXT,
+    extracted_listing_sha256 TEXT NOT NULL,
     collision_closure_sha256 TEXT NOT NULL,
     source_revocation_count INTEGER,
     authorized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -8355,27 +8357,23 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_link_authorizations (
     CHECK (length(evidence_capture_sha256) = 64),
     CHECK (evidence_capture_sha256 = lower(evidence_capture_sha256)),
     CHECK (evidence_capture_sha256 NOT GLOB '*[^0-9a-f]*'),
-    CHECK (extracted_listing_sha256 IS NULL OR (
+    CHECK (
       length(extracted_listing_sha256) = 64
       AND extracted_listing_sha256 = lower(extracted_listing_sha256)
       AND extracted_listing_sha256 NOT GLOB '*[^0-9a-f]*'
-    )),
+    ),
     CHECK (length(collision_closure_sha256) = 64),
     CHECK (collision_closure_sha256 = lower(collision_closure_sha256)),
     CHECK (collision_closure_sha256 NOT GLOB '*[^0-9a-f]*'),
     CHECK (
       (authorization_kind = 'manufacturer_reuse'
         AND grounded_resolution_sha256 IS NULL
-        AND plugin_submission_id IS NULL
-        AND extracted_listing_sha256 IS NULL
         AND source_revocation_count IS NULL)
       OR
       (authorization_kind = 'same_case_grounded'
         AND length(grounded_resolution_sha256) = 64
         AND grounded_resolution_sha256 = lower(grounded_resolution_sha256)
         AND grounded_resolution_sha256 NOT GLOB '*[^0-9a-f]*'
-        AND plugin_submission_id IS NOT NULL
-        AND extracted_listing_sha256 IS NOT NULL
         AND source_revocation_count IS NOT NULL
         AND source_revocation_count >= 0)
     )
@@ -8407,10 +8405,50 @@ WHEN NOT EXISTS (
     AND (
       (NEW.authorization_kind = 'manufacturer_reuse'
         AND EXISTS (
-          SELECT 1 FROM plugin_submissions capture
-          WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
+          SELECT 1
+          FROM plugin_submissions capture
+          JOIN plugin_installs install
+            ON install.id = capture.plugin_install_id
+           AND install.user_id = capture.user_id
+          WHERE capture.id = NEW.plugin_submission_id
+            AND capture.canonical_listing_id = link.aircraft_sale_listing_id
+            AND EXISTS (
+              SELECT 1 FROM aircraft_sale_listings listing
+              WHERE listing.id = link.aircraft_sale_listing_id
+                AND listing.created_by_user_id = capture.user_id
+                AND listing.source_url = capture.source_url
+            )
             AND capture.rendered_html_sha256 = NEW.evidence_capture_sha256
-            AND instr(capture.rendered_html, link.source_notes) > 0
+            AND capture.extracted_listing_json IS NOT NULL
+            AND capture.extraction_error IS NULL
+            AND julianday(install.created_at) IS NOT NULL
+            AND julianday(capture.submitted_at) IS NOT NULL
+            AND julianday(capture.submitted_at) >= julianday(install.created_at)
+            AND (
+              install.revoked_at IS NULL
+              OR (
+                julianday(install.revoked_at) IS NOT NULL
+                AND julianday(install.revoked_at) >= julianday(install.created_at)
+                AND julianday(capture.submitted_at) <= julianday(install.revoked_at)
+              )
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM json_each(
+                CASE WHEN json_valid(capture.extracted_listing_json)
+                  THEN capture.extracted_listing_json
+                  ELSE '{"avionics":[]}'
+                END,
+                '$.avionics'
+              ) occurrence
+              WHERE occurrence.type = 'object'
+                AND json_extract(
+                  CASE WHEN occurrence.type = 'object'
+                    THEN occurrence.value ELSE '{}'
+                  END,
+                  '$.source_evidence_text'
+                ) = link.source_notes
+            )
         )
         AND EXISTS (
           SELECT 1 FROM avionics_product_reuse_attestations attestation
@@ -8420,13 +8458,50 @@ WHEN NOT EXISTS (
       OR
       (NEW.authorization_kind = 'same_case_grounded'
         AND EXISTS (
-          SELECT 1 FROM plugin_submissions submission
+          SELECT 1
+          FROM plugin_submissions submission
+          JOIN plugin_installs install
+            ON install.id = submission.plugin_install_id
+           AND install.user_id = submission.user_id
           WHERE submission.id = NEW.plugin_submission_id
             AND submission.canonical_listing_id = link.aircraft_sale_listing_id
+            AND EXISTS (
+              SELECT 1 FROM aircraft_sale_listings listing
+              WHERE listing.id = link.aircraft_sale_listing_id
+                AND listing.created_by_user_id = submission.user_id
+                AND listing.source_url = submission.source_url
+            )
             AND submission.rendered_html_sha256 = NEW.evidence_capture_sha256
             AND submission.extracted_listing_json IS NOT NULL
             AND submission.extraction_error IS NULL
-            AND instr(submission.rendered_html, link.source_notes) > 0
+            AND julianday(install.created_at) IS NOT NULL
+            AND julianday(submission.submitted_at) IS NOT NULL
+            AND julianday(submission.submitted_at) >= julianday(install.created_at)
+            AND (
+              install.revoked_at IS NULL
+              OR (
+                julianday(install.revoked_at) IS NOT NULL
+                AND julianday(install.revoked_at) >= julianday(install.created_at)
+                AND julianday(submission.submitted_at) <= julianday(install.revoked_at)
+              )
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM json_each(
+                CASE WHEN json_valid(submission.extracted_listing_json)
+                  THEN submission.extracted_listing_json
+                  ELSE '{"avionics":[]}'
+                END,
+                '$.avionics'
+              ) occurrence
+              WHERE occurrence.type = 'object'
+                AND json_extract(
+                  CASE WHEN occurrence.type = 'object'
+                    THEN occurrence.value ELSE '{}'
+                  END,
+                  '$.source_evidence_text'
+                ) = link.source_notes
+            )
         )
         AND EXISTS (
           SELECT 1 FROM avionics_approved_product_graph_identities identity
@@ -8592,56 +8667,82 @@ CREATE TRIGGER IF NOT EXISTS
 AFTER DELETE ON plugin_submissions
 BEGIN
   DELETE FROM aircraft_sale_listing_avionics_link_authorizations
-  WHERE evidence_capture_sha256 = OLD.rendered_html_sha256
-    AND EXISTS (
-      SELECT 1 FROM aircraft_sale_listing_avionics link
-      WHERE link.id =
-              aircraft_sale_listing_avionics_link_authorizations.listing_link_id
-        AND link.aircraft_sale_listing_id = OLD.canonical_listing_id
-        AND length(trim(COALESCE(link.source_notes, ''))) > 0
-        AND instr(OLD.rendered_html, link.source_notes) > 0
-        AND NOT EXISTS (
-          SELECT 1 FROM plugin_submissions retained_capture
-          WHERE retained_capture.canonical_listing_id =
-                  link.aircraft_sale_listing_id
-            AND retained_capture.rendered_html_sha256 =
-                  aircraft_sale_listing_avionics_link_authorizations.evidence_capture_sha256
-            AND instr(retained_capture.rendered_html, link.source_notes) > 0
-        )
-    );
+  WHERE plugin_submission_id = OLD.id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS
   listing_avionics_authorizations_invalidate_capture_update
 AFTER UPDATE OF
+  user_id,
+  plugin_install_id,
+  source_url,
+  submitted_at,
+  signature_base64,
   canonical_listing_id,
   rendered_html,
   rendered_html_sha256,
   extracted_listing_json,
   extraction_error
 ON plugin_submissions
+WHEN NOT (NEW.user_id IS OLD.user_id)
+  OR NOT (NEW.plugin_install_id IS OLD.plugin_install_id)
+  OR NOT (NEW.source_url IS OLD.source_url)
+  OR NOT (NEW.submitted_at IS OLD.submitted_at)
+  OR NOT (NEW.signature_base64 IS OLD.signature_base64)
+  OR NOT (NEW.canonical_listing_id IS OLD.canonical_listing_id)
+  OR NOT (NEW.rendered_html IS OLD.rendered_html)
+  OR NOT (NEW.rendered_html_sha256 IS OLD.rendered_html_sha256)
+  OR NOT (NEW.extracted_listing_json IS OLD.extracted_listing_json)
+  OR NOT (NEW.extraction_error IS OLD.extraction_error)
 BEGIN
   DELETE FROM aircraft_sale_listing_avionics_link_authorizations
-  WHERE evidence_capture_sha256 = OLD.rendered_html_sha256
-    AND EXISTS (
-      SELECT 1 FROM aircraft_sale_listing_avionics link
-      WHERE link.id =
-              aircraft_sale_listing_avionics_link_authorizations.listing_link_id
-        AND link.aircraft_sale_listing_id = OLD.canonical_listing_id
-        AND length(trim(COALESCE(link.source_notes, ''))) > 0
-        AND instr(OLD.rendered_html, link.source_notes) > 0
-        AND NOT EXISTS (
-          SELECT 1 FROM plugin_submissions retained_capture
-          WHERE retained_capture.canonical_listing_id =
-                  link.aircraft_sale_listing_id
-            AND retained_capture.rendered_html_sha256 =
-                  aircraft_sale_listing_avionics_link_authorizations.evidence_capture_sha256
-            AND instr(retained_capture.rendered_html, link.source_notes) > 0
-        )
-    );
+  WHERE plugin_submission_id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_listing_provenance
+AFTER UPDATE OF created_by_user_id, source_url ON aircraft_sale_listings
+WHEN NOT (NEW.created_by_user_id IS OLD.created_by_user_id)
+  OR NOT (NEW.source_url IS OLD.source_url)
+BEGIN
   DELETE FROM aircraft_sale_listing_avionics_link_authorizations
-  WHERE authorization_kind = 'same_case_grounded'
-    AND plugin_submission_id = OLD.id;
+  WHERE listing_link_id IN (
+    SELECT id FROM aircraft_sale_listing_avionics
+    WHERE aircraft_sale_listing_id = OLD.id
+  );
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_install_provenance
+AFTER UPDATE OF user_id, public_key_base64, created_at, revoked_at
+ON plugin_installs
+WHEN NOT (NEW.user_id IS OLD.user_id)
+  OR NOT (NEW.public_key_base64 IS OLD.public_key_base64)
+  OR NOT (NEW.created_at IS OLD.created_at)
+  OR NOT (NEW.revoked_at IS OLD.revoked_at)
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_link_authorizations
+  WHERE plugin_submission_id IN (
+    SELECT submission.id FROM plugin_submissions submission
+    WHERE submission.plugin_install_id = OLD.id
+      AND (
+        NOT (NEW.user_id IS OLD.user_id)
+        OR NOT (NEW.public_key_base64 IS OLD.public_key_base64)
+        OR NOT (NEW.created_at IS OLD.created_at)
+        OR (
+          NOT (NEW.revoked_at IS OLD.revoked_at)
+          AND NEW.revoked_at IS NOT NULL
+          AND (
+            julianday(NEW.created_at) IS NULL
+            OR julianday(NEW.revoked_at) IS NULL
+            OR julianday(NEW.revoked_at) < julianday(NEW.created_at)
+            OR julianday(submission.submitted_at) IS NULL
+            OR julianday(submission.submitted_at) < julianday(NEW.created_at)
+            OR julianday(submission.submitted_at) > julianday(NEW.revoked_at)
+          )
+        )
+      )
+  );
 END;
 
 

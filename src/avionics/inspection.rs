@@ -9,7 +9,6 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Postgres, Sqlite, Transaction};
 
 use crate::avionics::fingerprint::{
@@ -21,11 +20,13 @@ use crate::avionics::reuse::{
     countable_unit_reuse_attestation_is_current_sqlite,
 };
 use crate::db::{AppDb, DatabaseBackend};
+use crate::listing::replay::retained_capture_timestamp_chronology_valid;
 use crate::listing::review::{association_observation_sha256_from_values, ListingAssociationRole};
 use crate::normalize::{
     normalize_avionics_identifier, normalize_avionics_manufacturer_name,
     normalize_avionics_model_name, normalize_name,
 };
+use crate::plugin::{current_checkpoint_contains_avionics_source_evidence, sha256_hex};
 
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 200;
@@ -472,6 +473,8 @@ struct ExplicitCountAuthorizationRow {
     authorization_observation_sha256: Option<String>,
     authorization_product_fingerprint: Option<String>,
     authorization_evidence_capture_sha256: Option<String>,
+    authorization_plugin_submission_id: Option<i64>,
+    authorization_extracted_listing_sha256: Option<String>,
     authorization_collision_closure_sha256: Option<String>,
     current_attestation_product_fingerprint: Option<String>,
     ordinary_eligible_for_same_listing: bool,
@@ -484,28 +487,57 @@ struct ExplicitCountEligibility {
 }
 
 macro_rules! retained_listing_evidence_capture_is_current {
-    ($db:expr, $transaction:expr, $listing_id:expr, $expected_capture_sha256:expr, $evidence_text:expr) => {{
+    ($db:expr, $transaction:expr, $listing_id:expr, $plugin_submission_id:expr, $expected_capture_sha256:expr, $expected_checkpoint_sha256:expr, $evidence_text:expr) => {{
         if $evidence_text.trim().is_empty() {
             false
         } else {
             let sql = $db.sql(
                 r#"
-                SELECT rendered_html
-                FROM plugin_submissions
-                WHERE canonical_listing_id = ?
-                  AND rendered_html_sha256 = ?
+                SELECT submission.rendered_html, submission.extracted_listing_json,
+                       install.created_at, submission.submitted_at, install.revoked_at
+                FROM plugin_submissions submission
+                JOIN plugin_installs install
+                  ON install.id = submission.plugin_install_id
+                 AND install.user_id = submission.user_id
+                JOIN aircraft_sale_listings listing
+                  ON listing.id = submission.canonical_listing_id
+                 AND listing.created_by_user_id = submission.user_id
+                 AND listing.source_url = submission.source_url
+                WHERE submission.id = ?
+                  AND submission.canonical_listing_id = ?
+                  AND submission.rendered_html_sha256 = ?
+                  AND submission.extracted_listing_json IS NOT NULL
+                  AND submission.extraction_error IS NULL
                 "#,
             );
-            let captures = sqlx::query_scalar::<_, String>(&sql)
-                .bind($listing_id)
-                .bind($expected_capture_sha256)
-                .fetch_all(&mut **$transaction)
-                .await?;
-            captures.iter().any(|rendered_html| {
-                format!("{:x}", Sha256::digest(rendered_html.as_bytes()))
-                    == $expected_capture_sha256
-                    && rendered_html.contains($evidence_text)
-            })
+            let capture =
+                sqlx::query_as::<_, (String, String, String, String, Option<String>)>(&sql)
+                    .bind($plugin_submission_id)
+                    .bind($listing_id)
+                    .bind($expected_capture_sha256)
+                    .fetch_optional(&mut **$transaction)
+                    .await?;
+            capture.is_some_and(
+                |(
+                    rendered_html,
+                    checkpoint,
+                    install_created_at,
+                    submitted_at,
+                    install_revoked_at,
+                )| {
+                    sha256_hex(rendered_html.as_bytes()) == $expected_capture_sha256
+                        && sha256_hex(checkpoint.as_bytes()) == $expected_checkpoint_sha256
+                        && retained_capture_timestamp_chronology_valid(
+                            &install_created_at,
+                            &submitted_at,
+                            install_revoked_at.as_deref(),
+                        )
+                        && current_checkpoint_contains_avionics_source_evidence(
+                            &checkpoint,
+                            $evidence_text,
+                        )
+                },
+            )
         }
     }};
 }
@@ -514,14 +546,18 @@ async fn retained_listing_evidence_capture_is_current_sqlite(
     db: &AppDb,
     transaction: &mut Transaction<'_, Sqlite>,
     listing_id: i64,
+    plugin_submission_id: i64,
     expected_capture_sha256: &str,
+    expected_checkpoint_sha256: &str,
     evidence_text: &str,
 ) -> InspectionResult<bool> {
     Ok(retained_listing_evidence_capture_is_current!(
         db,
         transaction,
         listing_id,
+        plugin_submission_id,
         expected_capture_sha256,
+        expected_checkpoint_sha256,
         evidence_text
     ))
 }
@@ -530,14 +566,18 @@ async fn retained_listing_evidence_capture_is_current_postgres(
     db: &AppDb,
     transaction: &mut Transaction<'_, Postgres>,
     listing_id: i64,
+    plugin_submission_id: i64,
     expected_capture_sha256: &str,
+    expected_checkpoint_sha256: &str,
     evidence_text: &str,
 ) -> InspectionResult<bool> {
     Ok(retained_listing_evidence_capture_is_current!(
         db,
         transaction,
         listing_id,
+        plugin_submission_id,
         expected_capture_sha256,
+        expected_checkpoint_sha256,
         evidence_text
     ))
 }
@@ -605,18 +645,24 @@ macro_rules! explicit_count_eligibility_in_transaction {
             if !exact_shape || !exact_authorization || !observation_is_current {
                 continue;
             }
-            let capture_is_current = match row.authorization_evidence_capture_sha256.as_deref() {
-                Some(capture_sha256) => {
+            let capture_is_current = match (
+                row.authorization_evidence_capture_sha256.as_deref(),
+                row.authorization_plugin_submission_id,
+                row.authorization_extracted_listing_sha256.as_deref(),
+            ) {
+                (Some(capture_sha256), Some(plugin_submission_id), Some(checkpoint_sha256)) => {
                     $capture_is_current(
                         $db,
                         $transaction,
                         row.listing_id,
+                        plugin_submission_id,
                         capture_sha256,
+                        checkpoint_sha256,
                         source_notes,
                     )
                     .await?
                 }
-                None => false,
+                _ => false,
             };
             if !capture_is_current {
                 continue;
@@ -685,6 +731,10 @@ async fn load_explicit_count_eligibility(
           authorization.product_fingerprint AS authorization_product_fingerprint,
           authorization.evidence_capture_sha256
             AS authorization_evidence_capture_sha256,
+          authorization.plugin_submission_id
+            AS authorization_plugin_submission_id,
+          authorization.extracted_listing_sha256
+            AS authorization_extracted_listing_sha256,
           authorization.collision_closure_sha256
             AS authorization_collision_closure_sha256,
           attestation.product_fingerprint
@@ -2144,6 +2194,18 @@ mod tests {
     #[tokio::test]
     async fn explicit_count_usage_requires_its_complete_current_authorization() {
         const EVIDENCE: &str = "Dual Inspector Test VISIBLE-1 units installed";
+        const INSERT_AUTHORIZATION_SQL: &str = r#"
+            INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
+              listing_link_id, association_role, avionics_model_id,
+              authorization_kind, observation_sha256, product_fingerprint,
+              evidence_capture_sha256, plugin_submission_id,
+              extracted_listing_sha256, collision_closure_sha256
+            )
+            SELECT ?, 'installed', ?, 'manufacturer_reuse', ?,
+                   product_fingerprint, ?, ?, ?, ?
+            FROM avionics_product_reuse_attestations
+            WHERE avionics_model_id = ?
+        "#;
         let (db, current_user_id, _, avionics_id) = fixture_with_ready_listing(false).await;
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!("test uses SQLite")
@@ -2213,6 +2275,41 @@ mod tests {
 
         let rendered_html = format!("<html><body>{EVIDENCE}</body></html>");
         let evidence_capture_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
+        let checkpoint = serde_json::json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2010,
+            "asking_price_usd": 175000,
+            "currency": "USD",
+            "airframe_hours": 1000,
+            "engine_hours": null,
+            "engine_time_basis": "unknown",
+            "engine_time_evidence": null,
+            "engine_time_confidence": null,
+            "propeller_hours": null,
+            "propeller_time_basis": "unknown",
+            "propeller_time_evidence": null,
+            "propeller_time_confidence": null,
+            "installed_engine": null,
+            "installed_propeller": null,
+            "registration_number": "N100IT",
+            "serial_number": "TEST100",
+            "status": "active",
+            "avionics": [{
+                "manufacturer": "Inspector",
+                "model": "VISIBLE-1",
+                "types": ["GPS"],
+                "quantity": 2,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": EVIDENCE,
+                "source_confidence": "high"
+            }],
+            "valuation_facts": []
+        })
+        .to_string();
+        let checkpoint_sha256 = format!("{:x}", Sha256::digest(checkpoint.as_bytes()));
         let plugin_install_id: i64 = sqlx::query_scalar(
             "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, 'inspection-explicit-count-key') RETURNING id",
         )
@@ -2220,21 +2317,24 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        sqlx::query(
+        let plugin_submission_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO plugin_submissions (
               user_id, plugin_install_id, source_url, rendered_html,
-              rendered_html_sha256, signature_base64, canonical_listing_id
+              rendered_html_sha256, signature_base64, extracted_listing_json,
+              canonical_listing_id
             ) VALUES (?, ?, 'https://listing.example/N100IT', ?, ?,
-                      'inspection-explicit-count-signature', ?)
+                      'inspection-explicit-count-signature', ?, ?)
+            RETURNING id
             "#,
         )
         .bind(current_user_id)
         .bind(plugin_install_id)
         .bind(&rendered_html)
         .bind(&evidence_capture_sha256)
+        .bind(&checkpoint)
         .bind(listing_id)
-        .execute(pool)
+        .fetch_one(pool)
         .await
         .unwrap();
         let collision_closure_sha256 = active_collision_closure_revision_sha256(&db, avionics_id)
@@ -2251,28 +2351,18 @@ mod tests {
             "installed",
             EVIDENCE,
         );
-        sqlx::query(
-            r#"
-            INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
-              listing_link_id, association_role, avionics_model_id,
-              authorization_kind, observation_sha256, product_fingerprint,
-              evidence_capture_sha256, collision_closure_sha256
-            )
-            SELECT ?, 'installed', ?, 'manufacturer_reuse', ?,
-                   product_fingerprint, ?, ?
-            FROM avionics_product_reuse_attestations
-            WHERE avionics_model_id = ?
-            "#,
-        )
-        .bind(link_id)
-        .bind(avionics_id)
-        .bind(observation_sha256)
-        .bind(evidence_capture_sha256)
-        .bind(collision_closure_sha256)
-        .bind(avionics_id)
-        .execute(pool)
-        .await
-        .unwrap();
+        sqlx::query(INSERT_AUTHORIZATION_SQL)
+            .bind(link_id)
+            .bind(avionics_id)
+            .bind(&observation_sha256)
+            .bind(&evidence_capture_sha256)
+            .bind(plugin_submission_id)
+            .bind(&checkpoint_sha256)
+            .bind(&collision_closure_sha256)
+            .bind(avionics_id)
+            .execute(pool)
+            .await
+            .unwrap();
 
         let detail = get_avionics_catalog_detail(&db, current_user_id, avionics_id)
             .await
@@ -2285,6 +2375,56 @@ mod tests {
             .unwrap();
         assert!(explicit_count.valuation_eligible);
         assert!(explicit_count.valuation_blockers.is_empty());
+
+        sqlx::query(
+            "DELETE FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
+        )
+        .bind(link_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(INSERT_AUTHORIZATION_SQL)
+            .bind(link_id)
+            .bind(avionics_id)
+            .bind(&observation_sha256)
+            .bind(&evidence_capture_sha256)
+            .bind(plugin_submission_id)
+            .bind("0".repeat(64))
+            .bind(&collision_closure_sha256)
+            .bind(avionics_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let wrong_checkpoint_detail =
+            get_avionics_catalog_detail(&db, current_user_id, avionics_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            wrong_checkpoint_detail
+                .summary
+                .usage
+                .valuation_eligible_listings,
+            0
+        );
+        sqlx::query(
+            "DELETE FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
+        )
+        .bind(link_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(INSERT_AUTHORIZATION_SQL)
+            .bind(link_id)
+            .bind(avionics_id)
+            .bind(&observation_sha256)
+            .bind(&evidence_capture_sha256)
+            .bind(plugin_submission_id)
+            .bind(&checkpoint_sha256)
+            .bind(&collision_closure_sha256)
+            .bind(avionics_id)
+            .execute(pool)
+            .await
+            .unwrap();
 
         // The immutable attestation and link authorization remain stored, but
         // changing one fingerprint input must immediately remove eligibility.

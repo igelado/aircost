@@ -72,6 +72,7 @@ use crate::normalize::{
     is_usable_avionics_label, normalize_avionics_manufacturer_name, normalize_avionics_model_name,
     normalize_name,
 };
+use crate::plugin::current_checkpoint_contains_avionics_source_evidence;
 
 macro_rules! execute_query {
     ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
@@ -562,6 +563,7 @@ struct GroundedCapabilityReplayScope {
 struct ExactListingSourceCaptureScope {
     plugin_submission_id: i64,
     rendered_html_sha256: String,
+    extracted_listing_sha256: String,
 }
 
 impl ExactListingSourceCaptureScope {
@@ -569,6 +571,7 @@ impl ExactListingSourceCaptureScope {
         Self {
             plugin_submission_id: binding.submission_id,
             rendered_html_sha256: binding.rendered_html_sha256.clone(),
+            extracted_listing_sha256: binding.bound_extracted_listing_sha256.clone(),
         }
     }
 
@@ -576,6 +579,7 @@ impl ExactListingSourceCaptureScope {
         Self {
             plugin_submission_id: scope.plugin_submission_id,
             rendered_html_sha256: scope.rendered_html_sha256.clone(),
+            extracted_listing_sha256: scope.extracted_listing_sha256.clone(),
         }
     }
 }
@@ -3393,6 +3397,7 @@ async fn resolve_listing_avionics_values(
                         retained_listing_context,
                         capture.plugin_submission_id,
                         &capture.rendered_html_sha256,
+                        &capture.extracted_listing_sha256,
                         &ListingAvionicsEvidenceObservation {
                             manufacturer: item.manufacturer.as_deref(),
                             model: &item.model,
@@ -6985,7 +6990,8 @@ async fn replace_listing_avionics(
     let select_exact_capture_sql = match db.backend() {
         DatabaseBackend::Sqlite(_) => db.sql(
             r#"
-            SELECT submission.rendered_html, submission.rendered_html_sha256
+            SELECT submission.rendered_html, submission.rendered_html_sha256,
+                   submission.extracted_listing_json
             FROM plugin_submissions submission
             JOIN aircraft_sale_listings listing
               ON listing.id = submission.canonical_listing_id
@@ -6994,11 +7000,14 @@ async fn replace_listing_avionics(
               AND submission.rendered_html_sha256 = ?
               AND submission.source_url = ?
               AND listing.source_url = submission.source_url
+              AND submission.extracted_listing_json IS NOT NULL
+              AND submission.extraction_error IS NULL
             "#,
         ),
         DatabaseBackend::Postgres(_) => db.sql(
             r#"
-            SELECT submission.rendered_html, submission.rendered_html_sha256
+            SELECT submission.rendered_html, submission.rendered_html_sha256,
+                   submission.extracted_listing_json
             FROM plugin_submissions submission
             JOIN aircraft_sale_listings listing
               ON listing.id = submission.canonical_listing_id
@@ -7007,6 +7016,8 @@ async fn replace_listing_avionics(
               AND submission.rendered_html_sha256 = ?
               AND submission.source_url = ?
               AND listing.source_url = submission.source_url
+              AND submission.extracted_listing_json IS NOT NULL
+              AND submission.extraction_error IS NULL
             "#,
         ),
     };
@@ -7016,10 +7027,11 @@ async fn replace_listing_avionics(
           listing_link_id, association_role, avionics_model_id,
           authorization_kind, observation_sha256, product_fingerprint,
           grounded_resolution_sha256, evidence_capture_sha256,
+          plugin_submission_id, extracted_listing_sha256,
           collision_closure_sha256
         )
         SELECT ?, 'installed', ?, 'manufacturer_reuse', ?,
-               attestation.product_fingerprint, NULL, ?, ?
+               attestation.product_fingerprint, NULL, ?, ?, ?, ?
         FROM avionics_product_reuse_attestations attestation
         WHERE attestation.avionics_model_id = ?
         "#,
@@ -7404,7 +7416,11 @@ async fn replace_listing_avionics(
                             item.avionics_model_id
                         )));
                     }
-                    let (rendered_html, evidence_capture_sha256): (String, String) =
+                    let (rendered_html, evidence_capture_sha256, extracted_listing_json): (
+                        String,
+                        String,
+                        String,
+                    ) =
                         sqlx::query_as(&select_exact_capture_sql)
                     .bind(proof.plugin_submission_id())
                     .bind(listing_id)
@@ -7422,6 +7438,14 @@ async fn replace_listing_avionics(
                         format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
                     if evidence_capture_sha256 != proof.rendered_html_sha256()
                         || computed_capture_sha256 != evidence_capture_sha256
+                        || format!(
+                            "{:x}",
+                            Sha256::digest(extracted_listing_json.as_bytes())
+                        ) != proof.extracted_listing_sha256()
+                        || !current_checkpoint_contains_avionics_source_evidence(
+                            &extracted_listing_json,
+                            evidence_text,
+                        )
                     {
                         return Err(ListingStoreError::State(format!(
                             "countable-unit avionics catalog id {} resolved content outside its exact capture hash",
@@ -7465,6 +7489,8 @@ async fn replace_listing_avionics(
                         .bind(item.avionics_model_id)
                         .bind(observation_sha256)
                         .bind(evidence_capture_sha256)
+                        .bind(proof.plugin_submission_id())
+                        .bind(proof.extracted_listing_sha256())
                         .bind(authorization.installed_collision_closure_sha256.as_str())
                         .bind(item.avionics_model_id)
                         .execute(&mut *transaction)
@@ -7886,6 +7912,39 @@ mod tests {
     const FAA_AIRCRAFT_REFERENCE: &str = "CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,AC-WEIGHT,SPEED,TC-DATA-SHEET,TC-DATA-HOLDER\n2072738,CESSNA AIRCRAFT CO,182T,4,1,1,0,01,004,CLASS 1,0145,3A13,TEXTRON AVIATION INC\n";
     const FAA_ENGINE_REFERENCE: &str =
         "CODE,MFR,MODEL,TYPE,HORSEPOWER,THRUST\n41528,LYCOMING,IO-540-AB1A5,1,00230,000000\n";
+
+    fn avionics_checkpoint(
+        manufacturer: Option<&str>,
+        model: &str,
+        avionics_types: &[&str],
+        quantity: i64,
+        source_confidence: &str,
+        evidence: &str,
+    ) -> String {
+        serde_json::to_string(
+            &preview_manual_listing(&json!({
+                "manufacturer": "Cessna",
+                "model": "182",
+                "variant": "182T",
+                "model_year": 2023,
+                "asking_price_usd": 525000,
+                "currency": "USD",
+                "airframe_hours": 400,
+                "status": "active",
+                "avionics": [{
+                    "manufacturer": manufacturer,
+                    "model": model,
+                    "types": avionics_types,
+                    "quantity": quantity,
+                    "configuration_action": "installed",
+                    "source_evidence_text": evidence,
+                    "source_confidence": source_confidence
+                }]
+            }))
+            .parsed_listing,
+        )
+        .expect("test avionics checkpoint should serialize")
+    }
 
     async fn seed_faa_aircraft(db: &AppDb, n_number: &str, serial: &str) {
         let suffix = n_number
@@ -9434,14 +9493,25 @@ mod tests {
         )
         .unwrap();
         let rendered_html_sha256 = format!("{:x}", Sha256::digest(html.as_bytes()));
+        let extracted_listing_json = avionics_checkpoint(
+            Some("Garmin"),
+            "GIA63W",
+            &["COM", "NAV", "GPS"],
+            2,
+            "medium",
+            EVIDENCE,
+        );
+        let extracted_listing_sha256 =
+            format!("{:x}", Sha256::digest(extracted_listing_json.as_bytes()));
         let proving_submission_id: i64 = query_scalar_one!(
             &db,
             i64,
             r#"
             INSERT INTO plugin_submissions (
               user_id, plugin_install_id, source_url, rendered_html,
-              rendered_html_sha256, signature_base64, canonical_listing_id
-            ) VALUES (?, ?, ?, ?, ?, 'dual-unit-signature', ?)
+              rendered_html_sha256, signature_base64, canonical_listing_id,
+              extracted_listing_json
+            ) VALUES (?, ?, ?, ?, ?, 'dual-unit-signature', ?, ?)
             RETURNING id
             "#,
             user.id,
@@ -9449,12 +9519,14 @@ mod tests {
             CONTROLLER_URL,
             html.as_str(),
             rendered_html_sha256.as_str(),
-            listing_id
+            listing_id,
+            extracted_listing_json.as_str()
         )
         .unwrap();
         let exact_source_capture_scope = ExactListingSourceCaptureScope {
             plugin_submission_id: proving_submission_id,
             rendered_html_sha256: rendered_html_sha256.clone(),
+            extracted_listing_sha256: extracted_listing_sha256.clone(),
         };
         let mut values = listing_values_with_variant("182T SKYLANE");
         values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
@@ -9644,14 +9716,19 @@ mod tests {
         )
         .unwrap();
         let rendered_html_sha256 = format!("{:x}", Sha256::digest(html.as_bytes()));
+        let extracted_listing_json =
+            avionics_checkpoint(None, "GDU-1040", &["Flight Display"], 2, "medium", EVIDENCE);
+        let extracted_listing_sha256 =
+            format!("{:x}", Sha256::digest(extracted_listing_json.as_bytes()));
         let proving_submission_id: i64 = query_scalar_one!(
             &db,
             i64,
             r#"
             INSERT INTO plugin_submissions (
               user_id, plugin_install_id, source_url, rendered_html,
-              rendered_html_sha256, signature_base64, canonical_listing_id
-            ) VALUES (?, ?, ?, ?, ?, 'model-only-dual-signature', ?)
+              rendered_html_sha256, signature_base64, canonical_listing_id,
+              extracted_listing_json
+            ) VALUES (?, ?, ?, ?, ?, 'model-only-dual-signature', ?, ?)
             RETURNING id
             "#,
             user.id,
@@ -9659,12 +9736,14 @@ mod tests {
             CONTROLLER_URL,
             html.as_str(),
             rendered_html_sha256.as_str(),
-            listing_id
+            listing_id,
+            extracted_listing_json.as_str()
         )
         .unwrap();
         let exact_source_capture_scope = ExactListingSourceCaptureScope {
             plugin_submission_id: proving_submission_id,
             rendered_html_sha256: rendered_html_sha256.clone(),
+            extracted_listing_sha256,
         };
         let mut values = listing_values_with_variant("182T SKYLANE");
         values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
@@ -9758,6 +9837,7 @@ mod tests {
         let exact_source_capture_scope = ExactListingSourceCaptureScope {
             plugin_submission_id: 1,
             rendered_html_sha256: format!("{:x}", Sha256::digest(html.as_bytes())),
+            extracted_listing_sha256: "0".repeat(64),
         };
         let mut values = listing_values_with_variant("182T SKYLANE");
         values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
@@ -9925,6 +10005,7 @@ mod tests {
         let exact_source_capture_scope = ExactListingSourceCaptureScope {
             plugin_submission_id: 1,
             rendered_html_sha256: format!("{:x}", Sha256::digest(html.as_bytes())),
+            extracted_listing_sha256: "0".repeat(64),
         };
         let mut values = listing_values_with_variant("182T SKYLANE");
         values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
@@ -11191,11 +11272,18 @@ mod tests {
 
         let rendered_html = "<p>GTX 345R installed</p>";
         let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
-        let extracted_listing_json = "{}";
+        let extracted_listing_json = avionics_checkpoint(
+            Some("Garmin"),
+            "GTX 345R",
+            &["Transponder"],
+            1,
+            "high",
+            "GTX 345R installed",
+        );
         let extracted_listing_sha256 =
             format!("{:x}", Sha256::digest(extracted_listing_json.as_bytes()));
         let install_id: i64 = sqlx::query_scalar(
-            "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, 'grounded-bind-key') RETURNING id",
+            "INSERT INTO plugin_installs (user_id, public_key_base64, created_at) VALUES (?, 'grounded-bind-key', '2026-08-23 12:34:56') RETURNING id",
         )
         .bind(user.id)
         .fetch_one(pool)
@@ -11232,7 +11320,7 @@ mod tests {
             expected_extracted_listing_json: None,
             expected_extracted_listing_sha256: None,
             expected_extraction_error: None,
-            bound_extracted_listing_json: extracted_listing_json.to_string(),
+            bound_extracted_listing_json: extracted_listing_json,
             bound_extracted_listing_sha256: extracted_listing_sha256,
         };
         let literal_values = values.clone();
@@ -11331,7 +11419,14 @@ mod tests {
         );
         let rendered_html = "<p>Garmin GTX 345R installed</p>";
         let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
-        let extraction_json = "{}";
+        let extraction_json = avionics_checkpoint(
+            Some("Garmin"),
+            "GTX 345R",
+            &["Transponder"],
+            1,
+            "high",
+            "GTX 345R installed",
+        );
         let extracted_listing_sha256 = format!("{:x}", Sha256::digest(extraction_json.as_bytes()));
         let install_id: i64 = sqlx::query_scalar(
             "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, 'grounded-test-key') RETURNING id",
@@ -11352,7 +11447,7 @@ mod tests {
         .bind(install_id)
         .bind(rendered_html)
         .bind(rendered_html_sha256.as_str())
-        .bind(extraction_json)
+        .bind(extraction_json.as_str())
         .bind(listing_id)
         .fetch_one(pool)
         .await

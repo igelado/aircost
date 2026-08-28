@@ -69,11 +69,15 @@ use crate::listing::avionics::{
 use crate::listing::evidence::{
     identity_span_has_boundaries, ListingEvidenceContext, MAX_LISTING_EVIDENCE_CONTEXT_BYTES,
 };
+use crate::listing::replay::retained_capture_timestamp_chronology_valid;
 use crate::listings::get_listing;
 use crate::models::SaleListing;
 use crate::normalize::{
     is_usable_avionics_label, normalize_avionics_identifier, normalize_avionics_manufacturer_name,
     normalize_avionics_model_name, normalize_name,
+};
+use crate::plugin::{
+    current_checkpoint_contains_avionics_source_evidence, parse_current_checkpoint_payload,
 };
 
 use self::staging::{
@@ -974,6 +978,7 @@ pub(crate) struct ListingEvidenceProvenance {
     plugin_submission_id: i64,
     source_url: String,
     rendered_html_sha256: String,
+    extracted_listing_sha256: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -984,6 +989,8 @@ struct ListingEvidenceCaptureRow {
     source_url: String,
     rendered_html: String,
     rendered_html_sha256: String,
+    extracted_listing_json: Option<String>,
+    extraction_error: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -1056,10 +1063,14 @@ struct AssociationAuthorizationRow {
     product_fingerprint: String,
     current_reuse_product_fingerprint: Option<String>,
     grounded_resolution_sha256: Option<String>,
-    plugin_submission_id: Option<i64>,
-    extracted_listing_sha256: Option<String>,
+    plugin_submission_id: i64,
+    extracted_listing_sha256: String,
     current_extracted_listing_json: Option<String>,
-    evidence_capture_is_current: bool,
+    current_rendered_html: Option<String>,
+    current_install_created_at: Option<String>,
+    current_submitted_at: Option<String>,
+    current_install_revoked_at: Option<String>,
+    evidence_capture_sha256: String,
     collision_closure_sha256: String,
     source_revocation_count: Option<i64>,
     current_source_revocation_count: i64,
@@ -1787,7 +1798,9 @@ async fn restage_pending_review_if_current_with_commit(
               canonical_listing_id,
               source_url,
               rendered_html,
-              rendered_html_sha256
+              rendered_html_sha256,
+              extracted_listing_json,
+              extraction_error
             FROM plugin_submissions
             WHERE id = ?
             "#,
@@ -1800,7 +1813,9 @@ async fn restage_pending_review_if_current_with_commit(
               canonical_listing_id,
               source_url,
               rendered_html,
-              rendered_html_sha256
+              rendered_html_sha256,
+              extracted_listing_json,
+              extraction_error
             FROM plugin_submissions
             WHERE id = ?
             FOR SHARE
@@ -1856,10 +1871,12 @@ async fn restage_pending_review_if_current_with_commit(
           product_fingerprint,
           grounded_resolution_sha256,
           evidence_capture_sha256,
+          plugin_submission_id,
+          extracted_listing_sha256,
           collision_closure_sha256
         )
         SELECT ?, ?, ?, 'manufacturer_reuse', ?, attestation.product_fingerprint,
-               NULL, ?, ?
+               NULL, ?, ?, ?, ?
         FROM avionics_product_reuse_attestations attestation
         WHERE attestation.avionics_model_id = ?
         ON CONFLICT (listing_link_id, association_role) DO NOTHING
@@ -2122,7 +2139,8 @@ async fn restage_pending_review_if_current_with_commit(
             validate_current_covered_associations(&payload.aspects, &assignments)?;
             let mut exact_association_evidence = HashMap::new();
             let mut evidence_repaired_link_ids = HashSet::new();
-            let mut repair_evidence_capture_sha256 = None;
+            let mut repair_evidence_provenance = None;
+            let mut repair_extracted_listing_json = None;
             if maintenance_commit.is_none() {
                 let action_graph_issues: i64 =
                     sqlx::query_scalar(&invalid_action_graph_sql)
@@ -2159,9 +2177,12 @@ async fn restage_pending_review_if_current_with_commit(
                             Some(capture.rendered_html.as_str()),
                         )
                     });
-                repair_evidence_capture_sha256 = rendered_capture
+                repair_evidence_provenance = rendered_capture
                     .as_ref()
-                    .map(|(_, provenance)| provenance.rendered_html_sha256.clone());
+                    .map(|(_, provenance)| provenance.clone());
+                repair_extracted_listing_json = rendered_capture
+                    .as_ref()
+                    .and_then(|(capture, _)| capture.extracted_listing_json.clone());
                 let repairs = plan_pending_association_evidence_repair(
                     &payload,
                     &assignments,
@@ -2520,11 +2541,22 @@ async fn restage_pending_review_if_current_with_commit(
                     // rather than silently mint a new grounded conclusion.
                     continue;
                 }
-                let Some(evidence_capture_sha256) =
-                    repair_evidence_capture_sha256.as_deref()
+                let Some(evidence_provenance) =
+                    repair_evidence_provenance.as_ref()
                 else {
                     continue;
                 };
+                if !repair_extracted_listing_json.as_deref().is_some_and(|checkpoint| {
+                    current_checkpoint_contains_avionics_source_evidence(
+                        checkpoint,
+                        evidence_text,
+                    )
+                }) {
+                    // A structurally visible repair span is not enough to
+                    // reissue authority: the exact decoded occurrence must
+                    // still exist in the current retained checkpoint.
+                    continue;
+                }
                 let collision_closure_sha256 = fingerprint_active_collision_closure(
                     &active_collision_catalog_rows,
                     &reuse_attested_ids,
@@ -2553,7 +2585,9 @@ async fn restage_pending_review_if_current_with_commit(
                     .bind(role_label)
                     .bind(association.avionics_model_id)
                     .bind(observation_sha256)
-                    .bind(evidence_capture_sha256)
+                    .bind(evidence_provenance.rendered_html_sha256.as_str())
+                    .bind(evidence_provenance.plugin_submission_id)
+                    .bind(evidence_provenance.extracted_listing_sha256.as_str())
                     .bind(collision_closure_sha256)
                     .bind(association.avionics_model_id)
                     .execute(&mut *transaction)
@@ -2709,6 +2743,8 @@ async fn restage_pending_review_if_current_with_commit(
                         .bind(commit.avionics_model_id)
                         .bind(commit.observation_sha256.as_str())
                         .bind(commit.evidence_provenance.rendered_html_sha256.as_str())
+                        .bind(commit.evidence_provenance.plugin_submission_id)
+                        .bind(commit.evidence_provenance.extracted_listing_sha256.as_str())
                         .bind(commit.expected_collision_closure_sha256.as_str())
                         .bind(commit.avionics_model_id)
                         .execute(&mut *transaction)
@@ -4078,14 +4114,11 @@ const ASSOCIATION_AUTHORIZATION_ROWS_SQLITE: &str = r#"
       authorization.plugin_submission_id,
       authorization.extracted_listing_sha256,
       grounded_submission.extracted_listing_json AS current_extracted_listing_json,
-      EXISTS (
-        SELECT 1
-        FROM plugin_submissions capture
-        WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
-          AND capture.rendered_html_sha256 = authorization.evidence_capture_sha256
-          AND length(trim(COALESCE(link.source_notes, ''))) > 0
-          AND instr(capture.rendered_html, link.source_notes) > 0
-      ) AS evidence_capture_is_current,
+      grounded_submission.rendered_html AS current_rendered_html,
+      grounded_install.created_at AS current_install_created_at,
+      grounded_submission.submitted_at AS current_submitted_at,
+      grounded_install.revoked_at AS current_install_revoked_at,
+      authorization.evidence_capture_sha256,
       authorization.collision_closure_sha256,
       authorization.source_revocation_count,
       (SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations)
@@ -4093,14 +4126,21 @@ const ASSOCIATION_AUTHORIZATION_ROWS_SQLITE: &str = r#"
     FROM aircraft_sale_listing_avionics_link_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
+    JOIN aircraft_sale_listings listing
+      ON listing.id = link.aircraft_sale_listing_id
     LEFT JOIN avionics_product_reuse_attestations attestation
       ON authorization.authorization_kind = 'manufacturer_reuse'
      AND attestation.avionics_model_id = authorization.avionics_model_id
     LEFT JOIN plugin_submissions grounded_submission
       ON grounded_submission.id = authorization.plugin_submission_id
      AND grounded_submission.canonical_listing_id = link.aircraft_sale_listing_id
+     AND grounded_submission.user_id = listing.created_by_user_id
+     AND grounded_submission.source_url = listing.source_url
      AND grounded_submission.rendered_html_sha256 = authorization.evidence_capture_sha256
      AND grounded_submission.extraction_error IS NULL
+    LEFT JOIN plugin_installs grounded_install
+      ON grounded_install.id = grounded_submission.plugin_install_id
+     AND grounded_install.user_id = grounded_submission.user_id
     WHERE link.aircraft_sale_listing_id = ?
     ORDER BY authorization.listing_link_id, authorization.association_role
 "#;
@@ -4118,14 +4158,11 @@ const ASSOCIATION_AUTHORIZATION_ROWS_POSTGRES: &str = r#"
       authorization.plugin_submission_id,
       authorization.extracted_listing_sha256,
       grounded_submission.extracted_listing_json AS current_extracted_listing_json,
-      EXISTS (
-        SELECT 1
-        FROM plugin_submissions capture
-        WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
-          AND capture.rendered_html_sha256 = authorization.evidence_capture_sha256
-          AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
-          AND position(link.source_notes IN capture.rendered_html) > 0
-      ) AS evidence_capture_is_current,
+      grounded_submission.rendered_html AS current_rendered_html,
+      grounded_install.created_at AS current_install_created_at,
+      grounded_submission.submitted_at AS current_submitted_at,
+      grounded_install.revoked_at AS current_install_revoked_at,
+      authorization.evidence_capture_sha256,
       authorization.collision_closure_sha256,
       authorization.source_revocation_count,
       (SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations)
@@ -4133,14 +4170,21 @@ const ASSOCIATION_AUTHORIZATION_ROWS_POSTGRES: &str = r#"
     FROM aircraft_sale_listing_avionics_link_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
+    JOIN aircraft_sale_listings listing
+      ON listing.id = link.aircraft_sale_listing_id
     LEFT JOIN avionics_product_reuse_attestations attestation
       ON authorization.authorization_kind = 'manufacturer_reuse'
      AND attestation.avionics_model_id = authorization.avionics_model_id
     LEFT JOIN plugin_submissions grounded_submission
       ON grounded_submission.id = authorization.plugin_submission_id
      AND grounded_submission.canonical_listing_id = link.aircraft_sale_listing_id
+     AND grounded_submission.user_id = listing.created_by_user_id
+     AND grounded_submission.source_url = listing.source_url
      AND grounded_submission.rendered_html_sha256 = authorization.evidence_capture_sha256
      AND grounded_submission.extraction_error IS NULL
+    LEFT JOIN plugin_installs grounded_install
+      ON grounded_install.id = grounded_submission.plugin_install_id
+     AND grounded_install.user_id = grounded_submission.user_id
     WHERE link.aircraft_sale_listing_id = ?
     ORDER BY authorization.listing_link_id, authorization.association_role
 "#;
@@ -4293,6 +4337,18 @@ fn validate_listing_evidence_capture(
     expected: Option<&ListingEvidenceProvenance>,
 ) -> Result<ListingEvidenceProvenance, String> {
     let provenance = validate_listing_evidence_capture_provenance(review, capture, expected)?;
+    if !current_checkpoint_contains_avionics_source_evidence(
+        capture
+            .extracted_listing_json
+            .as_deref()
+            .expect("current capture provenance requires a checkpoint"),
+        evidence_text,
+    ) {
+        return Err(
+            "source_evidence_text is not retained by the exact current extraction checkpoint"
+                .to_string(),
+        );
+    }
     validate_exact_listing_evidence_span(&capture.rendered_html, evidence_text)?;
     Ok(provenance)
 }
@@ -4333,10 +4389,20 @@ fn validate_listing_evidence_capture_provenance(
     {
         return Err("retained listing source capture failed its content hash".to_string());
     }
+    let extracted_listing_json = capture.extracted_listing_json.as_deref().ok_or_else(|| {
+        "retained listing source capture has no extraction checkpoint".to_string()
+    })?;
+    if capture.extraction_error.is_some() {
+        return Err("retained listing source capture has an extraction error".to_string());
+    }
+    parse_current_checkpoint_payload(extracted_listing_json)
+        .map_err(|error| format!("retained listing source capture is not current: {error}"))?;
+    let extracted_listing_sha256 = sha256_hex(extracted_listing_json.as_bytes());
     if let Some(expected) = expected {
         if expected.plugin_submission_id != capture.plugin_submission_id
             || expected.source_url != capture.source_url
             || expected.rendered_html_sha256 != capture.rendered_html_sha256
+            || expected.extracted_listing_sha256 != extracted_listing_sha256
         {
             return Err(
                 "retained listing source capture changed after evidence verification".to_string(),
@@ -4347,6 +4413,7 @@ fn validate_listing_evidence_capture_provenance(
         plugin_submission_id: capture.plugin_submission_id,
         source_url: capture.source_url.clone(),
         rendered_html_sha256: capture.rendered_html_sha256.clone(),
+        extracted_listing_sha256,
     })
 }
 
@@ -4406,7 +4473,9 @@ async fn load_listing_evidence_provenance(
           canonical_listing_id,
           source_url,
           rendered_html,
-          rendered_html_sha256
+          rendered_html_sha256,
+          extracted_listing_json,
+          extraction_error
         FROM plugin_submissions
         WHERE id = ?
         "#,
@@ -5247,14 +5316,44 @@ fn current_row_backed_authorized_associations(
     let mut authorized = HashSet::new();
 
     for row in rows {
-        if !row.evidence_capture_is_current {
+        let Some(assignment) = assignments_by_link.get(&row.listing_link_id) else {
             continue;
-        }
+        };
+        let Some(source_notes) = assignment
+            .source_notes
+            .as_deref()
+            .filter(|evidence| !evidence.trim().is_empty())
+        else {
+            continue;
+        };
+        let exact_checkpoint_is_current = row
+            .current_rendered_html
+            .as_deref()
+            .zip(row.current_extracted_listing_json.as_deref())
+            .is_some_and(|(rendered_html, checkpoint)| {
+                row.plugin_submission_id > 0
+                    && sha256_hex(rendered_html.as_bytes()) == row.evidence_capture_sha256
+                    && sha256_hex(checkpoint.as_bytes()) == row.extracted_listing_sha256
+                    && row
+                        .current_install_created_at
+                        .as_deref()
+                        .zip(row.current_submitted_at.as_deref())
+                        .is_some_and(|(created_at, submitted_at)| {
+                            retained_capture_timestamp_chronology_valid(
+                                created_at,
+                                submitted_at,
+                                row.current_install_revoked_at.as_deref(),
+                            )
+                        })
+                    && current_checkpoint_contains_avionics_source_evidence(
+                        checkpoint,
+                        source_notes,
+                    )
+            });
         let current_collision_closure_sha256 = match row.authorization_kind.as_str() {
             "manufacturer_reuse"
-                if row.grounded_resolution_sha256.is_none()
-                    && row.plugin_submission_id.is_none()
-                    && row.extracted_listing_sha256.is_none()
+                if exact_checkpoint_is_current
+                    && row.grounded_resolution_sha256.is_none()
                     && row.source_revocation_count.is_none()
                     && row.current_reuse_product_fingerprint.as_deref()
                         == Some(row.product_fingerprint.as_str())
@@ -5267,22 +5366,12 @@ fn current_row_backed_authorized_associations(
                 )
             }
             "same_case_grounded"
-                if row
-                    .grounded_resolution_sha256
-                    .as_deref()
-                    .is_some_and(valid_sha256)
-                    && row.plugin_submission_id.is_some()
-                    && row.source_revocation_count == Some(row.current_source_revocation_count)
+                if exact_checkpoint_is_current
                     && row
-                        .extracted_listing_sha256
+                        .grounded_resolution_sha256
                         .as_deref()
                         .is_some_and(valid_sha256)
-                    && row.current_extracted_listing_json.as_deref().is_some_and(
-                        |checkpoint| {
-                            row.extracted_listing_sha256.as_deref()
-                                == Some(sha256_hex(checkpoint.as_bytes()).as_str())
-                        },
-                    )
+                    && row.source_revocation_count == Some(row.current_source_revocation_count)
                     && catalog_product_fingerprints.get(&row.avionics_model_id)
                         == Some(&row.product_fingerprint) =>
             {
@@ -5299,9 +5388,6 @@ fn current_row_backed_authorized_associations(
         if row.collision_closure_sha256 != current_collision_closure_sha256 {
             continue;
         }
-        let Some(assignment) = assignments_by_link.get(&row.listing_link_id) else {
-            continue;
-        };
         let role = match row.association_role.as_str() {
             "installed" => ListingAssociationRole::Installed,
             "replacement" => ListingAssociationRole::Replacement,
@@ -9775,6 +9861,49 @@ mod tests {
                 .replaces_avionics_model_id
                 .expect("replacement authorization requires a replacement target"),
         };
+        let evidence_text = assignment.source_notes.as_deref().unwrap_or_default();
+        let replacement = assignment.replaces_avionics_model_id.map(|replacement_id| {
+            serde_json::json!({
+                "manufacturer": "Garmin",
+                "model": format!("Product {replacement_id}"),
+                "types": ["GPS"]
+            })
+        });
+        let checkpoint = serde_json::json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2023,
+            "asking_price_usd": 525000,
+            "currency": "USD",
+            "airframe_hours": 400,
+            "engine_hours": null,
+            "engine_time_basis": "unknown",
+            "engine_time_evidence": null,
+            "engine_time_confidence": null,
+            "propeller_hours": null,
+            "propeller_time_basis": "unknown",
+            "propeller_time_evidence": null,
+            "propeller_time_confidence": null,
+            "installed_engine": null,
+            "installed_propeller": null,
+            "registration_number": "N12345",
+            "serial_number": "TEST123",
+            "status": "active",
+            "avionics": [{
+                "manufacturer": "Garmin",
+                "model": format!("Product {}", assignment.avionics_model_id),
+                "types": ["GPS"],
+                "quantity": assignment.quantity,
+                "configuration_action": assignment.configuration_action.as_str(),
+                "replaces": replacement,
+                "source_evidence_text": evidence_text,
+                "source_confidence": assignment.source_confidence.as_deref()
+            }],
+            "valuation_facts": []
+        })
+        .to_string();
+        let rendered_html = format!("<p>{evidence_text}</p>");
         AssociationAuthorizationRow {
             listing_link_id: assignment.listing_link_id,
             association_role: association_role_label(role).to_string(),
@@ -9789,10 +9918,14 @@ mod tests {
             product_fingerprint: product_fingerprint.to_string(),
             current_reuse_product_fingerprint: None,
             grounded_resolution_sha256: Some("a".repeat(64)),
-            plugin_submission_id: Some(1),
-            extracted_listing_sha256: Some(sha256_hex(b"{}")),
-            current_extracted_listing_json: Some("{}".to_string()),
-            evidence_capture_is_current: true,
+            plugin_submission_id: 1,
+            extracted_listing_sha256: sha256_hex(checkpoint.as_bytes()),
+            current_extracted_listing_json: Some(checkpoint),
+            current_rendered_html: Some(rendered_html.clone()),
+            current_install_created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            current_submitted_at: Some("2026-01-02T00:00:00Z".to_string()),
+            current_install_revoked_at: None,
+            evidence_capture_sha256: sha256_hex(rendered_html.as_bytes()),
             collision_closure_sha256: fingerprint_grounded_collision_closure(
                 collision_rows,
                 avionics_model_id,
@@ -10699,13 +10832,13 @@ mod tests {
         let product_fingerprints = HashMap::from([(11, product_fingerprint)]);
 
         let mut stale_capture = current.clone();
-        stale_capture.evidence_capture_is_current = false;
+        stale_capture.current_rendered_html = None;
         let mut stale_product = current.clone();
         stale_product.product_fingerprint = "c".repeat(64);
         let mut stale_collision = current.clone();
         stale_collision.collision_closure_sha256 = "d".repeat(64);
         let mut missing_submission = current.clone();
-        missing_submission.plugin_submission_id = None;
+        missing_submission.plugin_submission_id = 0;
         let mut changed_checkpoint = current.clone();
         changed_checkpoint.current_extracted_listing_json = Some("{\"changed\":true}".to_string());
         let mut failed_checkpoint = current;
@@ -11459,13 +11592,14 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                 .await
                 .unwrap();
         let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
+        let checkpoint = review_checkpoint(serde_json::json!([]));
         sqlx::query_scalar(
             r#"
             INSERT INTO plugin_submissions (
               user_id, plugin_install_id, source_url, rendered_html,
               rendered_html_sha256, signature_base64,
               extracted_listing_json, canonical_listing_id
-            ) VALUES (?, ?, ?, ?, ?, 'test-signature', '{}', ?)
+            ) VALUES (?, ?, ?, ?, ?, 'test-signature', ?, ?)
             RETURNING id
             "#,
         )
@@ -11474,10 +11608,39 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .bind(source_url)
         .bind(rendered_html)
         .bind(rendered_html_sha256)
+        .bind(checkpoint)
         .bind(listing_id)
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    fn review_checkpoint(avionics: serde_json::Value) -> String {
+        serde_json::json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2020,
+            "asking_price_usd": 450000,
+            "currency": "USD",
+            "airframe_hours": 900,
+            "engine_hours": null,
+            "engine_time_basis": "unknown",
+            "engine_time_evidence": null,
+            "engine_time_confidence": null,
+            "propeller_hours": null,
+            "propeller_time_basis": "unknown",
+            "propeller_time_evidence": null,
+            "propeller_time_confidence": null,
+            "installed_engine": null,
+            "installed_propeller": null,
+            "registration_number": "N12345",
+            "serial_number": "TEST123",
+            "status": "active",
+            "avionics": avionics,
+            "valuation_facts": []
+        })
+        .to_string()
     }
 
     async fn insert_repairable_capture_review(
@@ -11789,11 +11952,36 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         sqlx::query(
             "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
         )
-        .bind(serde_json::json!({ "avionics": avionics }).to_string())
+        .bind(review_checkpoint(avionics))
         .bind(submission_id)
         .execute(sqlite_pool(db))
         .await
         .unwrap();
+    }
+
+    async fn store_current_installed_avionics_evidence(
+        db: &AppDb,
+        submission_id: i64,
+        model: &str,
+        avionics_type: &str,
+        quantity: i64,
+        evidence: &str,
+    ) {
+        store_current_avionics_extraction(
+            db,
+            submission_id,
+            serde_json::json!([{
+                "manufacturer": "Garmin",
+                "model": model,
+                "types": [avionics_type],
+                "quantity": quantity,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]),
+        )
+        .await;
     }
 
     async fn insert_listing_avionics_link(
@@ -11968,6 +12156,21 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             user_id,
             listing_id,
             &format!("<main>{evidence}</main>"),
+        )
+        .await;
+        store_current_avionics_extraction(
+            &db,
+            submission_id,
+            serde_json::json!([{
+                "manufacturer": "L3",
+                "model": "WX-500",
+                "types": ["Weather Radar"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]),
         )
         .await;
         let link_id: i64 = sqlx::query_scalar(
@@ -12329,6 +12532,33 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             "<html><body><p>Garmin GNS 430W navigator</p><p>Garmin GTX 345 transponder</p></body></html>";
         let submission_id =
             insert_review_bound_submission(&db, user_id, listing_id, rendered_html).await;
+        store_current_avionics_extraction(
+            &db,
+            submission_id,
+            serde_json::json!([
+                {
+                    "manufacturer": "Garmin",
+                    "model": "GNS 430W",
+                    "types": ["GPS"],
+                    "quantity": 1,
+                    "configuration_action": "installed",
+                    "replaces": null,
+                    "source_evidence_text": "Garmin GNS 430W navigator",
+                    "source_confidence": "high"
+                },
+                {
+                    "manufacturer": "Garmin",
+                    "model": "GTX 345",
+                    "types": ["Transponder"],
+                    "quantity": 1,
+                    "configuration_action": "installed",
+                    "replaces": null,
+                    "source_evidence_text": "Garmin GTX 345 transponder",
+                    "source_confidence": "high"
+                }
+            ]),
+        )
+        .await;
         let attested_product_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
         let unattested_product_id =
             insert_approved_product(&db, "GTX 345", "GTX345", "Transponder").await;
@@ -12825,6 +13055,15 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             user_id,
             listing_id,
             "<main><div>Garmin integrated avionics package.</div><div>Installed GMA-1347 Digital Audio Panel.</div></main>",
+        )
+        .await;
+        store_current_installed_avionics_evidence(
+            &db,
+            submission_id,
+            "GMA 1347",
+            "Audio Panel",
+            1,
+            "GMA-1347",
         )
         .await;
         let link_id: i64 = sqlx::query_scalar(
@@ -14245,6 +14484,33 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             "<html><body>Garmin GDL 69A shown in the listing. Weather Radar.</body></html>",
         )
         .await;
+        store_current_avionics_extraction(
+            &db,
+            submission_id,
+            serde_json::json!([
+                {
+                    "manufacturer": "Garmin",
+                    "model": "GDL 69A",
+                    "types": ["Datalink"],
+                    "quantity": 2,
+                    "configuration_action": "installed",
+                    "replaces": null,
+                    "source_evidence_text": "Garmin GDL 69A shown in the listing",
+                    "source_confidence": "high"
+                },
+                {
+                    "manufacturer": null,
+                    "model": "Weather Radar",
+                    "types": ["Weather Radar"],
+                    "quantity": 1,
+                    "configuration_action": "installed",
+                    "replaces": null,
+                    "source_evidence_text": "Weather Radar",
+                    "source_confidence": "medium"
+                }
+            ]),
+        )
+        .await;
         let preserved_id = insert_approved_product(&db, "GDL 69A", "GDL69A", "Connectivity").await;
         let link_id: i64 = sqlx::query_scalar(
             r#"
@@ -14487,6 +14753,15 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             "<html><body>Garmin GMA 1347 audio panel</body></html>",
         )
         .await;
+        store_current_installed_avionics_evidence(
+            &db,
+            submission_id,
+            "GMA 1347",
+            "Audio Panel",
+            1,
+            "Garmin GMA 1347 audio panel",
+        )
+        .await;
         let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
         let link_id: i64 = sqlx::query_scalar(
             r#"
@@ -14591,6 +14866,15 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             user_id,
             listing_id,
             &format!("<html><body>{evidence}</body></html>"),
+        )
+        .await;
+        store_current_installed_avionics_evidence(
+            &db,
+            submission_id,
+            "GMA 1347",
+            "Audio Panel",
+            2,
+            evidence,
         )
         .await;
         let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
@@ -14706,6 +14990,15 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             "<html><body>GMA 1347 audio panel</body></html>",
         )
         .await;
+        store_current_installed_avionics_evidence(
+            &db,
+            submission_id,
+            "GMA 1347",
+            "Audio Panel",
+            1,
+            "GMA 1347 audio panel",
+        )
+        .await;
         let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
         let link_id: i64 = sqlx::query_scalar(
             r#"
@@ -14814,6 +15107,15 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             "<html><body>Garmin GMA 1347 audio panel</body></html>",
         )
         .await;
+        store_current_installed_avionics_evidence(
+            &db,
+            submission_id,
+            "GMA 1347",
+            "Audio Panel",
+            1,
+            "Garmin GMA 1347 audio panel",
+        )
+        .await;
         let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
         attest_approved_product_for_current_policy_reuse(&db, product_id).await;
         let aspect = PendingReviewAspect::avionics(
@@ -14883,6 +15185,15 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             user_id,
             listing_id,
             "<html><body>Garmin GMA 1347 audio panel</body></html>",
+        )
+        .await;
+        store_current_installed_avionics_evidence(
+            &db,
+            submission_id,
+            "GMA 1347",
+            "Audio Panel",
+            1,
+            "Garmin GMA 1347 audio panel",
         )
         .await;
         let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
@@ -15186,6 +15497,15 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             user_id,
             listing_id,
             &format!("<html><body>{evidence}</body></html>"),
+        )
+        .await;
+        store_current_installed_avionics_evidence(
+            &db,
+            submission_id,
+            "GMA 1347",
+            "Audio Panel",
+            1,
+            evidence,
         )
         .await;
         let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;

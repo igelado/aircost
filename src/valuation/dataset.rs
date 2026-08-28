@@ -20,8 +20,10 @@ use crate::avionics::reuse::{
     countable_unit_reuse_attestation_is_current_sqlite,
 };
 use crate::db::{AppDb, DatabaseBackend};
+use crate::listing::replay::retained_capture_timestamp_chronology_valid;
 use crate::listing::review::{association_observation_sha256_from_values, ListingAssociationRole};
 use crate::models::is_plausible_asking_price_usd;
+use crate::plugin::current_checkpoint_contains_avionics_source_evidence;
 
 use super::types::{
     source_backed_component_observation, FactoryReferenceFeature, SourceBackedValuationFact,
@@ -153,6 +155,8 @@ struct EquipmentRow {
     source_notes: Option<String>,
     authorization_observation_sha256: Option<String>,
     authorization_evidence_capture_sha256: Option<String>,
+    authorization_plugin_submission_id: Option<i64>,
+    authorization_extracted_listing_sha256: Option<String>,
     authorization_collision_closure_sha256: Option<String>,
 }
 
@@ -858,6 +862,10 @@ async fn load_equipment(db: &AppDb) -> Result<BTreeMap<i64, Vec<String>>, Valuat
             AS authorization_observation_sha256,
           authorization.evidence_capture_sha256
             AS authorization_evidence_capture_sha256,
+          authorization.plugin_submission_id
+            AS authorization_plugin_submission_id,
+          authorization.extracted_listing_sha256
+            AS authorization_extracted_listing_sha256,
           authorization.collision_closure_sha256
             AS authorization_collision_closure_sha256
         FROM aircraft_sale_listing_avionics link
@@ -927,6 +935,8 @@ async fn load_equipment(db: &AppDb) -> Result<BTreeMap<i64, Vec<String>>, Valuat
           NULL AS source_notes,
           NULL AS authorization_observation_sha256,
           NULL AS authorization_evidence_capture_sha256,
+          NULL AS authorization_plugin_submission_id,
+          NULL AS authorization_extracted_listing_sha256,
           NULL AS authorization_collision_closure_sha256
         FROM aircraft_sale_listings listing
         JOIN engine_models model ON model.id = listing.installed_engine_model_id
@@ -948,6 +958,8 @@ async fn load_equipment(db: &AppDb) -> Result<BTreeMap<i64, Vec<String>>, Valuat
           NULL AS source_notes,
           NULL AS authorization_observation_sha256,
           NULL AS authorization_evidence_capture_sha256,
+          NULL AS authorization_plugin_submission_id,
+          NULL AS authorization_extracted_listing_sha256,
           NULL AS authorization_collision_closure_sha256
         FROM aircraft_sale_listings listing
         JOIN propeller_models model ON model.id = listing.installed_propeller_model_id
@@ -963,10 +975,21 @@ async fn load_equipment(db: &AppDb) -> Result<BTreeMap<i64, Vec<String>>, Valuat
                 .await?;
             let capture_sql = db.sql(
                 r#"
-                SELECT rendered_html
-                FROM plugin_submissions
-                WHERE canonical_listing_id = ?
-                  AND rendered_html_sha256 = ?
+                SELECT submission.rendered_html, submission.extracted_listing_json,
+                       install.created_at, submission.submitted_at, install.revoked_at
+                FROM plugin_submissions submission
+                JOIN plugin_installs install
+                  ON install.id = submission.plugin_install_id
+                 AND install.user_id = submission.user_id
+                JOIN aircraft_sale_listings listing
+                  ON listing.id = submission.canonical_listing_id
+                 AND listing.created_by_user_id = submission.user_id
+                 AND listing.source_url = submission.source_url
+                WHERE submission.id = ?
+                  AND submission.canonical_listing_id = ?
+                  AND submission.rendered_html_sha256 = ?
+                  AND submission.extracted_listing_json IS NOT NULL
+                  AND submission.extraction_error IS NULL
                 "#,
             );
             let mut equipment = BTreeMap::new();
@@ -1008,19 +1031,47 @@ async fn load_equipment(db: &AppDb) -> Result<BTreeMap<i64, Vec<String>>, Valuat
                     {
                         continue;
                     }
-                    let exact_capture = if let Some(capture_sha256) =
-                        row.authorization_evidence_capture_sha256.as_deref()
-                    {
-                        let captures = sqlx::query_scalar::<_, String>(&capture_sql)
-                            .bind(row.listing_id)
-                            .bind(capture_sha256)
-                            .fetch_all(&mut **$transaction)
-                            .await?;
-                        captures.iter().any(|rendered_html| {
-                            format!("{:x}", Sha256::digest(rendered_html.as_bytes()))
-                                == capture_sha256
-                                && rendered_html.contains(source_notes)
-                        })
+                    let exact_capture = if let (
+                        Some(capture_sha256),
+                        Some(plugin_submission_id),
+                        Some(extracted_listing_sha256),
+                    ) = (
+                        row.authorization_evidence_capture_sha256.as_deref(),
+                        row.authorization_plugin_submission_id,
+                        row.authorization_extracted_listing_sha256.as_deref(),
+                    ) {
+                        let capture = sqlx::query_as::<
+                            _,
+                            (String, String, String, String, Option<String>),
+                        >(&capture_sql)
+                        .bind(plugin_submission_id)
+                        .bind(row.listing_id)
+                        .bind(capture_sha256)
+                        .fetch_optional(&mut **$transaction)
+                        .await?;
+                        capture.is_some_and(
+                            |(
+                                rendered_html,
+                                checkpoint,
+                                install_created_at,
+                                submitted_at,
+                                install_revoked_at,
+                            )| {
+                                format!("{:x}", Sha256::digest(rendered_html.as_bytes()))
+                                    == capture_sha256
+                                    && format!("{:x}", Sha256::digest(checkpoint.as_bytes()))
+                                        == extracted_listing_sha256
+                                    && retained_capture_timestamp_chronology_valid(
+                                        &install_created_at,
+                                        &submitted_at,
+                                        install_revoked_at.as_deref(),
+                                    )
+                                    && current_checkpoint_contains_avionics_source_evidence(
+                                        &checkpoint,
+                                        source_notes,
+                                    )
+                            },
+                        )
                     } else {
                         false
                     };
@@ -2098,10 +2149,11 @@ mod tests {
             INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
               listing_link_id, association_role, avionics_model_id,
               authorization_kind, observation_sha256, product_fingerprint,
-              evidence_capture_sha256, collision_closure_sha256
+              evidence_capture_sha256, plugin_submission_id,
+              extracted_listing_sha256, collision_closure_sha256
             )
             SELECT ?, 'installed', ?, 'manufacturer_reuse', ?,
-                   product_fingerprint, ?, ?
+                   product_fingerprint, ?, ?, ?, ?
             FROM avionics_product_reuse_attestations
             WHERE avionics_model_id = ?
         "#;
@@ -2194,26 +2246,64 @@ mod tests {
 
         let rendered_html = format!("<html><body>{EVIDENCE}</body></html>");
         let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
+        let checkpoint = serde_json::json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2010,
+            "asking_price_usd": 175000,
+            "currency": "USD",
+            "airframe_hours": 1000,
+            "engine_hours": 500,
+            "engine_time_basis": "unknown",
+            "engine_time_evidence": null,
+            "engine_time_confidence": null,
+            "propeller_hours": 300,
+            "propeller_time_basis": "unknown",
+            "propeller_time_evidence": null,
+            "propeller_time_confidence": null,
+            "installed_engine": null,
+            "installed_propeller": null,
+            "registration_number": "N123",
+            "serial_number": "S123",
+            "status": "active",
+            "avionics": [{
+                "manufacturer": "Garmin",
+                "model": "GIA63W",
+                "types": ["COM"],
+                "quantity": 2,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": EVIDENCE,
+                "source_confidence": "high"
+            }],
+            "valuation_facts": []
+        })
+        .to_string();
+        let checkpoint_sha256 = format!("{:x}", Sha256::digest(checkpoint.as_bytes()));
         let install_id: i64 = sqlx::query_scalar(
             "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (1, 'dataset-explicit-count-key') RETURNING id",
         )
         .fetch_one(pool)
         .await
         .unwrap();
-        sqlx::query(
+        let submission_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO plugin_submissions (
               user_id, plugin_install_id, source_url, rendered_html,
-              rendered_html_sha256, signature_base64, canonical_listing_id
+              rendered_html_sha256, signature_base64, extracted_listing_json,
+              canonical_listing_id
             ) VALUES (1, ?, 'https://example.test/listing', ?, ?,
-                      'dataset-explicit-count-signature', ?)
+                      'dataset-explicit-count-signature', ?, ?)
+            RETURNING id
             "#,
         )
         .bind(install_id)
         .bind(&rendered_html)
         .bind(&rendered_html_sha256)
+        .bind(&checkpoint)
         .bind(listing_id)
-        .execute(pool)
+        .fetch_one(pool)
         .await
         .unwrap();
         let link_id: i64 = sqlx::query_scalar(
@@ -2250,6 +2340,8 @@ mod tests {
             .bind(model_id)
             .bind(&observation_sha256)
             .bind(&rendered_html_sha256)
+            .bind(submission_id)
+            .bind(&checkpoint_sha256)
             .bind(&collision_closure_sha256)
             .bind(model_id)
             .execute(pool)
@@ -2274,8 +2366,35 @@ mod tests {
         sqlx::query(INSERT_AUTHORIZATION_SQL)
             .bind(link_id)
             .bind(model_id)
+            .bind(&observation_sha256)
+            .bind(&rendered_html_sha256)
+            .bind(submission_id)
+            .bind("0".repeat(64))
+            .bind(&collision_closure_sha256)
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(load_equipment(&db)
+            .await
+            .unwrap()
+            .get(&listing_id)
+            .is_none());
+
+        sqlx::query(
+            "DELETE FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
+        )
+        .bind(link_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(INSERT_AUTHORIZATION_SQL)
+            .bind(link_id)
+            .bind(model_id)
             .bind("0".repeat(64))
             .bind(&rendered_html_sha256)
+            .bind(submission_id)
+            .bind(&checkpoint_sha256)
             .bind(&collision_closure_sha256)
             .bind(model_id)
             .execute(pool)
@@ -2298,6 +2417,8 @@ mod tests {
             .bind(model_id)
             .bind(&observation_sha256)
             .bind(&rendered_html_sha256)
+            .bind(submission_id)
+            .bind(&checkpoint_sha256)
             .bind(&collision_closure_sha256)
             .bind(model_id)
             .execute(pool)

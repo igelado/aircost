@@ -280,7 +280,7 @@ BEGIN
     INTO actual_object_count, actual_definition_digest
     FROM pg_temp.reference_catalog_schema_owned_objects;
     IF actual_object_count <> 792
-       OR actual_definition_digest <> 'a12dfb4a0ff4f026bee8b16c1c26ac0a' THEN
+       OR actual_definition_digest <> 'f1ed12c366a583546439a58db5fa8359' THEN
       RAISE EXCEPTION
         'reference catalog canonical schema owned-object mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
@@ -3922,8 +3922,10 @@ BEFORE UPDATE ON aircraft_sale_listing_avionics_grounded_capabilities
 FOR EACH ROW EXECUTE FUNCTION public.reject_listing_avionics_grounded_capability_update();
 
 -- Exact authorization for one listing-link component. Manufacturer-reuse
--- authorizations bind the current global attestation; same-case authorizations
--- bind the transient grounded resolution that approved this exact association.
+-- authorizations require both the current global attestation and the exact
+-- signed submission/capture/checkpoint occurrence. Same-case authorizations
+-- bind that exact checkpoint plus the transient grounded resolution.
+-- Consumers re-hash extracted_listing_json for backend-parity fail-closed reads.
 CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_link_authorizations (
     listing_link_id BIGINT NOT NULL
       REFERENCES public.aircraft_sale_listing_avionics(id) ON DELETE CASCADE,
@@ -3940,11 +3942,10 @@ CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_link_authorizat
     grounded_resolution_sha256 TEXT,
     evidence_capture_sha256 TEXT NOT NULL
       CHECK (evidence_capture_sha256 ~ '^[0-9a-f]{64}$'),
-    plugin_submission_id BIGINT
+    plugin_submission_id BIGINT NOT NULL
       REFERENCES public.plugin_submissions(id) ON DELETE CASCADE,
-    extracted_listing_sha256 TEXT
-      CHECK (extracted_listing_sha256 IS NULL OR
-             extracted_listing_sha256 ~ '^[0-9a-f]{64}$'),
+    extracted_listing_sha256 TEXT NOT NULL
+      CHECK (extracted_listing_sha256 ~ '^[0-9a-f]{64}$'),
     collision_closure_sha256 TEXT NOT NULL
       CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
     source_revocation_count BIGINT,
@@ -3953,14 +3954,10 @@ CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_link_authorizat
     CHECK (
       (authorization_kind = 'manufacturer_reuse'
       AND grounded_resolution_sha256 IS NULL
-      AND plugin_submission_id IS NULL
-      AND extracted_listing_sha256 IS NULL
       AND source_revocation_count IS NULL)
       OR
       (authorization_kind = 'same_case_grounded'
       AND grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'
-      AND plugin_submission_id IS NOT NULL
-      AND extracted_listing_sha256 IS NOT NULL
       AND source_revocation_count IS NOT NULL
       AND source_revocation_count >= 0)
     )
@@ -3995,10 +3992,50 @@ BEGIN
       AND (
         (NEW.authorization_kind = 'manufacturer_reuse'
           AND EXISTS (
-            SELECT 1 FROM public.plugin_submissions capture
-            WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
+            SELECT 1
+            FROM public.plugin_submissions capture
+            JOIN public.plugin_installs install
+              ON install.id = capture.plugin_install_id
+             AND install.user_id = capture.user_id
+            WHERE capture.id = NEW.plugin_submission_id
+              AND capture.canonical_listing_id = link.aircraft_sale_listing_id
+              AND EXISTS (
+                SELECT 1 FROM public.aircraft_sale_listings listing
+                WHERE listing.id = link.aircraft_sale_listing_id
+                  AND listing.created_by_user_id = capture.user_id
+                  AND listing.source_url = capture.source_url
+              )
               AND capture.rendered_html_sha256 = NEW.evidence_capture_sha256
-              AND position(link.source_notes IN capture.rendered_html) > 0
+              AND capture.extracted_listing_json IS NOT NULL
+              AND capture.extraction_error IS NULL
+              AND CAST(install.created_at AS TIMESTAMPTZ) IS NOT NULL
+              AND CAST(capture.submitted_at AS TIMESTAMPTZ) IS NOT NULL
+              AND CAST(capture.submitted_at AS TIMESTAMPTZ)
+                >= CAST(install.created_at AS TIMESTAMPTZ)
+              AND (
+                install.revoked_at IS NULL
+                OR (
+                  CAST(install.revoked_at AS TIMESTAMPTZ) IS NOT NULL
+                  AND CAST(install.revoked_at AS TIMESTAMPTZ)
+                    >= CAST(install.created_at AS TIMESTAMPTZ)
+                  AND CAST(capture.submitted_at AS TIMESTAMPTZ)
+                    <= CAST(install.revoked_at AS TIMESTAMPTZ)
+                )
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.jsonb_array_elements(
+                  CASE
+                    WHEN pg_catalog.jsonb_typeof(
+                      capture.extracted_listing_json::pg_catalog.jsonb -> 'avionics'
+                    ) = 'array'
+                    THEN capture.extracted_listing_json::pg_catalog.jsonb -> 'avionics'
+                    ELSE '[]'::pg_catalog.jsonb
+                  END
+                ) occurrence
+                WHERE pg_catalog.jsonb_typeof(occurrence) = 'object'
+                  AND occurrence ->> 'source_evidence_text' = link.source_notes
+              )
           )
           AND EXISTS (
             SELECT 1 FROM public.avionics_product_reuse_attestations attestation
@@ -4008,13 +4045,50 @@ BEGIN
         OR
         (NEW.authorization_kind = 'same_case_grounded'
           AND EXISTS (
-            SELECT 1 FROM public.plugin_submissions submission
+            SELECT 1
+            FROM public.plugin_submissions submission
+            JOIN public.plugin_installs install
+              ON install.id = submission.plugin_install_id
+             AND install.user_id = submission.user_id
             WHERE submission.id = NEW.plugin_submission_id
               AND submission.canonical_listing_id = link.aircraft_sale_listing_id
+              AND EXISTS (
+                SELECT 1 FROM public.aircraft_sale_listings listing
+                WHERE listing.id = link.aircraft_sale_listing_id
+                  AND listing.created_by_user_id = submission.user_id
+                  AND listing.source_url = submission.source_url
+              )
               AND submission.rendered_html_sha256 = NEW.evidence_capture_sha256
               AND submission.extracted_listing_json IS NOT NULL
               AND submission.extraction_error IS NULL
-              AND position(link.source_notes IN submission.rendered_html) > 0
+              AND CAST(install.created_at AS TIMESTAMPTZ) IS NOT NULL
+              AND CAST(submission.submitted_at AS TIMESTAMPTZ) IS NOT NULL
+              AND CAST(submission.submitted_at AS TIMESTAMPTZ)
+                >= CAST(install.created_at AS TIMESTAMPTZ)
+              AND (
+                install.revoked_at IS NULL
+                OR (
+                  CAST(install.revoked_at AS TIMESTAMPTZ) IS NOT NULL
+                  AND CAST(install.revoked_at AS TIMESTAMPTZ)
+                    >= CAST(install.created_at AS TIMESTAMPTZ)
+                  AND CAST(submission.submitted_at AS TIMESTAMPTZ)
+                    <= CAST(install.revoked_at AS TIMESTAMPTZ)
+                )
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.jsonb_array_elements(
+                  CASE
+                    WHEN pg_catalog.jsonb_typeof(
+                      submission.extracted_listing_json::pg_catalog.jsonb -> 'avionics'
+                    ) = 'array'
+                    THEN submission.extracted_listing_json::pg_catalog.jsonb -> 'avionics'
+                    ELSE '[]'::pg_catalog.jsonb
+                  END
+                ) occurrence
+                WHERE pg_catalog.jsonb_typeof(occurrence) = 'object'
+                  AND occurrence ->> 'source_evidence_text' = link.source_notes
+              )
           )
           AND EXISTS (
             SELECT 1 FROM public.avionics_approved_product_graph_identities identity
@@ -4305,24 +4379,8 @@ RETURNS TRIGGER LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $function$
 BEGIN
-  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations authorization_row
-  USING public.aircraft_sale_listing_avionics link
-  WHERE link.id = authorization_row.listing_link_id
-    AND authorization_row.evidence_capture_sha256 = OLD.rendered_html_sha256
-    AND link.aircraft_sale_listing_id = OLD.canonical_listing_id
-    AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
-    AND position(link.source_notes IN OLD.rendered_html) > 0
-    AND NOT EXISTS (
-      SELECT 1 FROM public.plugin_submissions retained_capture
-      WHERE retained_capture.canonical_listing_id =
-              link.aircraft_sale_listing_id
-        AND retained_capture.rendered_html_sha256 =
-              authorization_row.evidence_capture_sha256
-        AND position(link.source_notes IN retained_capture.rendered_html) > 0
-    );
   DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
-  WHERE authorization_kind = 'same_case_grounded'
-    AND plugin_submission_id = OLD.id;
+  WHERE plugin_submission_id = OLD.id;
   IF TG_OP = 'DELETE' THEN
     RETURN OLD;
   END IF;
@@ -4345,6 +4403,11 @@ ON public.plugin_submissions;
 CREATE TRIGGER
   listing_avionics_authorizations_invalidate_capture_update
 AFTER UPDATE OF
+  user_id,
+  plugin_install_id,
+  source_url,
+  submitted_at,
+  signature_base64,
   canonical_listing_id,
   rendered_html,
   rendered_html_sha256,
@@ -4352,7 +4415,112 @@ AFTER UPDATE OF
   extraction_error
 ON public.plugin_submissions
 FOR EACH ROW
+WHEN (
+  NEW.user_id IS DISTINCT FROM OLD.user_id
+  OR NEW.plugin_install_id IS DISTINCT FROM OLD.plugin_install_id
+  OR NEW.source_url IS DISTINCT FROM OLD.source_url
+  OR NEW.submitted_at IS DISTINCT FROM OLD.submitted_at
+  OR NEW.signature_base64 IS DISTINCT FROM OLD.signature_base64
+  OR NEW.canonical_listing_id IS DISTINCT FROM OLD.canonical_listing_id
+  OR NEW.rendered_html IS DISTINCT FROM OLD.rendered_html
+  OR NEW.rendered_html_sha256 IS DISTINCT FROM OLD.rendered_html_sha256
+  OR NEW.extracted_listing_json IS DISTINCT FROM OLD.extracted_listing_json
+  OR NEW.extraction_error IS DISTINCT FROM OLD.extraction_error
+)
 EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_capture();
+
+CREATE OR REPLACE FUNCTION
+  public.invalidate_listing_avionics_auth_for_listing_provenance()
+RETURNS TRIGGER LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations AS link_authorization
+  USING public.aircraft_sale_listing_avionics link
+  WHERE link_authorization.listing_link_id = link.id
+    AND link.aircraft_sale_listing_id = OLD.id;
+  RETURN NEW;
+END
+$function$;
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_listing_provenance
+ON public.aircraft_sale_listings;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_listing_provenance
+AFTER UPDATE OF created_by_user_id, source_url ON public.aircraft_sale_listings
+FOR EACH ROW
+WHEN (
+  NEW.created_by_user_id IS DISTINCT FROM OLD.created_by_user_id
+  OR NEW.source_url IS DISTINCT FROM OLD.source_url
+)
+EXECUTE FUNCTION
+  public.invalidate_listing_avionics_auth_for_listing_provenance();
+
+CREATE OR REPLACE FUNCTION
+  public.invalidate_listing_avionics_auth_for_install_provenance()
+RETURNS TRIGGER LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  IF NEW.user_id IS DISTINCT FROM OLD.user_id
+    OR NEW.public_key_base64 IS DISTINCT FROM OLD.public_key_base64
+    OR NEW.created_at IS DISTINCT FROM OLD.created_at
+  THEN
+    DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations AS link_authorization
+    USING public.plugin_submissions submission
+    WHERE link_authorization.plugin_submission_id = submission.id
+      AND submission.plugin_install_id = OLD.id;
+  ELSIF NEW.revoked_at IS DISTINCT FROM OLD.revoked_at
+    AND NEW.revoked_at IS NOT NULL
+  THEN
+    IF NOT pg_catalog.pg_input_is_valid(
+      NEW.created_at, 'timestamp with time zone'
+    ) OR NOT pg_catalog.pg_input_is_valid(
+      NEW.revoked_at, 'timestamp with time zone'
+    ) OR CAST(NEW.revoked_at AS TIMESTAMPTZ)
+      < CAST(NEW.created_at AS TIMESTAMPTZ)
+    THEN
+      DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations AS link_authorization
+      USING public.plugin_submissions submission
+      WHERE link_authorization.plugin_submission_id = submission.id
+        AND submission.plugin_install_id = OLD.id;
+    ELSE
+      DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations AS link_authorization
+      USING public.plugin_submissions submission
+      WHERE link_authorization.plugin_submission_id = submission.id
+        AND submission.plugin_install_id = OLD.id
+        AND (
+          NOT pg_catalog.pg_input_is_valid(
+            submission.submitted_at, 'timestamp with time zone'
+          )
+          OR CAST(submission.submitted_at AS TIMESTAMPTZ)
+            < CAST(NEW.created_at AS TIMESTAMPTZ)
+          OR CAST(submission.submitted_at AS TIMESTAMPTZ)
+            > CAST(NEW.revoked_at AS TIMESTAMPTZ)
+        );
+    END IF;
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_install_provenance
+ON public.plugin_installs;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_install_provenance
+AFTER UPDATE OF user_id, public_key_base64, created_at, revoked_at
+ON public.plugin_installs
+FOR EACH ROW
+WHEN (
+  NEW.user_id IS DISTINCT FROM OLD.user_id
+  OR NEW.public_key_base64 IS DISTINCT FROM OLD.public_key_base64
+  OR NEW.created_at IS DISTINCT FROM OLD.created_at
+  OR NEW.revoked_at IS DISTINCT FROM OLD.revoked_at
+)
+EXECUTE FUNCTION
+  public.invalidate_listing_avionics_auth_for_install_provenance();
 
 
 -- Audit surfaces for legacy action graphs. Non-ready legacy listings may
@@ -10653,7 +10821,7 @@ BEGIN
   INTO actual_object_count, actual_definition_digest
   FROM pg_temp.reference_catalog_schema_owned_objects;
   IF actual_object_count <> 792
-     OR actual_definition_digest <> 'a12dfb4a0ff4f026bee8b16c1c26ac0a' THEN
+     OR actual_definition_digest <> 'f1ed12c366a583546439a58db5fa8359' THEN
     RAISE EXCEPTION
       'reference catalog canonical schema post-state mismatch (% objects, digest %)',
       actual_object_count, actual_definition_digest;
