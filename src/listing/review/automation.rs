@@ -44,11 +44,10 @@ use crate::plugin::{
 };
 
 use super::{
-    association_observation_sha256_from_values, conservative_confidence, merged_notes,
-    parse_payload, serialize_review_payload, sha256_hex, valid_sha256,
-    validate_exact_listing_evidence_span, validate_exact_listing_product_evidence,
-    ListingAssociationRole, PendingReviewAspect, ReviewError, ReviewResult,
-    POSTGRES_LISTING_CHILD_LOCK_SQL, POSTGRES_RESTAGE_CATALOG_LOCK_SQL,
+    association_observation_sha256_from_values, parse_payload, serialize_review_payload,
+    sha256_hex, valid_sha256, validate_exact_listing_evidence_span,
+    validate_exact_listing_product_evidence, ListingAssociationRole, PendingReviewAspect,
+    ReviewError, ReviewResult, POSTGRES_LISTING_CHILD_LOCK_SQL, POSTGRES_RESTAGE_CATALOG_LOCK_SQL,
 };
 use crate::avionics::catalog::globally_unique_active_exact_model_id;
 
@@ -510,41 +509,17 @@ fn graph_key(
     approved_avionics_product_key(manufacturer_identity_id, product_key).map_err(ReviewError::Stale)
 }
 
-fn merge_compatible(existing: &mut PreparedLink, incoming: PreparedLink) -> ReviewResult<()> {
+fn reject_duplicate_subject(existing: &PreparedLink, incoming: &PreparedLink) -> ReviewResult<()> {
     if existing.avionics_model_id != incoming.avionics_model_id {
         return Err(ReviewError::Conflict(format!(
             "approved avionics catalog ids {} and {} share one canonical graph identity",
             existing.avionics_model_id, incoming.avionics_model_id
         )));
     }
-    if existing.configuration_action != incoming.configuration_action
-        || existing.replacement_key != incoming.replacement_key
-        || existing.replaces_avionics_model_id != incoming.replaces_avionics_model_id
-        || existing.authorization != incoming.authorization
-        || existing.replacement_authorization != incoming.replacement_authorization
-    {
-        return Err(ReviewError::Validation(format!(
-            "avionics catalog id {} has conflicting installation actions or replacement targets",
-            existing.avionics_model_id
-        )));
-    }
-    existing.quantity = existing.quantity.max(incoming.quantity);
-    existing.source_notes = merged_notes(
-        existing.source_notes.as_deref(),
-        incoming.source_notes.as_deref(),
-    );
-    existing.source_confidence = conservative_confidence(
-        existing.source_confidence.as_deref(),
-        incoming.source_confidence.as_deref(),
-    );
-    if existing.source != incoming.source
-        && (existing.source == "listing_review" || incoming.source == "listing_review")
-    {
-        // This can only happen while coalescing two already-persisted,
-        // reviewer-confirmed links. Automated input itself is always listing.
-        existing.source = "listing_review".to_string();
-    }
-    Ok(())
+    Err(ReviewError::Validation(format!(
+        "avionics catalog id {} occurs more than once in the prepared automatic graph; distinct occurrences require review and cannot be merged by quantity or evidence",
+        existing.avionics_model_id
+    )))
 }
 
 fn prepared_action(link: &PreparedLink) -> CanonicalAvionicsAction {
@@ -1765,8 +1740,8 @@ pub(crate) async fn apply_automated_avionics_review(
                     replacement_authorization: link.replacement_authorization.clone(),
                     replacement_key,
                 };
-                if let Some(existing) = accepted.get_mut(&incoming.subject_key) {
-                    merge_compatible(existing, incoming)?;
+                if let Some(existing) = accepted.get(&incoming.subject_key) {
+                    reject_duplicate_subject(existing, &incoming)?;
                 } else {
                     accepted.insert(incoming.subject_key.clone(), incoming);
                 }
@@ -1925,8 +1900,8 @@ pub(crate) async fn apply_automated_avionics_review(
                         .map(|_| AutomatedAssociationAuthorization::ManufacturerReuse),
                     replacement_key,
                 };
-                if let Some(existing) = preserved.get_mut(&subject_key) {
-                    merge_compatible(existing, incoming)?;
+                if let Some(existing) = preserved.get(&subject_key) {
+                    reject_duplicate_subject(existing, &incoming)?;
                 } else {
                     preserved.insert(subject_key, incoming);
                 }
@@ -2701,6 +2676,59 @@ mod tests {
             expected_replacement_collision_closure_sha256: None,
             preserved_association_guard: None,
         }
+    }
+
+    fn prepared_link(
+        model_id: i64,
+        subject_key: &str,
+        quantity: i64,
+        source_notes: &str,
+    ) -> PreparedLink {
+        PreparedLink {
+            avionics_model_id: model_id,
+            authorization: AutomatedAssociationAuthorization::ManufacturerReuse,
+            subject_key: subject_key.to_string(),
+            quantity,
+            source: "listing".to_string(),
+            source_notes: Some(source_notes.to_string()),
+            source_confidence: Some("high".to_string()),
+            configuration_action: "installed".to_string(),
+            replaces_avionics_model_id: None,
+            replacement_authorization: None,
+            replacement_key: None,
+        }
+    }
+
+    #[test]
+    fn duplicate_subject_distinct_occurrences_cannot_merge_quantity_or_evidence() {
+        let existing = prepared_link(42, "manufacturer:7:product:gnx375", 1, "GNX 375 GPS");
+        let incoming = prepared_link(
+            42,
+            "manufacturer:7:product:gnx375",
+            2,
+            "GNX 375 transponder",
+        );
+
+        let error = reject_duplicate_subject(&existing, &incoming)
+            .expect_err("distinct accepted occurrences must remain review work");
+
+        assert!(error.to_string().contains("occurs more than once"));
+        assert!(error.to_string().contains("cannot be merged"));
+        assert_eq!(existing.quantity, 1);
+        assert_eq!(existing.source_notes.as_deref(), Some("GNX 375 GPS"));
+    }
+
+    #[test]
+    fn duplicate_subject_exact_rows_have_no_automatic_merge_bypass() {
+        let existing = prepared_link(42, "manufacturer:7:product:gnx375", 1, "GNX 375");
+        let incoming = existing.clone();
+
+        let error = reject_duplicate_subject(&existing, &incoming)
+            .expect_err("even byte-identical accepted rows name distinct occurrences");
+
+        assert!(error
+            .to_string()
+            .contains("distinct occurrences require review"));
     }
 
     #[test]

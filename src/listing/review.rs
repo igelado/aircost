@@ -8294,67 +8294,15 @@ struct PreparedAssignment {
     replaces_avionics_model_id: Option<i64>,
 }
 
-fn merged_notes(left: Option<&str>, right: Option<&str>) -> Option<String> {
-    match (left.map(str::trim), right.map(str::trim)) {
-        (None | Some(""), None | Some("")) => None,
-        (Some(left), None | Some("")) => Some(left.to_string()),
-        (None | Some(""), Some(right)) => Some(right.to_string()),
-        (Some(left), Some(right)) if left == right => Some(left.to_string()),
-        (Some(left), Some(right)) => Some(format!("{left}\n{right}")),
-    }
-}
-
-fn conservative_confidence(left: Option<&str>, right: Option<&str>) -> Option<String> {
-    let rank = |value: &str| match value {
-        "high" => 0,
-        "medium" => 1,
-        "low" => 2,
-        _ => 3,
-    };
-    match (left, right) {
-        (Some(left), Some(right)) => Some(
-            if rank(left) >= rank(right) {
-                left
-            } else {
-                right
-            }
-            .to_string(),
-        ),
-        _ => None,
-    }
-}
-
-fn merge_assignment(
-    existing: &mut PreparedAssignment,
-    incoming: PreparedAssignment,
+fn reject_duplicate_assignment(
+    existing: &PreparedAssignment,
+    incoming: &PreparedAssignment,
 ) -> ReviewResult<()> {
-    if existing.configuration_action != incoming.configuration_action
-        || existing.replaces_avionics_model_id != incoming.replaces_avionics_model_id
-    {
-        return Err(ReviewError::Validation(format!(
-            "verified avionics product {} has conflicting installation actions or replacement targets",
-            existing.avionics_model_id
-        )));
-    }
-    existing.quantity = existing.quantity.max(incoming.quantity);
-    let reviewer_confirmed =
-        existing.source == "listing_review" || incoming.source == "listing_review";
-    if existing.source != incoming.source {
-        existing.source = "listing_review".to_string();
-    }
-    existing.source_notes = merged_notes(
-        existing.source_notes.as_deref(),
-        incoming.source_notes.as_deref(),
-    );
-    existing.source_confidence = if reviewer_confirmed {
-        Some("high".to_string())
-    } else {
-        conservative_confidence(
-            existing.source_confidence.as_deref(),
-            incoming.source_confidence.as_deref(),
-        )
-    };
-    Ok(())
+    debug_assert_eq!(existing.avionics_model_id, incoming.avionics_model_id);
+    Err(ReviewError::Validation(format!(
+        "multiple review occurrences resolve to verified avionics product {}; correct the extraction to one occurrence with an explicit source-supported quantity",
+        existing.avionics_model_id
+    )))
 }
 
 /// Applies a complete set of reviewer decisions atomically. This transaction
@@ -9581,8 +9529,8 @@ pub async fn resolve_listing_review(
                     configuration_action: aspect.configuration_action.clone(),
                     replaces_avionics_model_id,
                 };
-                if let Some(existing) = assignments.get_mut(&avionics_model_id) {
-                    merge_assignment(existing, incoming)?;
+                if let Some(existing) = assignments.get(&avionics_model_id) {
+                    reject_duplicate_assignment(existing, &incoming)?;
                 } else {
                     assignments.insert(avionics_model_id, incoming);
                 }
@@ -9743,6 +9691,43 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn complete_review_rejects_multiple_occurrences_for_one_product() {
+        let existing = PreparedAssignment {
+            avionics_model_id: 375,
+            quantity: 1,
+            source: "listing_review".to_string(),
+            source_notes: Some("GNX 375 GPS navigator installed".to_string()),
+            source_confidence: Some("high".to_string()),
+            configuration_action: "installed".to_string(),
+            replaces_avionics_model_id: None,
+        };
+        let incoming = PreparedAssignment {
+            avionics_model_id: 375,
+            quantity: 2,
+            source: "listing_review".to_string(),
+            source_notes: Some("GNX 375 Mode S transponder installed".to_string()),
+            source_confidence: Some("high".to_string()),
+            configuration_action: "installed".to_string(),
+            replaces_avionics_model_id: None,
+        };
+
+        let error = reject_duplicate_assignment(&existing, &incoming)
+            .expect_err("review must not infer physical quantity from catalog convergence");
+
+        assert!(error
+            .to_string()
+            .contains("correct the extraction to one occurrence"));
+        assert_eq!(
+            existing.quantity, 1,
+            "the first assignment remains unchanged"
+        );
+        assert_eq!(
+            existing.source_notes.as_deref(),
+            Some("GNX 375 GPS navigator installed")
+        );
+    }
 
     #[test]
     fn exact_association_evidence_is_scoped_to_the_bound_source_span() {

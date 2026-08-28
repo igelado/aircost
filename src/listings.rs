@@ -2145,23 +2145,17 @@ fn prepare_grounded_capability_bindings(
                 "grounded capability has no resolved installed catalog product".to_string(),
             )
         })?;
-        let installed_quantity_coverage = item
-            .grounded_capabilities
-            .iter()
-            .map(|capability| capability.seed.requested_quantity())
-            .max()
-            .unwrap_or_default();
         if !item.grounded_capabilities.is_empty()
-            && (item.grounded_capabilities.iter().any(|capability| {
-                capability.occurrence_role != OccurrenceRole::Primary
-                    || capability.configuration_action != item.configuration_action
-                    || capability.seed.avionics_model_id() != installed_id
-                    || capability.seed.requested_quantity() <= 0
-                    || capability.seed.requested_quantity() > item.quantity
-            }) || installed_quantity_coverage != item.quantity)
+            && (item.grounded_capabilities.len() != 1
+                || item.grounded_capabilities.iter().any(|capability| {
+                    capability.occurrence_role != OccurrenceRole::Primary
+                        || capability.configuration_action != item.configuration_action
+                        || capability.seed.avionics_model_id() != installed_id
+                        || capability.seed.requested_quantity() != item.quantity
+                }))
         {
             return Err(ListingStoreError::State(format!(
-                "grounded capabilities do not cover the exact quantity and action for avionics catalog id {installed_id}"
+                "one grounded occurrence must cover the exact quantity and action for avionics catalog id {installed_id}"
             )));
         }
         for capability in &item.grounded_capabilities {
@@ -2184,18 +2178,19 @@ fn prepare_grounded_capability_bindings(
                     "replacement grounded capability has no resolved target".to_string(),
                 )
             })?;
-            if item
-                .replacement_grounded_capabilities
-                .iter()
-                .any(|capability| {
-                    capability.occurrence_role != OccurrenceRole::Replacement
-                        || capability.configuration_action != item.configuration_action
-                        || capability.seed.avionics_model_id() != replacement_id
-                        || capability.seed.requested_quantity() != 1
-                })
+            if item.replacement_grounded_capabilities.len() != 1
+                || item
+                    .replacement_grounded_capabilities
+                    .iter()
+                    .any(|capability| {
+                        capability.occurrence_role != OccurrenceRole::Replacement
+                            || capability.configuration_action != item.configuration_action
+                            || capability.seed.avionics_model_id() != replacement_id
+                            || capability.seed.requested_quantity() != 1
+                    })
             {
                 return Err(ListingStoreError::State(format!(
-                    "grounded capabilities do not cover the exact replacement semantics for avionics catalog id {replacement_id}"
+                    "one grounded occurrence must cover the exact replacement semantics for avionics catalog id {replacement_id}"
                 )));
             }
             for capability in &item.replacement_grounded_capabilities {
@@ -3733,7 +3728,7 @@ async fn resolve_listing_avionics_values(
         }
     }
 
-    values.avionics = coalesce_resolved_listing_avionics(resolved)?;
+    values.avionics = require_unique_resolved_listing_avionics(resolved)?;
     Ok(ResolvedListingAvionics {
         pending_review_aspects: pending,
         occurrence_dispositions: dispositions,
@@ -4615,29 +4610,15 @@ fn listing_avionics_after_generic_target_rejection(
     removal
 }
 
-fn merged_avionics_types(left: &[String], right: &[String]) -> Vec<String> {
-    let mut merged = left.to_vec();
-    for avionics_type in right {
-        if !merged
-            .iter()
-            .any(|known| normalize_name(known) == normalize_name(avionics_type))
-        {
-            merged.push(avionics_type.clone());
-        }
-    }
-    merged.sort_by_key(|value| normalize_name(value));
-    merged
-}
-
-fn merge_duplicate_listing_avionics(
-    existing: &mut ListingAvionicsValue,
+fn reject_duplicate_listing_avionics(
+    existing: &ListingAvionicsValue,
     incoming: &ListingAvionicsValue,
 ) -> StoreResult<()> {
     let existing_model_id = existing.avionics_model_id.filter(|id| *id > 0);
     let incoming_model_id = incoming.avionics_model_id.filter(|id| *id > 0);
     if existing_model_id.is_none() || existing_model_id != incoming_model_id {
         return Err(ListingStoreError::State(
-            "only rows for the same resolved avionics catalog product can be coalesced".to_string(),
+            "duplicate avionics validation requires one resolved catalog product".to_string(),
         ));
     }
     if existing
@@ -4689,45 +4670,10 @@ fn merge_duplicate_listing_avionics(
         )));
     }
 
-    // Multiple capability mentions describe one physical unit, not additive
-    // quantities. Preserve all evidence, and let the weakest mention govern
-    // confidence so a strong duplicate cannot upgrade a weak one.
-    existing.quantity = existing.quantity.max(incoming.quantity);
-    existing.avionics_types =
-        merged_avionics_types(&existing.avionics_types, &incoming.avionics_types);
-    existing.source_notes = merged_source_notes(
-        existing.source_notes.as_deref(),
-        incoming.source_notes.as_deref(),
-    );
-    existing.source_confidence = conservative_source_confidence(
-        existing.source_confidence.as_deref(),
-        incoming.source_confidence.as_deref(),
-    )?;
-    let exact_count_basis = [
-        incoming.source_confidence_basis.as_ref(),
-        existing.source_confidence_basis.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|basis| match basis {
-        ListingSourceConfidenceBasis::ExactControllerLeadingDualCountableUnit(proof) => {
-            Some(proof.clone())
-        }
-        ListingSourceConfidenceBasis::RetainedHigh => None,
-    });
-    if let Some(proof) = exact_count_basis {
-        existing.source = "listing_explicit_count".to_string();
-        existing.source_notes = Some(proof.evidence_text().to_string());
-        existing.source_confidence_basis =
-            Some(ListingSourceConfidenceBasis::ExactControllerLeadingDualCountableUnit(proof));
-    }
-    existing
-        .grounded_capabilities
-        .extend(incoming.grounded_capabilities.iter().cloned());
-    existing
-        .replacement_grounded_capabilities
-        .extend(incoming.replacement_grounded_capabilities.iter().cloned());
-    Ok(())
+    Err(ListingStoreError::Validation(format!(
+        "catalog avionics model {} resolved from multiple listing occurrences; quantity must come from one explicit source-validated occurrence",
+        existing_model_id.expect("resolved catalog id checked above")
+    )))
 }
 
 fn matching_avionics_reference(
@@ -4749,52 +4695,10 @@ fn matching_avionics_reference(
             == canonical_avionics_types(&right.avionics_types)
 }
 
-fn merged_source_notes(left: Option<&str>, right: Option<&str>) -> Option<String> {
-    let mut notes = Vec::new();
-    for note in [left, right].into_iter().flatten() {
-        for line in note.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            if !notes.contains(&line) {
-                notes.push(line);
-            }
-        }
-    }
-    (!notes.is_empty()).then(|| notes.join("\n"))
-}
-
-fn conservative_source_confidence(
-    left: Option<&str>,
-    right: Option<&str>,
-) -> StoreResult<Option<String>> {
-    fn rank(confidence: &str) -> Option<u8> {
-        match confidence {
-            "low" => Some(0),
-            "medium" => Some(1),
-            "high" => Some(2),
-            _ => None,
-        }
-    }
-
-    for confidence in [left, right].into_iter().flatten() {
-        if rank(confidence).is_none() {
-            return Err(ListingStoreError::Validation(format!(
-                "invalid avionics source confidence while coalescing duplicates: {confidence}"
-            )));
-        }
-    }
-    let (Some(left), Some(right)) = (left, right) else {
-        return Ok(None);
-    };
-    let left_rank = rank(left).expect("confidence values checked above");
-    let right_rank = rank(right).expect("confidence values checked above");
-    Ok(Some(
-        if left_rank <= right_rank { left } else { right }.to_string(),
-    ))
-}
-
-fn coalesce_resolved_listing_avionics(
+fn require_unique_resolved_listing_avionics(
     avionics: impl IntoIterator<Item = ListingAvionicsValue>,
 ) -> StoreResult<Vec<ListingAvionicsValue>> {
-    let mut coalesced: Vec<ListingAvionicsValue> = Vec::new();
+    let mut unique: Vec<ListingAvionicsValue> = Vec::new();
     let mut seen = HashMap::<i64, usize>::new();
     for item in avionics {
         let avionics_model_id = item.avionics_model_id.filter(|id| *id > 0).ok_or_else(|| {
@@ -4804,13 +4708,13 @@ fn coalesce_resolved_listing_avionics(
             ))
         })?;
         if let Some(index) = seen.get(&avionics_model_id).copied() {
-            merge_duplicate_listing_avionics(&mut coalesced[index], &item)?;
+            reject_duplicate_listing_avionics(&unique[index], &item)?;
         } else {
-            seen.insert(avionics_model_id, coalesced.len());
-            coalesced.push(item);
+            seen.insert(avionics_model_id, unique.len());
+            unique.push(item);
         }
     }
-    Ok(coalesced)
+    Ok(unique)
 }
 
 /// Select only one extraction-validated occurrence from the bounded source
@@ -6829,10 +6733,11 @@ async fn replace_listing_avionics(
         link_source_notes: Option<String>,
     }
 
-    // Coalesce by physical catalog product before validation and persistence.
-    // This is deliberately repeated at the storage boundary so no caller can
-    // accidentally delegate conflict resolution to the database upsert.
-    let avionics = coalesce_resolved_listing_avionics(
+    // Require one source-validated occurrence per physical catalog product
+    // before persistence. This is deliberately repeated at the storage
+    // boundary so no caller can infer quantity from duplicate rows or delegate
+    // conflict resolution to the database uniqueness constraint.
+    let avionics = require_unique_resolved_listing_avionics(
         avionics
             .iter()
             .filter(|item| {
@@ -7960,14 +7865,14 @@ mod tests {
     use crate::models::{ParsedAvionics, ParsedAvionicsReference};
 
     use super::{
-        avionics_from_value, coalesce_resolved_listing_avionics, component_time_basis_from_value,
+        avionics_from_value, component_time_basis_from_value,
         exact_occurrence_evidence_from_source_units, listing_avionics_identity_request,
         listing_avionics_identity_resolution, listing_avionics_replacement_resolution,
         listing_avionics_value_from_catalog, replace_listing_avionics,
-        resolve_listing_avionics_values, validate_component_time, ExactListingSourceCaptureScope,
-        ListingAvionicsIdentityResolution, ListingAvionicsReplacementResolution,
-        ListingAvionicsValue, ListingSourceConfidenceBasis, ListingValues, ResolvedListingAvionics,
-        AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON,
+        require_unique_resolved_listing_avionics, resolve_listing_avionics_values,
+        validate_component_time, ExactListingSourceCaptureScope, ListingAvionicsIdentityResolution,
+        ListingAvionicsReplacementResolution, ListingAvionicsValue, ListingSourceConfidenceBasis,
+        ListingValues, ResolvedListingAvionics, AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON,
         AVIONICS_INSTALLATION_EVIDENCE_NOT_HIGH_REASON,
     };
 
@@ -10270,7 +10175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_exact_occurrences_reuse_and_coalesce_without_gemini() {
+    async fn repeated_exact_occurrences_fail_closed_without_gemini() {
         let db = AppDb::connect("sqlite::memory:")
             .await
             .expect("test database should initialize");
@@ -10299,7 +10204,7 @@ mod tests {
         let source_units = test_listing_evidence_units("https://example.com/listing", retained);
         let exact_source_capture_scope = validated_test_source_capture_scope(retained);
 
-        let resolved = resolve_listing_avionics_values(
+        let error = resolve_listing_avionics_values(
             &db,
             &mut values,
             None,
@@ -10310,17 +10215,16 @@ mod tests {
             Some(&exact_source_capture_scope),
         )
         .await
-        .expect("each exact occurrence should use the same attested local identity");
+        .expect_err("duplicate occurrences must not infer one physical quantity");
 
-        assert!(resolved.pending_review_aspects.is_empty());
-        assert_eq!(resolved.occurrence_dispositions.len(), 2);
-        assert!(resolved
-            .occurrence_dispositions
+        assert!(error
+            .to_string()
+            .contains("resolved from multiple listing occurrences"));
+        assert_eq!(values.avionics.len(), 2);
+        assert!(values
+            .avionics
             .iter()
-            .all(|disposition| disposition.avionics_model_id == Some(approved_id)));
-        assert_eq!(values.avionics.len(), 1);
-        assert_eq!(values.avionics[0].avionics_model_id, Some(approved_id));
-        assert_eq!(values.avionics[0].quantity, 1);
+            .all(|occurrence| occurrence.avionics_model_id.is_none()));
         assert_eq!(
             query_scalar_one!(&db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
                 .expect("usage count should load"),
@@ -10849,7 +10753,7 @@ mod tests {
     }
 
     #[test]
-    fn grounded_capability_prebind_uses_max_quantity_for_duplicate_mentions() {
+    fn grounded_capability_prebind_rejects_multiple_occurrence_receipts() {
         let values = listing_values_with_variant("182T SKYLANE");
         let context = "GTX 345R installed";
         let identity = approved_avionics_identity();
@@ -10888,15 +10792,15 @@ mod tests {
             },
         ];
 
-        let prepared = super::prepare_grounded_capability_bindings(&[item])
-            .expect("duplicate mentions must use the coalesced max quantity");
-        assert_eq!(prepared.len(), 2);
-        assert_eq!(prepared[0].requested_quantity, i64::MAX);
-        assert_eq!(prepared[1].requested_quantity, 1);
+        let error = super::prepare_grounded_capability_bindings(&[item])
+            .expect_err("one catalog link cannot consume multiple primary occurrences");
+        assert!(error
+            .to_string()
+            .contains("one grounded occurrence must cover the exact quantity"));
     }
 
     #[test]
-    fn grounded_replacement_capabilities_are_nonadditive_occurrence_evidence() {
+    fn grounded_replacement_capabilities_reject_multiple_occurrences() {
         let values = listing_values_with_variant("182T SKYLANE");
         let context = "GTX 345R replaces GTX 327";
         let mut replacement_identity = approved_avionics_identity();
@@ -10933,10 +10837,11 @@ mod tests {
             })
             .collect();
 
-        let prepared = super::prepare_grounded_capability_bindings(&[item])
-            .expect("duplicate replacement mentions must not add quantities");
-        assert_eq!(prepared.len(), 2);
-        assert!(prepared.iter().all(|row| row.requested_quantity == 1));
+        let error = super::prepare_grounded_capability_bindings(&[item])
+            .expect_err("one replacement link cannot consume multiple occurrences");
+        assert!(error
+            .to_string()
+            .contains("one grounded occurrence must cover the exact replacement semantics"));
     }
 
     #[test]
@@ -11777,7 +11682,7 @@ mod tests {
     }
 
     #[test]
-    fn gnx_duplicate_capability_mentions_coalesce_without_creating_extra_units() {
+    fn duplicate_capability_mentions_cannot_infer_one_physical_unit() {
         let gps = resolved_avionics_value(
             375,
             &["GPS"],
@@ -11797,21 +11702,58 @@ mod tests {
             2,
         );
 
-        let coalesced = coalesce_resolved_listing_avionics([gps, transponder])
-            .expect("identical installation semantics should coalesce");
+        let error = require_unique_resolved_listing_avionics([gps, transponder])
+            .expect_err("catalog identity alone cannot establish physical co-reference");
 
-        assert_eq!(coalesced.len(), 1);
-        assert_eq!(coalesced[0].quantity, 2, "quantity uses max, not sum");
-        assert_eq!(coalesced[0].avionics_types, vec!["GPS", "Transponder"]);
-        assert_eq!(
-            coalesced[0].source_notes.as_deref(),
-            Some("GNX 375 GPS navigator installed\nGNX 375 Mode S transponder installed")
-        );
-        assert_eq!(
-            coalesced[0].source_confidence.as_deref(),
+        assert!(error
+            .to_string()
+            .contains("resolved from multiple listing occurrences"));
+    }
+
+    #[test]
+    fn one_explicit_occurrence_preserves_its_declared_quantity() {
+        let explicit_pair = resolved_avionics_value(
+            375,
+            &["GPS", "Transponder"],
+            "installed",
+            None,
+            Some("Dual Garmin GNX 375"),
             Some("medium"),
-            "the weaker duplicate evidence must govern"
+            2,
         );
+
+        let unique = require_unique_resolved_listing_avionics([explicit_pair])
+            .expect("one explicit occurrence owns its declared quantity");
+
+        assert_eq!(unique.len(), 1);
+        assert_eq!(unique[0].quantity, 2);
+        assert_eq!(unique[0].avionics_types, vec!["GPS", "Transponder"]);
+        assert_eq!(
+            unique[0].source_notes.as_deref(),
+            Some("Dual Garmin GNX 375")
+        );
+    }
+
+    #[test]
+    fn duplicate_occurrences_cannot_select_a_maximum_quantity() {
+        let single = resolved_avionics_value(
+            375,
+            &["GPS", "Transponder"],
+            "installed",
+            None,
+            Some("Garmin GNX 375 installed"),
+            Some("high"),
+            1,
+        );
+        let mut pair = single.clone();
+        pair.quantity = 2;
+
+        let error = require_unique_resolved_listing_avionics([single, pair])
+            .expect_err("conflicting occurrence quantities must not be reduced with max");
+
+        assert!(error
+            .to_string()
+            .contains("quantity must come from one explicit source-validated occurrence"));
     }
 
     #[test]
@@ -11835,7 +11777,7 @@ mod tests {
             1,
         );
 
-        let error = coalesce_resolved_listing_avionics([installed, replaces])
+        let error = require_unique_resolved_listing_avionics([installed, replaces])
             .expect_err("conflicting configuration actions must fail closed");
 
         assert!(error
@@ -11864,7 +11806,7 @@ mod tests {
             1,
         );
 
-        let error = coalesce_resolved_listing_avionics([replaces_gtx_327, replaces_gtx_330])
+        let error = require_unique_resolved_listing_avionics([replaces_gtx_327, replaces_gtx_330])
             .expect_err("different replacement targets must fail closed");
 
         assert!(error.to_string().contains("replacement targets"));
@@ -11896,8 +11838,9 @@ mod tests {
             .expect("replacement reference should exist")
             .model = "GTX 330".to_string();
 
-        let error = coalesce_resolved_listing_avionics([replaces_gtx_327, conflicting_reference])
-            .expect_err("a shared numeric id must not hide conflicting target evidence");
+        let error =
+            require_unique_resolved_listing_avionics([replaces_gtx_327, conflicting_reference])
+                .expect_err("a shared numeric id must not hide conflicting target evidence");
 
         assert!(error.to_string().contains("replacement targets"));
     }
