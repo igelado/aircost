@@ -1984,13 +1984,6 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "UPDATE aircraft_sale_listings SET ingestion_state = 'ready', ingestion_completed_at = CURRENT_TIMESTAMP, is_verified = 1 WHERE id = ?",
-        )
-        .bind(listing_id)
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
             r#"
             INSERT INTO avionics_authoritative_source_origins (
               authority_kind, avionics_manufacturer_identity_id, https_origin,
@@ -2112,6 +2105,13 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE aircraft_sale_listings SET ingestion_state = 'ready', ingestion_error = NULL, ingestion_completed_at = CURRENT_TIMESTAMP, is_verified = 1 WHERE id = ?",
+        )
+        .bind(listing_id)
+        .execute(pool)
+        .await
+        .unwrap();
 
         let detail = get_avionics_catalog_detail(&db, current_user_id, avionics_id)
             .await
@@ -2174,6 +2174,13 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE aircraft_sale_listings SET ingestion_state = 'ready', ingestion_error = NULL, ingestion_completed_at = CURRENT_TIMESTAMP, is_verified = 1 WHERE id = ?",
+        )
+        .bind(listing_id)
+        .execute(pool)
+        .await
+        .unwrap();
 
         // The immutable attestation and link authorization remain stored, but
         // changing one fingerprint input must immediately remove eligibility.
