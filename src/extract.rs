@@ -2326,7 +2326,7 @@ Rules:\n\
 - Weather delivered by satellite, ADS-B/FIS-B, SiriusXM, or another receiver/datalink is a Datalink capability, not Weather Radar. Assign Weather Radar only to an installed airborne radar sensor/system; the word weather by itself never establishes Weather Radar.\n\
 - Each avionics item must include configuration_action installed, replaces, or removes; a short exact source_evidence_text; and high/medium/low source_confidence. Use replaces/removes only when the listing explicitly states the delta from prior/factory equipment.\n\
 - For replaces/removes, replaces must identify the concrete displaced unit. For removes with no new unit, use the removed unit as both the item identity and replaces identity. For installed, replaces must be null.\n\
-- valuation_facts contains only source-backed facts material to value. Allowed kinds are restoration, damage_history, log_completeness, paint_condition, interior_condition, engine_conversion, airframe_conversion, and major_modification.\n\
+- valuation_facts contains only source-backed facts material to value. Allowed kinds are restoration, damage_history, log_completeness, paint_condition, interior_condition, engine_conversion, airframe_conversion, and major_modification. Classify repairs and any prop-strike, damage, accident, incident, gear-up, or ground-loop history as damage_history, including when the damage was repaired or only documented in logs. Reserve major_modification for an explicit non-repair modification or upgrade that materially changes the aircraft and is not already an engine_conversion or airframe_conversion. Never classify a repair as major_modification merely because it changed or restored the airframe.\n\
 - For each valuation fact, value is a concise normalized description, evidence_text is a short exact span copied from the listing, and confidence is high, medium, or low. Omit facts that are not explicitly supported; do not infer that an unmentioned damage history means no damage.\n\
 - For avionics model labels, use the fullest useful literal unit or suite token present in the selected evidence. Omit unanchored numbers and generic labels such as GPS, NAV/COM, Autopilot, or Transponder. A source-literal numeric model anchored to its manufacturer in the same evidence is useful: preserve Garmin 255 and JPI 830 as required above.\n\
 - Preserve an ambiguous attached trailing letter exactly as written in the listing. In particular, when quantity wording attaches s or S to a product token (for example, 3 Garmin GI275s), return the source token GI275s rather than singularizing it to GI275 or deciding it is model GI275S. Later catalog curation, not listing extraction, resolves that ambiguity.\n\
@@ -3202,6 +3202,7 @@ fn gemini_listing_valuation_fact_schema() -> Value {
         "properties": {
             "kind": {
                 "type": "string",
+                "description": "Use damage_history for repairs and for prop-strike, damage, accident, incident, gear-up, or ground-loop events, even when repaired. Use major_modification only for an explicit non-repair modification or upgrade not already represented as engine_conversion or airframe_conversion.",
                 "enum": [
                     "restoration", "damage_history", "log_completeness",
                     "paint_condition", "interior_condition", "engine_conversion",
@@ -4078,13 +4079,15 @@ fn model_valuation_facts(value: Option<&Value>) -> Vec<ListingValuationFact> {
         .iter()
         .filter_map(|item| {
             let object = item.as_object()?;
-            let kind = optional_string(object.get("kind"))?;
+            let mut kind = optional_string(object.get("kind"))?;
             let value = optional_string(object.get("value"))?;
             let evidence_text = optional_string(object.get("evidence_text"))?;
             let confidence = source_confidence(object.get("confidence"))?;
-            if !allowed.contains(&kind.as_str())
-                || !seen.insert((kind.clone(), value.clone(), evidence_text.clone()))
-            {
+            if !allowed.contains(&kind.as_str()) {
+                return None;
+            }
+            kind = canonical_valuation_fact_kind(&kind, &evidence_text).to_string();
+            if !seen.insert((kind.clone(), value.clone(), evidence_text.clone())) {
                 return None;
             }
             Some(ListingValuationFact {
@@ -4096,6 +4099,85 @@ fn model_valuation_facts(value: Option<&Value>) -> Vec<ListingValuationFact> {
             })
         })
         .collect()
+}
+
+fn canonical_valuation_fact_kind<'a>(kind: &'a str, evidence_text: &str) -> &'a str {
+    if kind != "major_modification" {
+        return kind;
+    }
+
+    let tokens = valuation_fact_cue_tokens(evidence_text);
+    let has_damage_or_repair_cue =
+        tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "damage"
+                    | "damages"
+                    | "damaged"
+                    | "repair"
+                    | "repairs"
+                    | "repaired"
+                    | "repairing"
+                    | "accident"
+                    | "accidents"
+                    | "incident"
+                    | "incidents"
+                    | "propstrike"
+                    | "propstrikes"
+                    | "groundloop"
+                    | "groundloops"
+            )
+        }) || contains_token_pair(&tokens, "prop", &["strike", "strikes"])
+            || contains_token_pair(&tokens, "gear", &["up"])
+            || contains_token_pair(&tokens, "ground", &["loop", "loops"]);
+    let has_explicit_modification_cue = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "mod"
+                | "mods"
+                | "modify"
+                | "modified"
+                | "modification"
+                | "modifications"
+                | "upgrade"
+                | "upgrades"
+                | "upgraded"
+                | "conversion"
+                | "conversions"
+                | "converted"
+                | "stc"
+        )
+    }) || tokens
+        .windows(3)
+        .any(|words| words == ["supplemental", "type", "certificate"]);
+
+    if has_damage_or_repair_cue && !has_explicit_modification_cue {
+        "damage_history"
+    } else {
+        kind
+    }
+}
+
+fn valuation_fact_cue_tokens(evidence_text: &str) -> Vec<String> {
+    evidence_text
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn contains_token_pair(tokens: &[String], first: &str, second: &[&str]) -> bool {
+    tokens
+        .windows(2)
+        .any(|words| words[0] == first && second.contains(&words[1].as_str()))
 }
 
 fn model_avionics(value: Option<&Value>) -> Vec<ParsedAvionics> {
@@ -4342,8 +4424,8 @@ mod tests {
         gemini_avionics_unit_concreteness_response_schema,
         gemini_avionics_unit_resolution_response_schema, gemini_google_search_was_used,
         gemini_grounding_sources, gemini_grounding_supports, gemini_listing_avionics_item_schema,
-        gemini_response_schema, generate_content_json_config, generate_content_usage_metrics,
-        parsed_listing_from_model_output, preview_manual_listing,
+        gemini_listing_valuation_fact_schema, gemini_response_schema, generate_content_json_config,
+        generate_content_usage_metrics, parsed_listing_from_model_output, preview_manual_listing,
         validate_avionics_approved_candidate_adjudication_context,
         validate_avionics_candidate_triage_context, AuthorizedDirectSourcePolicy,
         AvionicsApprovedCandidateAdjudicationContext, AvionicsApprovedCatalogCandidate,
@@ -4489,6 +4571,124 @@ mod tests {
             schema["properties"]["propeller_time_basis"]["enum"],
             json!(["SNEW", "SMOH", "SFOH", "SPOH", "unknown"])
         );
+    }
+
+    #[test]
+    fn canonicalizes_repair_and_damage_major_modifications_as_damage_history() {
+        for (value, evidence) in [
+            (
+                "Airframe repairs documented in logs",
+                "Airframe repairs, August 2010, Details in Logs",
+            ),
+            ("Propeller strike history", "Prop strike in 2004"),
+            ("Propeller strike history", "Two documented prop strikes"),
+            (
+                "Repaired airframe damage",
+                "Damage repaired by licensed shop",
+            ),
+            ("Accident history", "Accident documented in logs"),
+            ("Incident history", "Incident documented in logs"),
+            ("Gear-up landing history", "Gear-up landing repaired"),
+            ("Ground-loop history", "Ground loop event in 1998"),
+        ] {
+            let parsed = parsed_listing_from_model_output(&json!({
+                "valuation_facts": [{
+                    "kind": "major_modification",
+                    "value": value,
+                    "evidence_text": evidence,
+                    "confidence": "high"
+                }]
+            }));
+
+            assert_eq!(parsed.valuation_facts.len(), 1, "evidence {evidence:?}");
+            assert_eq!(
+                parsed.valuation_facts[0].kind, "damage_history",
+                "evidence {evidence:?}"
+            );
+            assert_eq!(parsed.valuation_facts[0].value, value);
+            assert_eq!(parsed.valuation_facts[0].evidence_text, evidence);
+        }
+    }
+
+    #[test]
+    fn preserves_explicit_major_modifications_even_when_damage_is_also_mentioned() {
+        for (value, evidence) in [
+            (
+                "Wingtip modification after repair",
+                "Wingtip modification completed after damage repair",
+            ),
+            (
+                "Avionics upgrade after incident",
+                "Avionics upgraded after incident inspection",
+            ),
+            (
+                "STC landing gear change",
+                "Gear-up repair incorporated under STC SA1234",
+            ),
+            (
+                "Airframe conversion",
+                "Ground-loop repair completed during conversion",
+            ),
+            ("Modernized instrument panel", "Modernized instrument panel"),
+            (
+                "Repaired airframe damage",
+                "Work documented in aircraft logs",
+            ),
+        ] {
+            let parsed = parsed_listing_from_model_output(&json!({
+                "valuation_facts": [{
+                    "kind": "major_modification",
+                    "value": value,
+                    "evidence_text": evidence,
+                    "confidence": "medium"
+                }]
+            }));
+
+            assert_eq!(parsed.valuation_facts.len(), 1, "evidence {evidence:?}");
+            assert_eq!(
+                parsed.valuation_facts[0].kind, "major_modification",
+                "evidence {evidence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaves_non_major_modification_fact_kinds_unchanged() {
+        let parsed = parsed_listing_from_model_output(&json!({
+            "valuation_facts": [{
+                "kind": "restoration",
+                "value": "Airframe restoration after repair",
+                "evidence_text": "Airframe restored after repairs",
+                "confidence": "high"
+            }]
+        }));
+
+        assert_eq!(parsed.valuation_facts.len(), 1);
+        assert_eq!(parsed.valuation_facts[0].kind, "restoration");
+    }
+
+    #[test]
+    fn valuation_fact_prompt_and_schema_define_repairs_as_damage_history() {
+        let prompt = build_extraction_prompt("Airframe repairs, August 2010, Details in Logs");
+        for required in [
+            "prop-strike, damage, accident, incident, gear-up, or ground-loop history as damage_history",
+            "including when the damage was repaired",
+            "Reserve major_modification for an explicit non-repair modification or upgrade",
+            "Never classify a repair as major_modification",
+        ] {
+            assert!(prompt.contains(required), "missing {required:?}");
+        }
+
+        let schema = gemini_listing_valuation_fact_schema();
+        let kind_description = schema["properties"]["kind"]["description"]
+            .as_str()
+            .expect("valuation fact kind description");
+        assert!(kind_description.contains("damage_history for repairs"));
+        assert!(kind_description.contains("major_modification only"));
+        assert!(schema["properties"]["value"].get("description").is_none());
+        assert!(schema["properties"]["evidence_text"]
+            .get("description")
+            .is_none());
     }
 
     #[test]

@@ -308,6 +308,16 @@ must also be a separate whitespace-delimited source label; a prefix joined to
 the rest of one hyphenated or fused product code remains part of the literal
 model and cannot become a manufacturer.
 
+Valuation-fact parsing also enforces the extraction taxonomy before a fact can
+become a model feature. Repairs and explicit prop-strike, damage, accident,
+incident, gear-up, or ground-loop history are `damage_history`, including when
+the listing says the damage was repaired. If Gemini instead returns
+`major_modification`, the parser corrects that kind only when its exact evidence
+contains one of those cues and no explicit modification, upgrade, conversion,
+or STC cue. The model-normalized value cannot drive this correction. Explicit
+modification language therefore remains `major_modification`; the rule does not
+infer facts or alter any source text.
+
 For one structurally valid Controller capture with one exact `Avionics/Radios`
 field, the same pass may copy one unique bounded visible span into
 `source_evidence_text`. The copied span must be exactly equal to the model's
