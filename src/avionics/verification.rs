@@ -230,6 +230,17 @@ pub struct AvionicsProviderRequestPlan {
     pub uncertainty_note: String,
 }
 
+impl AvionicsProviderRequestPlan {
+    /// Whether executing this exact preflight plan can require Gemini.
+    ///
+    /// The validation envelope includes every conditional identity route and
+    /// legacy re-extraction. A zero envelope is therefore the only plan that
+    /// may execute without a configured provider client.
+    pub fn requires_provider(&self) -> bool {
+        self.known_total_provider_requests_validation_envelope_maximum > 0
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct AvionicsVerificationPreflightSummary {
     pub listings_selected: usize,
@@ -522,10 +533,12 @@ impl PendingReviewRevisionCursor {
 /// guarded write is bound to the exact submission, owner, listing, source URL,
 /// capture bytes/hash, pending-review revision, and prior extraction state.
 /// Dry-run still makes paid preview calls without domain writes. Listing links
-/// and residual review state retain their separate atomic apply boundary.
+/// and residual review state retain their separate atomic apply boundary. An
+/// absent extractor is valid only for a zero-request plan; any route that
+/// requires a provider fails closed before the atomic apply boundary.
 pub async fn verify_listing_avionics_page(
     db: &AppDb,
-    extractor: &GeminiListingExtractor,
+    extractor: Option<&GeminiListingExtractor>,
     mode: AvionicsVerificationExecutionMode,
     scope: &AvionicsVerificationScope,
 ) -> VerificationResult<AvionicsVerificationReport> {
@@ -603,10 +616,12 @@ pub async fn preflight_listing_avionics(
 /// workflow and atomic apply boundary.
 ///
 /// Repeating the call after the review has cleared returns `NoPendingReview`
-/// and performs no catalog, link, review, or provider work.
+/// and performs no catalog, link, review, or provider work. A zero-request
+/// local plan may run without an extractor; provider-required work without one
+/// remains blocked without mutating the pending review.
 pub async fn verify_listing_avionics(
     db: &AppDb,
-    extractor: &GeminiListingExtractor,
+    extractor: Option<&GeminiListingExtractor>,
     mode: AvionicsVerificationExecutionMode,
     listing_id: i64,
 ) -> VerificationResult<ListingAvionicsVerification> {
@@ -1234,7 +1249,7 @@ fn provider_request_plan(
 
 async fn process_listing(
     db: &AppDb,
-    extractor: &GeminiListingExtractor,
+    extractor: Option<&GeminiListingExtractor>,
     apply: bool,
     row: &ListingSourceRow,
     catalog_statuses: &mut HashMap<i64, String>,
@@ -1277,14 +1292,16 @@ async fn process_listing(
             return listing_report;
         }
     };
-    let scoped_extractor = extractor.clone().with_usage_scope(
-        format!("auto-review-listing-{}", row.listing_id),
-        Some(row.listing_id),
-        Some(SourceCorrelation {
-            kind: "plugin_submission".to_string(),
-            id: submission_id.to_string(),
-        }),
-    );
+    let scoped_extractor = extractor.map(|extractor| {
+        extractor.clone().with_usage_scope(
+            format!("auto-review-listing-{}", row.listing_id),
+            Some(row.listing_id),
+            Some(SourceCorrelation {
+                kind: "plugin_submission".to_string(),
+                id: submission_id.to_string(),
+            }),
+        )
+    });
 
     // Avionics curation only needs to prove that the source listing belongs
     // to a current FAA-backed N-number. Requiring the separately curated
@@ -1368,9 +1385,17 @@ async fn process_listing(
                     return listing_report;
                 }
             };
+            let Some(scoped_extractor) = scoped_extractor.as_ref() else {
+                let error =
+                    "current-schema re-extraction requires configured Gemini services".to_string();
+                listing_report.status = "blocked".to_string();
+                listing_report.reextraction_error = Some(error.clone());
+                listing_report.error = Some(error);
+                return listing_report;
+            };
             listing_report.reextraction_attempted = true;
             match reextract_avionics(
-                &scoped_extractor,
+                scoped_extractor,
                 &listing_text,
                 &listing_context,
                 source_url,
@@ -1722,6 +1747,10 @@ async fn process_listing(
         execution_cursor += 1;
         if requires_provider && !provider_phase_started {
             provider_phase_started = true;
+            if scoped_extractor.is_none() {
+                blocking_reasons
+                    .push("identity resolution requires configured Gemini services".to_string());
+            }
             if let Some(reason) = review_revision.stale_reason.as_ref() {
                 blocking_reasons.push(format!(
                     "pending review revision could not be advanced safely: {reason}"
@@ -1883,7 +1912,9 @@ async fn process_listing(
                 } else if requires_provider {
                     resolve_identity_attempt(
                         db,
-                        &scoped_extractor,
+                        scoped_extractor
+                            .as_ref()
+                            .expect("the provider barrier requires a configured extractor"),
                         apply,
                         row,
                         source_url.as_deref(),
@@ -2052,7 +2083,9 @@ async fn process_listing(
         } else if requires_provider {
             resolve_identity_attempt(
                 db,
-                &scoped_extractor,
+                scoped_extractor
+                    .as_ref()
+                    .expect("the provider barrier requires a configured extractor"),
                 apply,
                 row,
                 source_url.as_deref(),
@@ -2342,7 +2375,9 @@ async fn process_listing(
         } else if requires_provider {
             resolve_identity_attempt(
                 db,
-                &scoped_extractor,
+                scoped_extractor
+                    .as_ref()
+                    .expect("the provider barrier requires a configured extractor"),
                 apply,
                 row,
                 source_url.as_deref(),
@@ -5651,6 +5686,19 @@ mod tests {
         assert!(plan
             .grounded_pass_note
             .contains("exactly one tools-disabled"));
+        assert!(plan.requires_provider());
+
+        let local_plan = provider_request_plan(&AvionicsVerificationPreflightSummary {
+            retained_identity_components: 3,
+            verified_local_identity_components: 3,
+            generic_invalid_identity_components: 1,
+            ..AvionicsVerificationPreflightSummary::default()
+        });
+        assert_eq!(
+            local_plan.known_total_provider_requests_validation_envelope_maximum,
+            0
+        );
+        assert!(!local_plan.requires_provider());
         assert!(plan
             .uncertainty_note
             .contains("does not run the concreteness classifier"));
@@ -5740,7 +5788,7 @@ mod tests {
 
         let report = verify_listing_avionics_page(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             &AvionicsVerificationScope::new(1, Some(listing_id), None),
         )
@@ -6360,10 +6408,9 @@ mod tests {
             0
         );
 
-        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let report = verify_listing_avionics_page(
             &db,
-            &extractor,
+            None,
             AvionicsVerificationExecutionMode::Preview,
             &AvionicsVerificationScope::new(1, Some(listing_id), None),
         )
@@ -6380,7 +6427,7 @@ mod tests {
 
         let applied = verify_listing_avionics_page(
             &db,
-            &extractor,
+            None,
             AvionicsVerificationExecutionMode::Apply,
             &AvionicsVerificationScope::new(1, Some(listing_id), None),
         )
@@ -6453,7 +6500,7 @@ mod tests {
 
             let applied = verify_listing_avionics_page(
                 &db,
-                &extractor,
+                Some(&extractor),
                 AvionicsVerificationExecutionMode::Apply,
                 &AvionicsVerificationScope::new(1, Some(listing_id), None),
             )
@@ -6543,7 +6590,7 @@ mod tests {
             );
             let applied = verify_listing_avionics_page(
                 &db,
-                &extractor,
+                Some(&extractor),
                 AvionicsVerificationExecutionMode::Apply,
                 &AvionicsVerificationScope::new(1, Some(listing_id), None),
             )
@@ -6668,7 +6715,7 @@ mod tests {
 
                 let preview = verify_listing_avionics_page(
                     &db,
-                    &extractor,
+                    Some(&extractor),
                     AvionicsVerificationExecutionMode::Preview,
                     &AvionicsVerificationScope::new(1, Some(listing_id), None),
                 )
@@ -7948,7 +7995,7 @@ mod tests {
         let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
         let result = verify_listing_avionics(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -7974,6 +8021,106 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stored_product_id, product_id);
+    }
+
+    #[tokio::test]
+    async fn provider_required_reextraction_without_a_client_fails_closed() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        seed_approved_named_product_for_manufacturer(
+            &db,
+            true,
+            "Garmin",
+            "https://www.garmin.com",
+            "Fixture",
+            "FIXTURE-TEST",
+            "GPS",
+        )
+        .await;
+        let source_url = "https://example.test/listing/keyless-reextraction";
+        let listing_id = seed_listing(&db, source_url).await;
+        seed_faa_admission(&db, listing_id).await;
+        let stale_extraction = retained_legacy_listing_extraction().to_string();
+        let submission_id = seed_submission_and_review(
+            &db,
+            listing_id,
+            source_url,
+            "<p>Garmin fixture installed</p>",
+            Some(&stale_extraction),
+            Some(listing_id),
+            None,
+        )
+        .await;
+        let preflight = preflight_listing_avionics_page(
+            &db,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap();
+        assert!(preflight.provider_request_plan.requires_provider());
+
+        let before: (String, i64, i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT submission.extracted_listing_json,
+                   (SELECT COUNT(*) FROM avionics_models),
+                   (SELECT COUNT(*) FROM aircraft_sale_listing_avionics
+                     WHERE aircraft_sale_listing_id = ?),
+                   (SELECT COUNT(*) FROM gemini_api_usage
+                     WHERE aircraft_sale_listing_id = ?),
+                   review.review_payload_sha256
+            FROM plugin_submissions submission
+            JOIN aircraft_sale_listing_pending_reviews review
+              ON review.plugin_submission_id = submission.id
+            WHERE submission.id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .bind(listing_id)
+        .bind(submission_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+
+        let result = verify_listing_avionics(
+            &db,
+            None,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("missing optional provider capability is a guarded listing outcome");
+        let ListingAvionicsVerification::Processed { report } = result else {
+            panic!("the pending review should remain present")
+        };
+        assert_eq!(report.status, "blocked");
+        assert!(report.reextraction_required);
+        assert!(!report.reextraction_attempted);
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("configured Gemini services")));
+
+        let after: (String, i64, i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT submission.extracted_listing_json,
+                   (SELECT COUNT(*) FROM avionics_models),
+                   (SELECT COUNT(*) FROM aircraft_sale_listing_avionics
+                     WHERE aircraft_sale_listing_id = ?),
+                   (SELECT COUNT(*) FROM gemini_api_usage
+                     WHERE aircraft_sale_listing_id = ?),
+                   review.review_payload_sha256
+            FROM plugin_submissions submission
+            JOIN aircraft_sale_listing_pending_reviews review
+              ON review.plugin_submission_id = submission.id
+            WHERE submission.id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .bind(listing_id)
+        .bind(submission_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(after, before);
     }
 
     #[tokio::test]
@@ -8040,7 +8187,7 @@ mod tests {
             let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
             let result = verify_listing_avionics(
                 &db,
-                &extractor,
+                Some(&extractor),
                 AvionicsVerificationExecutionMode::Apply,
                 listing_id,
             )
@@ -8200,10 +8347,9 @@ mod tests {
             0
         );
 
-        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let applied = verify_listing_avionics(
             &db,
-            &extractor,
+            None,
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -8354,7 +8500,7 @@ mod tests {
         let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let applied = verify_listing_avionics(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -8507,7 +8653,7 @@ mod tests {
         let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let applied = verify_listing_avionics(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -8709,7 +8855,7 @@ mod tests {
             let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
             let applied = verify_listing_avionics(
                 &db,
-                &extractor,
+                Some(&extractor),
                 AvionicsVerificationExecutionMode::Apply,
                 listing_id,
             )
@@ -8797,8 +8943,14 @@ mod tests {
 
         let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let mut catalog_statuses = load_catalog_statuses(&db).await.unwrap();
-        let report =
-            process_listing(&db, &extractor, true, &stale_row, &mut catalog_statuses).await;
+        let report = process_listing(
+            &db,
+            Some(&extractor),
+            true,
+            &stale_row,
+            &mut catalog_statuses,
+        )
+        .await;
 
         assert_eq!(report.status, "blocked");
         assert_eq!(report.prepared_link_count, 1);
@@ -8928,7 +9080,7 @@ mod tests {
         let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let applied = verify_listing_avionics(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -9076,7 +9228,7 @@ mod tests {
         let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
         let result = verify_listing_avionics(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -9271,7 +9423,7 @@ mod tests {
         let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
         let result = verify_listing_avionics(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -9474,7 +9626,7 @@ mod tests {
         let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
         let result = verify_listing_avionics(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -9635,7 +9787,7 @@ mod tests {
         let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
         let result = verify_listing_avionics(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -9924,7 +10076,7 @@ mod tests {
         let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let result = verify_listing_avionics(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -10106,7 +10258,7 @@ mod tests {
         let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
         let result = verify_listing_avionics(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -10246,7 +10398,7 @@ mod tests {
         let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
         let first = verify_listing_avionics(
             &db,
-            &extractor,
+            Some(&extractor),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -10316,7 +10468,7 @@ mod tests {
         let unavailable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let second = verify_listing_avionics(
             &db,
-            &unavailable,
+            Some(&unavailable),
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )
@@ -10394,8 +10546,14 @@ mod tests {
         .await;
         let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
         let mut catalog_statuses = load_catalog_statuses(&db).await.unwrap();
-        let report =
-            process_listing(&db, &extractor, true, &stale_row, &mut catalog_statuses).await;
+        let report = process_listing(
+            &db,
+            Some(&extractor),
+            true,
+            &stale_row,
+            &mut catalog_statuses,
+        )
+        .await;
         server.abort();
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert_eq!(report.status, "blocked");
@@ -10596,7 +10754,7 @@ mod tests {
 
             let result = verify_listing_avionics(
                 &db,
-                &extractor,
+                Some(&extractor),
                 AvionicsVerificationExecutionMode::Apply,
                 listing_id,
             )
@@ -10786,10 +10944,9 @@ mod tests {
             } if actual == listing_id && ingestion_state == "incomplete"
         ));
 
-        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let verification = verify_listing_avionics(
             &db,
-            &extractor,
+            None,
             AvionicsVerificationExecutionMode::Apply,
             listing_id,
         )

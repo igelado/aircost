@@ -74,6 +74,21 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use tempfile::NamedTempFile;
 
+fn automatic_verification_api_key<F>(
+    requires_provider: bool,
+    read_api_key: F,
+) -> Result<Option<String>>
+where
+    F: FnOnce() -> std::result::Result<String, env::VarError>,
+{
+    if !requires_provider {
+        return Ok(None);
+    }
+    read_api_key()
+        .context("GEMINI_API_KEY is required for automatic verification")
+        .map(Some)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let command = parse_args(env::args().skip(1))?;
@@ -521,38 +536,58 @@ async fn main() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
                 ListingVerificationCommandMode::Preview | ListingVerificationCommandMode::Apply => {
-                    let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?;
-                    let runtime_config = GeminiRuntimeConfig::from_environment()?;
-                    let gemini_api_key = env::var("GEMINI_API_KEY")
-                        .context("GEMINI_API_KEY is required for automatic verification")?;
-                    let aircraft_gemini = GeminiInteractionsClient::new(gemini_api_key)?
-                        .with_usage_store(GeminiUsageStore::new(&db));
-                    let aircraft_drs = env::var("FAA_DRS_API_KEY")
-                        .ok()
-                        .map(DrsClient::new)
-                        .transpose()?;
-                    let aircraft = aircraft_drs
-                        .as_ref()
-                        .map(|drs| AircraftVerificationServices {
-                            gemini: &aircraft_gemini,
-                            drs,
-                            config: &runtime_config,
-                        });
                     let verification_mode = match mode {
                         ListingVerificationCommandMode::Preview => ListingVerificationMode::Preview,
                         ListingVerificationCommandMode::Apply => ListingVerificationMode::Apply,
                         ListingVerificationCommandMode::Preflight => unreachable!(),
                     };
-                    let report = verify_listings(
+                    let preflight = verify_listings(
                         &db,
-                        verification_mode,
+                        ListingVerificationMode::Preflight,
                         &scope,
-                        ListingVerificationServices {
-                            extractor: Some(&extractor),
-                            aircraft,
-                        },
+                        ListingVerificationServices::unavailable(),
                     )
                     .await?;
+                    let requires_provider = preflight.provider_request_plan.requires_provider();
+                    let gemini_api_key = automatic_verification_api_key(requires_provider, || {
+                        env::var("GEMINI_API_KEY")
+                    })?;
+                    let report = if let Some(gemini_api_key) = gemini_api_key {
+                        let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?;
+                        let runtime_config = GeminiRuntimeConfig::from_environment()?;
+                        let aircraft_gemini = GeminiInteractionsClient::new(gemini_api_key)?
+                            .with_usage_store(GeminiUsageStore::new(&db));
+                        let aircraft_drs = env::var("FAA_DRS_API_KEY")
+                            .ok()
+                            .map(DrsClient::new)
+                            .transpose()?;
+                        let aircraft =
+                            aircraft_drs
+                                .as_ref()
+                                .map(|drs| AircraftVerificationServices {
+                                    gemini: &aircraft_gemini,
+                                    drs,
+                                    config: &runtime_config,
+                                });
+                        verify_listings(
+                            &db,
+                            verification_mode,
+                            &scope,
+                            ListingVerificationServices {
+                                extractor: Some(&extractor),
+                                aircraft,
+                            },
+                        )
+                        .await?
+                    } else {
+                        verify_listings(
+                            &db,
+                            verification_mode,
+                            &scope,
+                            ListingVerificationServices::unavailable(),
+                        )
+                        .await?
+                    };
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
             }
@@ -3117,6 +3152,28 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn verify_listings_requires_a_key_only_for_a_provider_plan() {
+        assert_eq!(
+            automatic_verification_api_key(false, || {
+                panic!("a zero-request plan must not read GEMINI_API_KEY")
+            })
+            .unwrap(),
+            None
+        );
+
+        let error = automatic_verification_api_key(true, || Err(env::VarError::NotPresent))
+            .expect_err("a paid plan must preserve the existing key requirement");
+        assert!(error
+            .to_string()
+            .contains("GEMINI_API_KEY is required for automatic verification"));
+
+        assert_eq!(
+            automatic_verification_api_key(true, || Ok("test-key".to_string())).unwrap(),
+            Some("test-key".to_string())
+        );
     }
 
     #[test]

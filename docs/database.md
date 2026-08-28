@@ -1232,9 +1232,18 @@ prompt, response envelope, Search result, URL Context dossier, or grounding
 evidence. Because it commits before identity work, a later catalog or listing
 block retains the validated avionics and a retry can preflight and replay them
 without another listing-extraction request.
-Set `GEMINI_API_KEY` and review the per-listing
-source, re-extraction, error, accepted, safely-discarded, and remaining-review
-counts before using `--apply`. Apply mode persists independently grounded
+`--preview` and `--apply` first evaluate the same complete provider-request
+plan used by preflight. When its aircraft count and avionics validation
+envelope are both zero, the command does not read `GEMINI_API_KEY` or construct
+a Gemini client; the web verification worker follows the same keyless local
+path. A nonzero plan still requires configured provider services. If source or
+catalog state changes after a zero-request plan and a route would now require a
+provider, execution fails closed before provider, catalog, listing-link, or
+review writes.
+
+For a nonzero plan, set `GEMINI_API_KEY` and review the per-listing source,
+re-extraction, error, accepted, safely-discarded, and remaining-review counts
+before using `--apply`. Apply mode persists independently grounded
 catalog identities through the ordinary catalog resolver; listing links and
 review state are handled separately by the atomic apply boundary below.
 `prepared_link_count` is diagnostic: it counts links assembled from resolved
