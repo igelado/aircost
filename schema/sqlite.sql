@@ -261,7 +261,7 @@ VALUES
 ('trigger:compatibility_projected_package_link_immutable_update', 'createtriggercompatibility_projected_package_link_immutable_updatebeforeupdateonaircraft_package_applicabilitywhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_factory_package_id=old.aircraft_factory_package_idandprojection.aircraft_designation_id=old.aircraft_designation_idand(old.aircraft_generation_idisnullorprojection.aircraft_generation_id=old.aircraft_generation_id))beginselectraise(abort,''compatibility-projectedpackageapplicabilityisimmutable'');end'),
 ('trigger:listing_avionics_authorizations_invalidate_capture_delete', 'createtriggerlisting_avionics_authorizations_invalidate_capture_deleteafterdeleteonplugin_submissionsbegindeletefromaircraft_sale_listing_avionics_link_authorizationswhereplugin_submission_id=old.id;end'),
 ('trigger:listing_avionics_authorizations_invalidate_capture_update', 'createtriggerlisting_avionics_authorizations_invalidate_capture_updateafterupdateofuser_id,plugin_install_id,source_url,submitted_at,signature_base64,canonical_listing_id,rendered_html,rendered_html_sha256,extracted_listing_json,extraction_erroronplugin_submissionswhennot(new.user_idisold.user_id)ornot(new.plugin_install_idisold.plugin_install_id)ornot(new.source_urlisold.source_url)ornot(new.submitted_atisold.submitted_at)ornot(new.signature_base64isold.signature_base64)ornot(new.canonical_listing_idisold.canonical_listing_id)ornot(new.rendered_htmlisold.rendered_html)ornot(new.rendered_html_sha256isold.rendered_html_sha256)ornot(new.extracted_listing_jsonisold.extracted_listing_json)ornot(new.extraction_errorisold.extraction_error)begindeletefromaircraft_sale_listing_avionics_link_authorizationswhereplugin_submission_id=old.id;end'),
-('trigger:listing_avionics_authorizations_invalidate_model_proof_update', 'createtriggerlisting_avionics_authorizations_invalidate_model_proof_updateafterupdateofavionics_manufacturer_id,name,normalized_name,catalog_status,manufacturer_identifier_kind,manufacturer_identifier,normalized_manufacturer_identifier,identity_source_url,identity_source_title,identity_evidence_textonavionics_modelsbegindeletefromaircraft_sale_listing_avionics_link_authorizationswhereauthorization_kind=''same_case_grounded''andavionics_model_id=old.id;end'),
+('trigger:listing_avionics_authorizations_invalidate_model_proof_update', 'createtriggerlisting_avionics_authorizations_invalidate_model_proof_updateafterupdateofavionics_manufacturer_id,name,normalized_name,catalog_status,manufacturer_identifier_kind,manufacturer_identifier,normalized_manufacturer_identifier,identity_source_url,identity_source_title,identity_evidence_textonavionics_modelswhennot(new.avionics_manufacturer_idisold.avionics_manufacturer_id)ornot(new.nameisold.name)ornot(new.normalized_nameisold.normalized_name)ornot(new.catalog_statusisold.catalog_status)ornot(new.manufacturer_identifier_kindisold.manufacturer_identifier_kind)ornot(new.manufacturer_identifierisold.manufacturer_identifier)ornot(new.normalized_manufacturer_identifierisold.normalized_manufacturer_identifier)ornot(new.identity_source_urlisold.identity_source_url)ornot(new.identity_source_titleisold.identity_source_title)ornot(new.identity_evidence_textisold.identity_evidence_text)begindeletefromaircraft_sale_listing_avionics_link_authorizationswhereauthorization_kind=''same_case_grounded''andavionics_model_id=old.id;end'),
 ('trigger:official_dollar_normalization_immutable_delete', 'createtriggerofficial_dollar_normalization_immutable_deletebeforedeleteonofficial_dollar_normalization_factsbeginselectraise(abort,''officialdollarnormalizationfactsareimmutable'');end'),
 ('trigger:official_dollar_normalization_immutable_update', 'createtriggerofficial_dollar_normalization_immutable_updatebeforeupdateonofficial_dollar_normalization_factsbeginselectraise(abort,''officialdollarnormalizationfactsareimmutable'');end'),
 ('trigger:official_dollar_normalization_require_evidence', 'createtriggerofficial_dollar_normalization_require_evidencebeforeinsertonofficial_dollar_normalization_factswhennotexists(select1fromcuration_evidence_claimsclaimjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwhereclaim.id=new.evidence_claim_idandclaim.validation_status=''validated''andclaim.claim_kindin(''price'',''specification'')andsource.source_tier=''regulator_primary'')beginselectraise(abort,''dollarnormalizationrequiresvalidatedofficialregulatorevidence'');end'),
@@ -3834,46 +3834,6 @@ OR (
 )
 BEGIN
   SELECT RAISE(ABORT, 'listing avionics action graph has duplicate or contradictory installed/displaced identities');
-END;
-
-CREATE TRIGGER IF NOT EXISTS aircraft_sale_listings_ready_semantic_avionics
-BEFORE UPDATE OF ingestion_state ON aircraft_sale_listings
-WHEN NEW.ingestion_state = 'ready'
-AND (
-  EXISTS (
-    SELECT 1
-    FROM avionics_semantic_invalid_listing_action_graphs invalid_graph
-    WHERE invalid_graph.listing_id = NEW.id
-  )
-  OR EXISTS (
-    SELECT 1
-    FROM aircraft_sale_listing_avionics link
-    JOIN avionics_models model ON model.id = link.avionics_model_id
-    WHERE link.aircraft_sale_listing_id = NEW.id
-      AND model.catalog_status <> 'approved'
-  )
-  OR EXISTS (
-    SELECT 1
-    FROM aircraft_sale_listing_avionics link
-    JOIN avionics_models model ON model.id = link.replaces_avionics_model_id
-    WHERE link.aircraft_sale_listing_id = NEW.id
-      AND model.catalog_status <> 'approved'
-  )
-  OR EXISTS (
-    SELECT 1
-    FROM aircraft_sale_listing_avionics link
-    WHERE link.aircraft_sale_listing_id = NEW.id
-      AND (
-        link.quantity <= 0
-        OR link.source_confidence IS NOT 'high'
-        OR link.source NOT IN (
-          'listing', 'listing_explicit_count', 'listing_review'
-        )
-      )
-  )
-)
-BEGIN
-  SELECT RAISE(ABORT, 'ready listing requires unique approved canonical avionics');
 END;
 
 CREATE TRIGGER IF NOT EXISTS aircraft_sale_listings_ready_semantic_avionics_insert
@@ -8520,6 +8480,76 @@ BEGIN
   );
 END;
 
+-- This trigger is deliberately created after the authorization table. Earlier
+-- schema seed statements update listings, and SQLite resolves trigger relation
+-- names at execution time.
+CREATE TRIGGER IF NOT EXISTS aircraft_sale_listings_ready_semantic_avionics
+BEFORE UPDATE OF ingestion_state ON aircraft_sale_listings
+WHEN NEW.ingestion_state = 'ready'
+AND (
+  EXISTS (
+    SELECT 1
+    FROM avionics_semantic_invalid_listing_action_graphs invalid_graph
+    WHERE invalid_graph.listing_id = NEW.id
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM aircraft_sale_listing_avionics link
+    JOIN avionics_models model ON model.id = link.avionics_model_id
+    WHERE link.aircraft_sale_listing_id = NEW.id
+      AND model.catalog_status <> 'approved'
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM aircraft_sale_listing_avionics link
+    JOIN avionics_models model ON model.id = link.replaces_avionics_model_id
+    WHERE link.aircraft_sale_listing_id = NEW.id
+      AND model.catalog_status <> 'approved'
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM aircraft_sale_listing_avionics link
+    WHERE link.aircraft_sale_listing_id = NEW.id
+      AND (
+        link.quantity <= 0
+        OR link.source_confidence IS NOT 'high'
+        OR link.source NOT IN (
+          'listing', 'listing_explicit_count', 'listing_review'
+        )
+      )
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM aircraft_sale_listing_avionics link
+    WHERE link.aircraft_sale_listing_id = NEW.id
+      AND link.source IN ('listing', 'listing_explicit_count')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM aircraft_sale_listing_avionics_link_authorizations authorization
+        WHERE authorization.listing_link_id = link.id
+          AND authorization.association_role = 'installed'
+          AND authorization.avionics_model_id = link.avionics_model_id
+      )
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM aircraft_sale_listing_avionics link
+    WHERE link.aircraft_sale_listing_id = NEW.id
+      AND link.source IN ('listing', 'listing_explicit_count')
+      AND link.replaces_avionics_model_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM aircraft_sale_listing_avionics_link_authorizations authorization
+        WHERE authorization.listing_link_id = link.id
+          AND authorization.association_role = 'replacement'
+          AND authorization.avionics_model_id = link.replaces_avionics_model_id
+      )
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'ready listing requires unique approved canonical avionics');
+END;
+
 CREATE TRIGGER IF NOT EXISTS
   listing_avionics_authorizations_immutable_update
 BEFORE UPDATE ON aircraft_sale_listing_avionics_link_authorizations
@@ -8530,17 +8560,56 @@ BEGIN
   );
 END;
 
+-- Authorization is live publication authority, not an audit receipt. Any
+-- invalidation must atomically withdraw a surviving published listing. During
+-- a listing/link cascade the parent link is already absent, so no row is
+-- demoted and the cascade remains valid.
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_demote_listing_after_delete
+AFTER DELETE ON aircraft_sale_listing_avionics_link_authorizations
+WHEN EXISTS (
+  SELECT 1
+  FROM aircraft_sale_listing_avionics link
+  JOIN aircraft_sale_listings listing
+    ON listing.id = link.aircraft_sale_listing_id
+  WHERE link.id = OLD.listing_link_id
+    AND (listing.ingestion_state = 'ready' OR listing.is_verified = 1)
+)
+BEGIN
+  UPDATE aircraft_sale_listings
+  SET ingestion_state = 'quarantined',
+      is_verified = 0,
+      ingestion_error = 'avionics_authorization_invalidated',
+      ingestion_completed_at = NULL,
+      updated_at = CURRENT_TIMESTAMP
+  WHERE id = (
+    SELECT aircraft_sale_listing_id
+    FROM aircraft_sale_listing_avionics
+    WHERE id = OLD.listing_link_id
+  )
+    AND (ingestion_state = 'ready' OR is_verified = 1);
+END;
+
 CREATE TRIGGER IF NOT EXISTS
   listing_avionics_authorizations_invalidate_link_update
 AFTER UPDATE OF
   aircraft_sale_listing_id,
   avionics_model_id,
   quantity,
+  source,
   source_notes,
   source_confidence,
   configuration_action,
   replaces_avionics_model_id
 ON aircraft_sale_listing_avionics
+WHEN NOT (NEW.aircraft_sale_listing_id IS OLD.aircraft_sale_listing_id)
+  OR NOT (NEW.avionics_model_id IS OLD.avionics_model_id)
+  OR NOT (NEW.quantity IS OLD.quantity)
+  OR NOT (NEW.source IS OLD.source)
+  OR NOT (NEW.source_notes IS OLD.source_notes)
+  OR NOT (NEW.source_confidence IS OLD.source_confidence)
+  OR NOT (NEW.configuration_action IS OLD.configuration_action)
+  OR NOT (NEW.replaces_avionics_model_id IS OLD.replaces_avionics_model_id)
 BEGIN
   DELETE FROM aircraft_sale_listing_avionics_link_authorizations
   WHERE listing_link_id = NEW.id;
@@ -8564,6 +8633,16 @@ AFTER UPDATE OF
   normalized_manufacturer_identifier, identity_source_url,
   identity_source_title, identity_evidence_text
 ON avionics_models
+WHEN NOT (NEW.avionics_manufacturer_id IS OLD.avionics_manufacturer_id)
+  OR NOT (NEW.name IS OLD.name)
+  OR NOT (NEW.normalized_name IS OLD.normalized_name)
+  OR NOT (NEW.catalog_status IS OLD.catalog_status)
+  OR NOT (NEW.manufacturer_identifier_kind IS OLD.manufacturer_identifier_kind)
+  OR NOT (NEW.manufacturer_identifier IS OLD.manufacturer_identifier)
+  OR NOT (NEW.normalized_manufacturer_identifier IS OLD.normalized_manufacturer_identifier)
+  OR NOT (NEW.identity_source_url IS OLD.identity_source_url)
+  OR NOT (NEW.identity_source_title IS OLD.identity_source_title)
+  OR NOT (NEW.identity_evidence_text IS OLD.identity_evidence_text)
 BEGIN
   DELETE FROM aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'
@@ -8591,6 +8670,8 @@ END;
 CREATE TRIGGER IF NOT EXISTS
   listing_avionics_authorizations_invalidate_model_type_update
 AFTER UPDATE OF avionics_model_id, avionics_type_id ON avionics_model_types
+WHEN NOT (NEW.avionics_model_id IS OLD.avionics_model_id)
+  OR NOT (NEW.avionics_type_id IS OLD.avionics_type_id)
 BEGIN
   DELETE FROM aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'
@@ -8600,6 +8681,8 @@ END;
 CREATE TRIGGER IF NOT EXISTS
   listing_avionics_authorizations_invalidate_type_update
 AFTER UPDATE OF name, normalized_name ON avionics_types
+WHEN NOT (NEW.name IS OLD.name)
+  OR NOT (NEW.normalized_name IS OLD.normalized_name)
 BEGIN
   DELETE FROM aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'
@@ -8634,6 +8717,16 @@ AFTER UPDATE OF
   canonical_product_key, manufacturer_identifier_kind,
   canonical_identifier_key
 ON avionics_approved_product_identities
+WHEN NOT (NEW.avionics_model_id IS OLD.avionics_model_id)
+  OR NOT (
+    NEW.avionics_manufacturer_identity_id
+      IS OLD.avionics_manufacturer_identity_id
+  )
+  OR NOT (NEW.canonical_product_key IS OLD.canonical_product_key)
+  OR NOT (
+    NEW.manufacturer_identifier_kind IS OLD.manufacturer_identifier_kind
+  )
+  OR NOT (NEW.canonical_identifier_key IS OLD.canonical_identifier_key)
 BEGIN
   DELETE FROM aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'
@@ -8643,6 +8736,8 @@ END;
 CREATE TRIGGER IF NOT EXISTS
   listing_avionics_authorizations_invalidate_manufacturer_update
 AFTER UPDATE OF name, normalized_name ON avionics_manufacturers
+WHEN NOT (NEW.name IS OLD.name)
+  OR NOT (NEW.normalized_name IS OLD.normalized_name)
 BEGIN
   DELETE FROM aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'

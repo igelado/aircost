@@ -280,7 +280,7 @@ BEGIN
     INTO actual_object_count, actual_definition_digest
     FROM pg_temp.reference_catalog_schema_owned_objects;
     IF actual_object_count <> 792
-       OR actual_definition_digest <> 'f1ed12c366a583546439a58db5fa8359' THEN
+       OR actual_definition_digest <> '9fccaee88521d99c9b4cdffdb8af610e' THEN
       RAISE EXCEPTION
         'reference catalog canonical schema owned-object mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
@@ -4130,6 +4130,45 @@ CREATE TRIGGER listing_avionics_authorizations_immutable_update
 BEFORE UPDATE ON public.aircraft_sale_listing_avionics_link_authorizations
 FOR EACH ROW EXECUTE FUNCTION public.preserve_listing_avionics_authorization();
 
+-- Authorization is live publication authority, not an audit receipt. Any
+-- invalidation atomically withdraws a surviving published listing. A cascading
+-- parent/link deletion no longer exposes the link here and remains valid.
+CREATE OR REPLACE FUNCTION public.demote_listing_after_avionics_authorization_delete()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  parent_listing_id BIGINT;
+BEGIN
+  SELECT link.aircraft_sale_listing_id
+  INTO parent_listing_id
+  FROM public.aircraft_sale_listing_avionics link
+  WHERE link.id = OLD.listing_link_id;
+
+  IF parent_listing_id IS NOT NULL THEN
+    UPDATE public.aircraft_sale_listings
+    SET ingestion_state = 'quarantined',
+        is_verified = FALSE,
+        ingestion_error = 'avionics_authorization_invalidated',
+        ingestion_completed_at = NULL,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = parent_listing_id
+      AND (ingestion_state = 'ready' OR is_verified);
+  END IF;
+  RETURN OLD;
+END;
+$function$;
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_demote_listing_after_delete
+ON public.aircraft_sale_listing_avionics_link_authorizations;
+CREATE TRIGGER
+  listing_avionics_authorizations_demote_listing_after_delete
+AFTER DELETE ON public.aircraft_sale_listing_avionics_link_authorizations
+FOR EACH ROW
+EXECUTE FUNCTION public.demote_listing_after_avionics_authorization_delete();
+
 CREATE OR REPLACE FUNCTION public.invalidate_listing_avionics_authorization_for_link()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -4149,12 +4188,24 @@ AFTER UPDATE OF
   aircraft_sale_listing_id,
   avionics_model_id,
   quantity,
+  source,
   source_notes,
   source_confidence,
   configuration_action,
   replaces_avionics_model_id
 ON public.aircraft_sale_listing_avionics
-FOR EACH ROW EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_link();
+FOR EACH ROW
+WHEN (
+  NEW.aircraft_sale_listing_id IS DISTINCT FROM OLD.aircraft_sale_listing_id
+  OR NEW.avionics_model_id IS DISTINCT FROM OLD.avionics_model_id
+  OR NEW.quantity IS DISTINCT FROM OLD.quantity
+  OR NEW.source IS DISTINCT FROM OLD.source
+  OR NEW.source_notes IS DISTINCT FROM OLD.source_notes
+  OR NEW.source_confidence IS DISTINCT FROM OLD.source_confidence
+  OR NEW.configuration_action IS DISTINCT FROM OLD.configuration_action
+  OR NEW.replaces_avionics_model_id IS DISTINCT FROM OLD.replaces_avionics_model_id
+)
+EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_link();
 
 CREATE OR REPLACE FUNCTION public.invalidate_listing_avionics_authorization_for_reuse()
 RETURNS TRIGGER
@@ -4201,6 +4252,18 @@ AFTER UPDATE OF
   identity_source_title, identity_evidence_text
 ON public.avionics_models
 FOR EACH ROW
+WHEN (
+  NEW.avionics_manufacturer_id IS DISTINCT FROM OLD.avionics_manufacturer_id
+  OR NEW.name IS DISTINCT FROM OLD.name
+  OR NEW.normalized_name IS DISTINCT FROM OLD.normalized_name
+  OR NEW.catalog_status IS DISTINCT FROM OLD.catalog_status
+  OR NEW.manufacturer_identifier_kind IS DISTINCT FROM OLD.manufacturer_identifier_kind
+  OR NEW.manufacturer_identifier IS DISTINCT FROM OLD.manufacturer_identifier
+  OR NEW.normalized_manufacturer_identifier IS DISTINCT FROM OLD.normalized_manufacturer_identifier
+  OR NEW.identity_source_url IS DISTINCT FROM OLD.identity_source_url
+  OR NEW.identity_source_title IS DISTINCT FROM OLD.identity_source_title
+  OR NEW.identity_evidence_text IS DISTINCT FROM OLD.identity_evidence_text
+)
 EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_model_proof();
 
 CREATE OR REPLACE FUNCTION
@@ -4251,6 +4314,10 @@ CREATE TRIGGER
   listing_avionics_authorizations_invalidate_model_type_update
 AFTER UPDATE OF avionics_model_id, avionics_type_id ON public.avionics_model_types
 FOR EACH ROW
+WHEN (
+  NEW.avionics_model_id IS DISTINCT FROM OLD.avionics_model_id
+  OR NEW.avionics_type_id IS DISTINCT FROM OLD.avionics_type_id
+)
 EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_model_type();
 
 CREATE OR REPLACE FUNCTION
@@ -4274,6 +4341,10 @@ ON public.avionics_types;
 CREATE TRIGGER listing_avionics_authorizations_invalidate_type_update
 AFTER UPDATE OF name, normalized_name ON public.avionics_types
 FOR EACH ROW
+WHEN (
+  NEW.name IS DISTINCT FROM OLD.name
+  OR NEW.normalized_name IS DISTINCT FROM OLD.normalized_name
+)
 EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_type();
 
 CREATE OR REPLACE FUNCTION
@@ -4322,6 +4393,13 @@ AFTER UPDATE OF
   canonical_identifier_key
 ON public.avionics_approved_product_identities
 FOR EACH ROW
+WHEN (
+  NEW.avionics_model_id IS DISTINCT FROM OLD.avionics_model_id
+  OR NEW.avionics_manufacturer_identity_id IS DISTINCT FROM OLD.avionics_manufacturer_identity_id
+  OR NEW.canonical_product_key IS DISTINCT FROM OLD.canonical_product_key
+  OR NEW.manufacturer_identifier_kind IS DISTINCT FROM OLD.manufacturer_identifier_kind
+  OR NEW.canonical_identifier_key IS DISTINCT FROM OLD.canonical_identifier_key
+)
 EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_graph();
 
 CREATE OR REPLACE FUNCTION
@@ -4347,6 +4425,10 @@ CREATE TRIGGER
   listing_avionics_authorizations_invalidate_manufacturer_update
 AFTER UPDATE OF name, normalized_name ON public.avionics_manufacturers
 FOR EACH ROW
+WHEN (
+  NEW.name IS DISTINCT FROM OLD.name
+  OR NEW.normalized_name IS DISTINCT FROM OLD.normalized_name
+)
 EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_manufacturer();
 
 CREATE OR REPLACE FUNCTION
@@ -4845,54 +4927,64 @@ BEFORE UPDATE OF aircraft_sale_listing_id, avionics_model_id,
 ON aircraft_sale_listing_avionics
 FOR EACH ROW EXECUTE FUNCTION require_valid_listing_avionics_action_graph();
 
-CREATE OR REPLACE FUNCTION require_ready_listing_avionics_integrity()
+CREATE OR REPLACE FUNCTION public.reject_ready_listing_insert_before_avionics()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $function$
 BEGIN
-  IF TG_OP = 'INSERT' AND NEW.ingestion_state = 'ready' THEN
+  IF NEW.ingestion_state = 'ready' THEN
     RAISE EXCEPTION 'listing cannot be inserted ready before avionics are validated';
   END IF;
-  IF TG_OP = 'UPDATE' THEN
-    IF NEW.ingestion_state = 'ready'
-       AND OLD.ingestion_state IS DISTINCT FROM 'ready'
-       AND NOT EXISTS (
+  RETURN NEW;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.require_ready_listing_avionics_integrity()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  IF NEW.ingestion_state = 'ready'
+     AND OLD.ingestion_state IS DISTINCT FROM 'ready'
+     AND NOT EXISTS (
          SELECT 1
-         FROM pg_locks held_lock
+         FROM pg_catalog.pg_locks held_lock
          WHERE held_lock.locktype = 'relation'
-           AND held_lock.pid = pg_backend_pid()
-           AND held_lock.relation = 'aircraft_sale_listing_avionics'::regclass
+           AND held_lock.pid = pg_catalog.pg_backend_pid()
+           AND held_lock.relation =
+               'public.aircraft_sale_listing_avionics'::pg_catalog.regclass
            AND held_lock.mode IN (
              'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'
            )
            AND held_lock.granted
-       ) THEN
-      RAISE EXCEPTION
-        'publishing a listing requires a prior SHARE ROW EXCLUSIVE avionics table lock';
-    END IF;
+     ) THEN
+    RAISE EXCEPTION
+      'publishing a listing requires a prior SHARE ROW EXCLUSIVE avionics table lock';
   END IF;
   IF NEW.ingestion_state = 'ready' AND (
     EXISTS (
       SELECT 1
-      FROM avionics_semantic_invalid_listing_action_graphs invalid_graph
+      FROM public.avionics_semantic_invalid_listing_action_graphs invalid_graph
       WHERE invalid_graph.listing_id = NEW.id
     )
     OR EXISTS (
       SELECT 1
-      FROM aircraft_sale_listing_avionics link
-      JOIN avionics_models model ON model.id = link.avionics_model_id
+      FROM public.aircraft_sale_listing_avionics link
+      JOIN public.avionics_models model ON model.id = link.avionics_model_id
       WHERE link.aircraft_sale_listing_id = NEW.id
         AND model.catalog_status <> 'approved'
     )
     OR EXISTS (
       SELECT 1
-      FROM aircraft_sale_listing_avionics link
-      JOIN avionics_models model ON model.id = link.replaces_avionics_model_id
+      FROM public.aircraft_sale_listing_avionics link
+      JOIN public.avionics_models model ON model.id = link.replaces_avionics_model_id
       WHERE link.aircraft_sale_listing_id = NEW.id
         AND model.catalog_status <> 'approved'
     )
     OR EXISTS (
-      SELECT 1 FROM aircraft_sale_listing_avionics link
+      SELECT 1 FROM public.aircraft_sale_listing_avionics link
       WHERE link.aircraft_sale_listing_id = NEW.id
         AND (
           link.quantity <= 0
@@ -4900,6 +4992,33 @@ BEGIN
           OR link.source NOT IN (
             'listing', 'listing_explicit_count', 'listing_review'
           )
+        )
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM public.aircraft_sale_listing_avionics link
+      WHERE link.aircraft_sale_listing_id = NEW.id
+        AND link.source IN ('listing', 'listing_explicit_count')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.aircraft_sale_listing_avionics_link_authorizations authority_row
+          WHERE authority_row.listing_link_id = link.id
+            AND authority_row.association_role = 'installed'
+            AND authority_row.avionics_model_id = link.avionics_model_id
+        )
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM public.aircraft_sale_listing_avionics link
+      WHERE link.aircraft_sale_listing_id = NEW.id
+        AND link.source IN ('listing', 'listing_explicit_count')
+        AND link.replaces_avionics_model_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.aircraft_sale_listing_avionics_link_authorizations authority_row
+          WHERE authority_row.listing_link_id = link.id
+            AND authority_row.association_role = 'replacement'
+            AND authority_row.avionics_model_id = link.replaces_avionics_model_id
         )
     )
   ) THEN
@@ -4910,16 +5029,17 @@ END;
 $function$;
 
 DROP TRIGGER IF EXISTS aircraft_sale_listings_ready_semantic_avionics
-  ON aircraft_sale_listings;
+  ON public.aircraft_sale_listings;
 CREATE TRIGGER aircraft_sale_listings_ready_semantic_avionics
-BEFORE UPDATE OF ingestion_state ON aircraft_sale_listings
-FOR EACH ROW EXECUTE FUNCTION require_ready_listing_avionics_integrity();
+BEFORE UPDATE OF ingestion_state ON public.aircraft_sale_listings
+FOR EACH ROW EXECUTE FUNCTION public.require_ready_listing_avionics_integrity();
 
 DROP TRIGGER IF EXISTS aircraft_sale_listings_ready_semantic_avionics_insert
-  ON aircraft_sale_listings;
+  ON public.aircraft_sale_listings;
 CREATE TRIGGER aircraft_sale_listings_ready_semantic_avionics_insert
-BEFORE INSERT ON aircraft_sale_listings
-FOR EACH ROW EXECUTE FUNCTION require_ready_listing_avionics_integrity();
+BEFORE INSERT ON public.aircraft_sale_listings
+FOR EACH ROW
+EXECUTE FUNCTION public.reject_ready_listing_insert_before_avionics();
 
 CREATE OR REPLACE FUNCTION require_verified_listing_ready_state()
 RETURNS TRIGGER
@@ -10821,7 +10941,7 @@ BEGIN
   INTO actual_object_count, actual_definition_digest
   FROM pg_temp.reference_catalog_schema_owned_objects;
   IF actual_object_count <> 792
-     OR actual_definition_digest <> 'f1ed12c366a583546439a58db5fa8359' THEN
+     OR actual_definition_digest <> '9fccaee88521d99c9b4cdffdb8af610e' THEN
     RAISE EXCEPTION
       'reference catalog canonical schema post-state mismatch (% objects, digest %)',
       actual_object_count, actual_definition_digest;
