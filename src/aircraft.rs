@@ -12,28 +12,17 @@ use std::fmt;
 use std::sync::Arc;
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-use sqlx::{Connection, FromRow, Postgres, Sqlite, Transaction};
+use sqlx::{Connection, FromRow};
 
 use self::faa::{audit_listing_admission, require_listing_admission, AircraftAdmissionError};
 use self::reference::persistence::{
     listing_reference_status, normalized_reference_price, PublishedReferenceConfiguration,
     ReferenceGap,
 };
-#[cfg(test)]
-use crate::avionics::fingerprint::active_collision_closure_revision_sha256;
-use crate::avionics::fingerprint::{
-    active_collision_closure_revision_sha256_postgres,
-    active_collision_closure_revision_sha256_sqlite, AvionicsFingerprintError,
-};
-use crate::avionics::reuse::{
-    countable_unit_reuse_attestation_is_current_postgres,
-    countable_unit_reuse_attestation_is_current_sqlite,
+use crate::avionics::authorization::{
+    listing_authorization_state_postgres, listing_authorization_state_sqlite,
 };
 use crate::db::{AppDb, DatabaseBackend};
-use crate::listing::replay::retained_capture_timestamp_chronology_valid;
-use crate::listing::review::{association_observation_sha256_from_values, ListingAssociationRole};
-use crate::plugin::current_checkpoint_contains_avionics_source_evidence;
 use crate::valuation::dataset::{require_snapshot_faa_admission, technical_field_count};
 use crate::valuation::{
     source_backed_component_observation, FactoryReferenceFeature, SupportGrade, ValuationBreakdown,
@@ -165,24 +154,12 @@ struct AvionicsEstimateRow {
 
 #[derive(Clone, Debug, FromRow)]
 struct ListingAvionicsEstimateRow {
-    listing_link_id: i64,
     avionics_model_id: i64,
     quantity: i64,
     valuation_scope: String,
     configuration_action: String,
     replaces_avionics_model_id: Option<i64>,
-    source: String,
-    source_notes: Option<String>,
     source_confidence: Option<String>,
-    authorization_avionics_model_id: Option<i64>,
-    authorization_kind: Option<String>,
-    authorization_observation_sha256: Option<String>,
-    authorization_product_fingerprint: Option<String>,
-    current_reuse_product_fingerprint: Option<String>,
-    authorization_evidence_capture_sha256: Option<String>,
-    authorization_plugin_submission_id: Option<i64>,
-    authorization_extracted_listing_sha256: Option<String>,
-    authorization_collision_closure_sha256: Option<String>,
 }
 
 impl From<ListingAvionicsEstimateRow> for AvionicsEstimateRow {
@@ -196,15 +173,6 @@ impl From<ListingAvionicsEstimateRow> for AvionicsEstimateRow {
             source_confidence: row.source_confidence,
         }
     }
-}
-
-#[derive(Debug, FromRow)]
-struct RetainedListingAvionicsCaptureRow {
-    rendered_html: String,
-    extracted_listing_json: String,
-    install_created_at: String,
-    submitted_at: String,
-    install_revoked_at: Option<String>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -880,39 +848,15 @@ async fn listing_avionics_estimates(
 ) -> StoreResult<Vec<AvionicsEstimateRow>> {
     const LISTING_AVIONICS_ESTIMATES_SQL: &str = r#"
         SELECT
-          link.id AS listing_link_id,
           model.id AS avionics_model_id,
           link.quantity,
           model.valuation_scope,
           link.configuration_action,
           link.replaces_avionics_model_id,
-          link.source,
-          link.source_notes,
-          link.source_confidence,
-          authorization.avionics_model_id AS authorization_avionics_model_id,
-          authorization.authorization_kind,
-          authorization.observation_sha256
-            AS authorization_observation_sha256,
-          authorization.product_fingerprint
-            AS authorization_product_fingerprint,
-          current_attestation.product_fingerprint
-            AS current_reuse_product_fingerprint,
-          authorization.evidence_capture_sha256
-            AS authorization_evidence_capture_sha256,
-          authorization.plugin_submission_id
-            AS authorization_plugin_submission_id,
-          authorization.extracted_listing_sha256
-            AS authorization_extracted_listing_sha256,
-          authorization.collision_closure_sha256
-            AS authorization_collision_closure_sha256
+          link.source_confidence
         FROM aircraft_sale_listing_avionics link
         JOIN avionics_models model
           ON model.id = link.avionics_model_id
-        LEFT JOIN aircraft_sale_listing_avionics_link_authorizations authorization
-          ON authorization.listing_link_id = link.id
-         AND authorization.association_role = 'installed'
-        LEFT JOIN avionics_product_reuse_attestations current_attestation
-          ON current_attestation.avionics_model_id = model.id
         WHERE link.aircraft_sale_listing_id = ?
           AND link.source IN (
             'listing', 'listing_explicit_count', 'listing_review'
@@ -930,31 +874,28 @@ async fn listing_avionics_estimates(
         ORDER BY link.id
     "#;
     macro_rules! load_in_transaction {
-        ($transaction:ident, $explicit_count_is_current:path) => {{
+        ($transaction:ident, $authorization_state:path) => {{
+            let authorization_state = $authorization_state(db, &mut $transaction, listing_id)
+                .await
+                .map_err(|error| AircraftStoreError::Database(error.to_string()))?;
+            if !authorization_state.all_automatic_associations_current() {
+                return Err(AircraftStoreError::Model(
+                    "listing avionics association authorization is missing or stale".to_string(),
+                ));
+            }
             let sql = db.sql(LISTING_AVIONICS_ESTIMATES_SQL);
             let rows = sqlx::query_as::<_, ListingAvionicsEstimateRow>(&sql)
                 .bind(listing_id)
                 .fetch_all(&mut *$transaction)
                 .await?;
-            let mut estimates = Vec::with_capacity(rows.len());
-            for row in rows {
-                if row.source != "listing_explicit_count"
-                    || $explicit_count_is_current(db, &mut $transaction, listing_id, &row).await?
-                {
-                    estimates.push(row.into());
-                }
-            }
-            estimates
+            rows.into_iter().map(Into::into).collect()
         }};
     }
 
     match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
             let mut transaction = pool.begin().await?;
-            let estimates = load_in_transaction!(
-                transaction,
-                explicit_count_listing_avionics_is_current_sqlite
-            );
+            let estimates = load_in_transaction!(transaction, listing_authorization_state_sqlite);
             transaction.commit().await?;
             Ok(estimates)
         }
@@ -963,167 +904,11 @@ async fn listing_avionics_estimates(
             let mut transaction = connection
                 .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .await?;
-            let estimates = load_in_transaction!(
-                transaction,
-                explicit_count_listing_avionics_is_current_postgres
-            );
+            let estimates = load_in_transaction!(transaction, listing_authorization_state_postgres);
             transaction.commit().await?;
             Ok(estimates)
         }
     }
-}
-
-macro_rules! explicit_count_listing_avionics_is_current {
-    (
-        $db:expr,
-        $transaction:expr,
-        $listing_id:expr,
-        $row:expr,
-        $countable_reuse_is_current:path,
-        $active_collision_revision:path
-    ) => {{
-        let row = $row;
-        let (
-            Some(source_notes),
-            Some(authorization_model_id),
-            Some(authorization_kind),
-            Some(authorization_observation_sha256),
-            Some(authorization_product_fingerprint),
-            Some(current_reuse_product_fingerprint),
-            Some(authorization_evidence_capture_sha256),
-            Some(authorization_plugin_submission_id),
-            Some(authorization_extracted_listing_sha256),
-            Some(authorization_collision_closure_sha256),
-        ) = (
-            row.source_notes.as_deref(),
-            row.authorization_avionics_model_id,
-            row.authorization_kind.as_deref(),
-            row.authorization_observation_sha256.as_deref(),
-            row.authorization_product_fingerprint.as_deref(),
-            row.current_reuse_product_fingerprint.as_deref(),
-            row.authorization_evidence_capture_sha256.as_deref(),
-            row.authorization_plugin_submission_id,
-            row.authorization_extracted_listing_sha256.as_deref(),
-            row.authorization_collision_closure_sha256.as_deref(),
-        )
-        else {
-            return Ok(false);
-        };
-        if row.quantity != 2
-            || row.configuration_action != "installed"
-            || row.replaces_avionics_model_id.is_some()
-            || row.source_confidence.as_deref() != Some("high")
-            || source_notes.trim().is_empty()
-            || authorization_model_id != row.avionics_model_id
-            || authorization_kind != "manufacturer_reuse"
-            || authorization_product_fingerprint != current_reuse_product_fingerprint
-            || !$countable_reuse_is_current($db, $transaction, row.avionics_model_id).await?
-        {
-            return Ok(false);
-        }
-        let expected_observation_sha256 = association_observation_sha256_from_values(
-            $listing_id,
-            row.listing_link_id,
-            ListingAssociationRole::Installed,
-            row.avionics_model_id,
-            row.avionics_model_id,
-            row.replaces_avionics_model_id,
-            row.quantity,
-            &row.configuration_action,
-            source_notes,
-        );
-        if authorization_observation_sha256 != expected_observation_sha256 {
-            return Ok(false);
-        }
-        let capture_sql = $db.sql(
-            r#"
-            SELECT submission.rendered_html, submission.extracted_listing_json,
-                   install.created_at AS install_created_at,
-                   submission.submitted_at,
-                   install.revoked_at AS install_revoked_at
-            FROM plugin_submissions submission
-            JOIN plugin_installs install
-              ON install.id = submission.plugin_install_id
-             AND install.user_id = submission.user_id
-            JOIN aircraft_sale_listings listing
-              ON listing.id = submission.canonical_listing_id
-             AND listing.created_by_user_id = submission.user_id
-             AND listing.source_url = submission.source_url
-            WHERE submission.id = ?
-              AND submission.canonical_listing_id = ?
-              AND submission.rendered_html_sha256 = ?
-              AND submission.extracted_listing_json IS NOT NULL
-              AND submission.extraction_error IS NULL
-            "#,
-        );
-        let capture = sqlx::query_as::<_, RetainedListingAvionicsCaptureRow>(&capture_sql)
-            .bind(authorization_plugin_submission_id)
-            .bind($listing_id)
-            .bind(authorization_evidence_capture_sha256)
-            .fetch_optional(&mut **$transaction)
-            .await?;
-        let capture_is_current = capture.is_some_and(|capture| {
-            format!("{:x}", Sha256::digest(capture.rendered_html.as_bytes()))
-                == authorization_evidence_capture_sha256
-                && format!(
-                    "{:x}",
-                    Sha256::digest(capture.extracted_listing_json.as_bytes())
-                ) == authorization_extracted_listing_sha256
-                && retained_capture_timestamp_chronology_valid(
-                    &capture.install_created_at,
-                    &capture.submitted_at,
-                    capture.install_revoked_at.as_deref(),
-                )
-                && current_checkpoint_contains_avionics_source_evidence(
-                    &capture.extracted_listing_json,
-                    source_notes,
-                )
-        });
-        if !capture_is_current {
-            return Ok(false);
-        }
-        match $active_collision_revision($db, $transaction, row.avionics_model_id).await {
-            Ok(current_collision) => {
-                Ok(current_collision == authorization_collision_closure_sha256)
-            }
-            Err(AvionicsFingerprintError::Conflict(_)) => Ok(false),
-            Err(AvionicsFingerprintError::Database(message)) => {
-                Err(AircraftStoreError::Database(message))
-            }
-        }
-    }};
-}
-
-async fn explicit_count_listing_avionics_is_current_sqlite(
-    db: &AppDb,
-    transaction: &mut Transaction<'_, Sqlite>,
-    listing_id: i64,
-    row: &ListingAvionicsEstimateRow,
-) -> StoreResult<bool> {
-    explicit_count_listing_avionics_is_current!(
-        db,
-        transaction,
-        listing_id,
-        row,
-        countable_unit_reuse_attestation_is_current_sqlite,
-        active_collision_closure_revision_sha256_sqlite
-    )
-}
-
-async fn explicit_count_listing_avionics_is_current_postgres(
-    db: &AppDb,
-    transaction: &mut Transaction<'_, Postgres>,
-    listing_id: i64,
-    row: &ListingAvionicsEstimateRow,
-) -> StoreResult<bool> {
-    explicit_count_listing_avionics_is_current!(
-        db,
-        transaction,
-        listing_id,
-        row,
-        countable_unit_reuse_attestation_is_current_postgres,
-        active_collision_closure_revision_sha256_postgres
-    )
 }
 
 async fn reference_avionics_estimates(
@@ -1333,23 +1118,33 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        active_collision_closure_revision_sha256, aircraft_listing_value_with_model,
-        aircraft_option_for_variant, aircraft_options, association_observation_sha256_from_values,
+        aircraft_listing_value_with_model, aircraft_option_for_variant, aircraft_options,
         avionics_suite_memberships, ground_estimate_to_reference, listing_avionics_estimates,
         listing_value_point, require_valuation_model_faa_admission, resolve_avionics_configuration,
         AircraftListingPointRow, AircraftReferenceValuationBasis, AvionicsConfigurationLink,
-        AvionicsSuiteMembership, ListingAssociationRole, RetainedListingAvionicsCaptureRow,
+        AvionicsSuiteMembership,
     };
+    use crate::avionics::fingerprint::active_collision_closure_revision_sha256;
     use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
     use crate::avionics::reuse::refresh_reuse_attestation_sqlite;
     use crate::db::{AppDb, DatabaseBackend};
     use crate::listing::replay::retained_capture_timestamp_chronology_valid;
+    use crate::listing::review::{
+        association_observation_sha256_from_values, ListingAssociationRole,
+    };
     use crate::plugin::current_checkpoint_contains_avionics_source_evidence;
     use crate::valuation::{
         DepreciationPoint, SupportGrade, ValuationBreakdown, ValuationError, ValuationEstimate,
         ValuationModel, ValuationQuery,
     };
     use sha2::{Digest, Sha256};
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct RetainedListingAvionicsCaptureRow {
+        install_created_at: String,
+        submitted_at: String,
+        install_revoked_at: Option<String>,
+    }
 
     fn link(
         model_id: i64,
@@ -1982,7 +1777,9 @@ mod tests {
         .await
         .unwrap();
 
-        let listing_rows = listing_avionics_estimates(&db, listing_id).await.unwrap();
+        let listing_error = listing_avionics_estimates(&db, listing_id)
+            .await
+            .expect_err("one stale automatic association must reject the whole listing graph");
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM avionics_model_types WHERE avionics_model_id = ?",
@@ -1994,13 +1791,9 @@ mod tests {
             2,
             "the fixture must exercise a multi-capability physical product"
         );
-        assert_eq!(
-            listing_rows
-                .iter()
-                .map(|row| row.avionics_model_id)
-                .collect::<Vec<_>>(),
-            vec![approved_suite_id]
-        );
+        assert!(listing_error
+            .to_string()
+            .contains("association authorization is missing or stale"));
         assert_eq!(
             avionics_suite_memberships(&db).await.unwrap(),
             vec![AvionicsSuiteMembership {
@@ -2243,8 +2036,7 @@ mod tests {
         ));
         let retained_capture: RetainedListingAvionicsCaptureRow = sqlx::query_as(
             r#"
-            SELECT submission.rendered_html, submission.extracted_listing_json,
-                   install.created_at AS install_created_at,
+            SELECT install.created_at AS install_created_at,
                    submission.submitted_at,
                    install.revoked_at AS install_revoked_at
             FROM plugin_submissions submission
@@ -2292,8 +2084,9 @@ mod tests {
             .unwrap();
         assert!(listing_avionics_estimates(&db, listing_id)
             .await
-            .unwrap()
-            .is_empty());
+            .expect_err("a stale checkpoint must reject the listing")
+            .to_string()
+            .contains("association authorization is missing or stale"));
 
         sqlx::query(
             "DELETE FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
@@ -2316,24 +2109,20 @@ mod tests {
             .unwrap();
         assert!(listing_avionics_estimates(&db, listing_id)
             .await
-            .unwrap()
-            .is_empty());
+            .expect_err("a stale observation must reject the listing")
+            .to_string()
+            .contains("association authorization is missing or stale"));
 
         sqlx::query("UPDATE aircraft_sale_listing_avionics SET source = 'listing' WHERE id = ?")
             .bind(link_id)
             .execute(pool)
             .await
             .unwrap();
-        assert_eq!(
-            listing_avionics_estimates(&db, listing_id)
-                .await
-                .unwrap()
-                .iter()
-                .map(|row| (row.avionics_model_id, row.quantity))
-                .collect::<Vec<_>>(),
-            vec![(model_id, 2)],
-            "ordinary listing behavior must not inherit the explicit-count gate"
-        );
+        assert!(listing_avionics_estimates(&db, listing_id)
+            .await
+            .expect_err("ordinary automatic listing data also requires current authority")
+            .to_string()
+            .contains("association authorization is missing or stale"));
     }
 
     #[tokio::test]

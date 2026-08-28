@@ -618,7 +618,7 @@ const REFERENCE_CATALOG_CUTOVER_RETIRED_ROUTINES: &[&str] = &[
 ];
 const REFERENCE_CATALOG_CUTOVER_SQLITE_OBJECT_COUNT: i64 = 213;
 const REFERENCE_CATALOG_CUTOVER_SQLITE_DEFINITION_DIGEST: &str =
-    "d54632bf3bc2029e58d4f23cb315807660de87bbfb6e4b18a658f61e562ba824";
+    "e719b1ac8845b11a21cc24b4fa36e0fd66e4e1fc2dfaa49cc25fab05a1aa4115";
 const REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES: &[&str] = &[
     "aircraft_reference_fact_set_attestations:sqlite_autoindex_aircraft_reference_fact_set_attestations_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:fact_set_kind:0:BINARY:1,2:-1::0:BINARY:0",
     "aircraft_reference_prices:sqlite_autoindex_aircraft_reference_prices_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:price_kind:0:BINARY:1,2:4:currency:0:BINARY:1,3:-1::0:BINARY:0",
@@ -632,7 +632,7 @@ const REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES: &[&str] = &[
 ];
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_OBJECT_COUNT: i64 = 792;
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_DEFINITION_DIGEST: &str =
-    "f1ed12c366a583546439a58db5fa8359";
+    "9fccaee88521d99c9b4cdffdb8af610e";
 const SQLITE_SERIAL_SCHEME_INSERT_TRIGGER: &str = r#"
 CREATE TRIGGER aircraft_serial_schemes_require_approval
 BEFORE INSERT ON aircraft_serial_number_schemes
@@ -1070,7 +1070,9 @@ fn canonical_sqlite_named_definition(schema: &str, name: &str) -> Option<String>
         .find(|statement| {
             statement.starts_with(&format!("createindex{canonical_name}on"))
                 || statement.starts_with(&format!("createuniqueindex{canonical_name}on"))
-                || statement.starts_with(&format!("createtrigger{canonical_name}"))
+                || statement.starts_with(&format!("createtrigger{canonical_name}before"))
+                || statement.starts_with(&format!("createtrigger{canonical_name}after"))
+                || statement.starts_with(&format!("createtrigger{canonical_name}insteadof"))
         })
 }
 
@@ -1092,7 +1094,11 @@ fn canonical_postgres_named_trigger_definition(schema: &str, name: &str) -> Opti
         .into_iter()
         .map(strip_leading_sql_comments)
         .map(canonical_postgres_trigger_definition)
-        .find(|statement| statement.starts_with(&marker))
+        .find(|statement| {
+            statement.starts_with(&format!("{marker}before"))
+                || statement.starts_with(&format!("{marker}after"))
+                || statement.starts_with(&format!("{marker}insteadof"))
+        })
 }
 
 fn postgres_migration_function_source(function_name: &str) -> Option<&'static str> {
@@ -4212,7 +4218,7 @@ impl AppDb {
                                 'aircraft_sale_listing_avionics_link_authorizations'
                               ) > 0
                             )
-                        ) <> 20
+                        ) <> 22
                       )
                     "#,
                 )
@@ -5332,6 +5338,20 @@ impl AppDb {
         const SQLITE_INDEXES: &[&str] = &["idx_listing_avionics_authorizations_model"];
         const TRIGGERS: &[(&str, i16, bool, bool, &str)] = &[
             (
+                "aircraft_sale_listings_ready_semantic_avionics",
+                19,
+                false,
+                true,
+                "require_ready_listing_avionics_integrity",
+            ),
+            (
+                "listing_avionics_authorizations_demote_listing_after_delete",
+                9,
+                true,
+                true,
+                "demote_listing_after_avionics_authorization_delete",
+            ),
+            (
                 "listing_avionics_authorizations_immutable_update",
                 19,
                 true,
@@ -5370,7 +5390,7 @@ impl AppDb {
                 "listing_avionics_authorizations_invalidate_graph_update",
                 17,
                 false,
-                true,
+                false,
                 "invalidate_listing_avionics_same_case_for_graph",
             ),
             (
@@ -5384,7 +5404,7 @@ impl AppDb {
                 "listing_avionics_authorizations_invalidate_link_update",
                 17,
                 false,
-                true,
+                false,
                 "invalidate_listing_avionics_authorization_for_link",
             ),
             (
@@ -5398,14 +5418,14 @@ impl AppDb {
                 "listing_avionics_authorizations_invalidate_manufacturer_update",
                 17,
                 false,
-                true,
+                false,
                 "invalidate_listing_avionics_same_case_for_manufacturer",
             ),
             (
                 "listing_avionics_authorizations_invalidate_model_proof_update",
                 17,
                 false,
-                true,
+                false,
                 "invalidate_listing_avionics_same_case_for_model_proof",
             ),
             (
@@ -5426,7 +5446,7 @@ impl AppDb {
                 "listing_avionics_authorizations_invalidate_model_type_update",
                 17,
                 false,
-                true,
+                false,
                 "invalidate_listing_avionics_same_case_for_model_type",
             ),
             (
@@ -5447,7 +5467,7 @@ impl AppDb {
                 "listing_avionics_authorizations_invalidate_type_update",
                 17,
                 false,
-                true,
+                false,
                 "invalidate_listing_avionics_same_case_for_type",
             ),
             (
@@ -5536,6 +5556,43 @@ impl AppDb {
                                 })
                         },
                     );
+                #[cfg(test)]
+                if !triggers_are_exact {
+                    eprintln!(
+                        "listing avionics authorization SQLite triggers drifted: actual={:?} expected={:?}",
+                        actual_triggers
+                            .iter()
+                            .map(|(name, _)| name)
+                            .collect::<Vec<_>>(),
+                        TRIGGERS.iter().map(|trigger| trigger.0).collect::<Vec<_>>()
+                    );
+                    for ((actual_name, actual_definition), (expected_name, _, _, _, _)) in
+                        actual_triggers.iter().zip(TRIGGERS)
+                    {
+                        let exact = actual_definition.as_deref().is_some_and(|actual| {
+                            canonical_sqlite_schema_definition(actual)
+                                == canonical_sqlite_named_definition(
+                                    SQLITE_SCHEMA_SQL,
+                                    expected_name,
+                                )
+                                .unwrap()
+                        });
+                        if !exact {
+                            eprintln!("SQLite trigger definition drift: {actual_name}");
+                            eprintln!(
+                                "actual={}\nexpected={}",
+                                canonical_sqlite_schema_definition(
+                                    actual_definition.as_deref().unwrap_or_default()
+                                ),
+                                canonical_sqlite_named_definition(
+                                    SQLITE_SCHEMA_SQL,
+                                    expected_name,
+                                )
+                                .unwrap()
+                            );
+                        }
+                    }
+                }
                 Ok(table_is_exact && indexes_are_exact && triggers_are_exact)
             }
             GateConnection::Postgres(pool) => {
@@ -18845,6 +18902,7 @@ mod tests {
         );
         for definition in [SQLITE_SCHEMA_SQL, POSTGRES_SCHEMA_SQL] {
             for cleanup_trigger in [
+                "listing_avionics_authorizations_demote_listing_after_delete",
                 "listing_avionics_authorizations_invalidate_model_proof_update",
                 "listing_avionics_authorizations_invalidate_model_type_insert",
                 "listing_avionics_authorizations_invalidate_model_type_delete",
@@ -19244,6 +19302,167 @@ mod tests {
                 "{target} provenance change must invalidate authorization"
             );
         }
+    }
+
+    async fn disable_non_avionics_listing_ready_guards(pool: &sqlx::SqlitePool) {
+        sqlx::raw_sql(
+            "DROP TRIGGER listing_ready_requires_canonical_aircraft_update; \
+             DROP TRIGGER listing_ready_requires_aircraft_projection; \
+             DROP TRIGGER listing_ready_rejects_pending_aircraft_placeholder;",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn publish_listing_authorization_fixture(pool: &sqlx::SqlitePool, listing_id: i64) {
+        sqlx::query(
+            "UPDATE aircraft_sale_listings \
+             SET ingestion_state = 'ready', is_verified = 1, \
+                 ingestion_error = NULL, ingestion_completed_at = CURRENT_TIMESTAMP, \
+                 updated_at = '2000-01-01T00:00:00Z' \
+             WHERE id = ?",
+        )
+        .bind(listing_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_listing_requires_authorization_but_human_review_is_row_free() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let fixture = insert_decoded_listing_authorization_fixture(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        disable_non_avionics_listing_ready_guards(pool).await;
+        sqlx::query(
+            "DELETE FROM aircraft_sale_listing_avionics_link_authorizations \
+             WHERE listing_link_id = ?",
+        )
+        .bind(fixture.link_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = sqlx::query(
+            "UPDATE aircraft_sale_listings \
+             SET ingestion_state = 'ready', ingestion_error = NULL, \
+                 ingestion_completed_at = CURRENT_TIMESTAMP \
+             WHERE id = ?",
+        )
+        .bind(fixture.listing_id)
+        .execute(pool)
+        .await
+        .expect_err("an automatic listing association without authority must not publish");
+        assert!(error
+            .to_string()
+            .contains("ready listing requires unique approved canonical avionics"));
+
+        sqlx::query(
+            "UPDATE aircraft_sale_listing_avionics \
+             SET source = 'listing_review' WHERE id = ?",
+        )
+        .bind(fixture.link_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        publish_listing_authorization_fixture(pool, fixture.listing_id).await;
+    }
+
+    #[tokio::test]
+    async fn authorization_invalidation_demotes_published_listing_and_noops_preserve_it() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let fixture = insert_decoded_listing_authorization_fixture(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        disable_non_avionics_listing_ready_guards(pool).await;
+        publish_listing_authorization_fixture(pool, fixture.listing_id).await;
+
+        sqlx::query(
+            "UPDATE plugin_submissions \
+             SET signature_base64 = signature_base64 WHERE id = ?",
+        )
+        .bind(fixture.submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_as::<_, (String, bool, Option<String>)>(
+                "SELECT ingestion_state, is_verified, ingestion_error \
+                 FROM aircraft_sale_listings WHERE id = ?",
+            )
+            .bind(fixture.listing_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            ("ready".to_string(), true, None),
+            "a no-op provenance update must preserve authority and publication"
+        );
+
+        sqlx::query("UPDATE plugin_submissions SET signature_base64 = 'invalidated' WHERE id = ?")
+            .bind(fixture.submission_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_as::<_, (String, bool, Option<String>, Option<String>)>(
+                "SELECT ingestion_state, is_verified, ingestion_error, \
+                        ingestion_completed_at \
+                 FROM aircraft_sale_listings WHERE id = ?",
+            )
+            .bind(fixture.listing_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            (
+                "quarantined".to_string(),
+                false,
+                Some("avionics_authorization_invalidated".to_string()),
+                None,
+            )
+        );
+        assert_ne!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT updated_at FROM aircraft_sale_listings WHERE id = ?",
+            )
+            .bind(fixture.listing_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            "2000-01-01T00:00:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_listing_delete_cascades_through_authorizations() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let fixture = insert_decoded_listing_authorization_fixture(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        disable_non_avionics_listing_ready_guards(pool).await;
+        publish_listing_authorization_fixture(pool, fixture.listing_id).await;
+
+        sqlx::query("DELETE FROM aircraft_sale_listings WHERE id = ?")
+            .bind(fixture.listing_id)
+            .execute(pool)
+            .await
+            .expect("listing cascade deletion must not be interpreted as invalidation");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) \
+                 FROM aircraft_sale_listing_avionics_link_authorizations \
+                 WHERE listing_link_id = ?",
+            )
+            .bind(fixture.link_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            0
+        );
     }
 
     #[test]

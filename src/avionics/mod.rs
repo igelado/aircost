@@ -1,3 +1,4 @@
+pub(crate) mod authorization;
 pub mod catalog;
 pub mod consolidation;
 pub(crate) mod fingerprint;

@@ -4,7 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::FromRow;
+use sqlx::{Connection, FromRow};
 
 use crate::aircraft::curation::visual::{
     VisibleIdentifierKind, VisualConsensusStatus, VisualEvidenceConfidence,
@@ -17,6 +17,10 @@ use crate::aircraft::faa::{
 };
 use crate::aircraft::identity::{
     ensure_listing_identity_assignment_from_approved_catalog, EnsureIdentityAssignmentOutcome,
+};
+use crate::avionics::authorization::{
+    listing_authorization_state, listing_authorization_state_postgres,
+    listing_authorization_state_sqlite,
 };
 #[cfg(test)]
 use crate::avionics::catalog::grounded_resolution_receipt_seed_for_replay;
@@ -31,11 +35,12 @@ use crate::avionics::catalog::{
     GroundedAvionicsResolutionReceiptSeed,
 };
 use crate::avionics::fingerprint::{
-    active_collision_closure_member_ids, catalog_product_fingerprint_for_id,
-    catalog_product_fingerprint_from_rows, fingerprint_active_collision_closure,
-    fingerprint_grounded_collision_closure, grounded_collision_closure_revision_sha256,
-    ActiveCollisionCatalogFingerprintRow, AvionicsFingerprintError, CatalogFingerprintRow,
-    ACTIVE_COLLISION_CATALOG_ROWS_SQL, APPROVED_CATALOG_ROWS_SQL,
+    active_collision_closure_revision_sha256_postgres,
+    active_collision_closure_revision_sha256_sqlite, catalog_product_fingerprint_for_id,
+    catalog_product_fingerprint_from_rows, fingerprint_grounded_collision_closure,
+    grounded_collision_closure_revision_sha256, ActiveCollisionCatalogFingerprintRow,
+    AvionicsFingerprintError, CatalogFingerprintRow, ACTIVE_COLLISION_CATALOG_ROWS_SQL,
+    APPROVED_CATALOG_ROWS_SQL,
 };
 use crate::avionics::reuse::{
     countable_unit_product_reuse_attestation_is_current,
@@ -584,6 +589,51 @@ impl ExactListingSourceCaptureScope {
     }
 }
 
+#[derive(Debug, FromRow)]
+struct ExactSignedListingCheckpointRow {
+    plugin_submission_id: i64,
+    rendered_html_sha256: String,
+    extracted_listing_json: String,
+}
+
+async fn exact_signed_listing_checkpoint_scope(
+    db: &AppDb,
+    listing_id: i64,
+) -> StoreResult<Option<ExactListingSourceCaptureScope>> {
+    let rows = query_as_all!(
+        db,
+        ExactSignedListingCheckpointRow,
+        r#"
+        SELECT submission.id AS plugin_submission_id,
+               submission.rendered_html_sha256,
+               submission.extracted_listing_json
+        FROM plugin_submissions submission
+        WHERE submission.canonical_listing_id = ?
+          AND submission.extracted_listing_json IS NOT NULL
+          AND submission.extraction_error IS NULL
+        ORDER BY submission.id
+        "#,
+        listing_id
+    )?;
+    let [row] = rows.as_slice() else {
+        return if rows.is_empty() {
+            Ok(None)
+        } else {
+            Err(ListingStoreError::State(format!(
+                "listing {listing_id} has multiple retained signed extraction checkpoints"
+            )))
+        };
+    };
+    Ok(Some(ExactListingSourceCaptureScope {
+        plugin_submission_id: row.plugin_submission_id,
+        rendered_html_sha256: row.rendered_html_sha256.clone(),
+        extracted_listing_sha256: format!(
+            "{:x}",
+            Sha256::digest(row.extracted_listing_json.as_bytes())
+        ),
+    }))
+}
+
 enum GroundedCapabilityReplayOutcome {
     Approved(
         ApprovedAvionicsIdentity,
@@ -752,8 +802,11 @@ const AVIONICS_INSTALLATION_EVIDENCE_NOT_HIGH_REASON: &str =
     "The product identity was verified automatically, but the listing does not provide high-confidence evidence that this unit is installed.";
 const AVIONICS_MANUFACTURER_REVIEW_REQUIRED_REASON: &str =
     "The listing names a concrete avionics model without a manufacturer, and the current verified catalog does not identify one unique reusable product. Select an existing verified product or discard this observation.";
+const AVIONICS_SIGNED_CHECKPOINT_REQUIRED_REASON: &str =
+    "The product identity matches the verified catalog, but this automatic association has no exact signed listing checkpoint. Confirm or discard it manually.";
 pub(crate) const SOURCE_IDENTITY_RECEIPT_PENDING: &str =
     "source_identity_correction_receipt_pending";
+pub(crate) const AVIONICS_AUTHORIZATION_INVALIDATED: &str = "avionics_authorization_invalidated";
 
 #[derive(Clone, Debug)]
 struct ListingValues {
@@ -1707,12 +1760,6 @@ async fn grounded_capability_replay_scope(
     db: &AppDb,
     listing_id: i64,
 ) -> StoreResult<Option<GroundedCapabilityReplayScope>> {
-    #[derive(FromRow)]
-    struct Row {
-        plugin_submission_id: i64,
-        rendered_html_sha256: String,
-        extracted_listing_json: Option<String>,
-    }
     let capability_rows = query_as_all!(
         db,
         StoredGroundedCapabilityRow,
@@ -1774,40 +1821,14 @@ async fn grounded_capability_replay_scope(
                 allow_provider_fallback: false,
             }));
         }
-        let bound_rows = query_as_all!(
-            db,
-            Row,
-            r#"
-            SELECT submission.id AS plugin_submission_id,
-                   submission.rendered_html_sha256,
-                   submission.extracted_listing_json
-            FROM plugin_submissions submission
-            WHERE submission.canonical_listing_id = ?
-              AND submission.extracted_listing_json IS NOT NULL
-              AND submission.extraction_error IS NULL
-            ORDER BY submission.id
-            "#,
-            listing_id
-        )?;
-        let [bound] = bound_rows.as_slice() else {
-            return if bound_rows.is_empty() {
-                Ok(None)
-            } else {
-                Err(ListingStoreError::State(format!(
-                    "listing {listing_id} has multiple retained signed extraction checkpoints"
-                )))
-            };
+        let Some(bound) = exact_signed_listing_checkpoint_scope(db, listing_id).await? else {
+            return Ok(None);
         };
-        let extracted = bound.extracted_listing_json.as_deref().ok_or_else(|| {
-            ListingStoreError::State(
-                "bound signed listing lost its retained extraction checkpoint".to_string(),
-            )
-        })?;
         return Ok(Some(GroundedCapabilityReplayScope {
             listing_id,
             plugin_submission_id: bound.plugin_submission_id,
             rendered_html_sha256: bound.rendered_html_sha256.clone(),
-            extracted_listing_sha256: format!("{:x}", Sha256::digest(extracted.as_bytes())),
+            extracted_listing_sha256: bound.extracted_listing_sha256,
             allow_provider_fallback: true,
         }));
     };
@@ -3100,7 +3121,7 @@ async fn insert_listing(
         )
         .await;
     }
-    if let Err(error) = replace_listing_avionics(db, listing_id, &values.avionics).await {
+    if let Err(error) = Box::pin(replace_listing_avionics(db, listing_id, &values.avionics)).await {
         return retain_receipt_gate_or_quarantine(
             db,
             listing_id,
@@ -3235,7 +3256,9 @@ async fn update_listing_values(
         .await;
     }
     if replace_avionics_links {
-        if let Err(error) = replace_listing_avionics(db, listing_id, &values.avionics).await {
+        if let Err(error) =
+            Box::pin(replace_listing_avionics(db, listing_id, &values.avionics)).await
+        {
             return retain_receipt_gate_or_quarantine(
                 db,
                 listing_id,
@@ -3429,6 +3452,19 @@ async fn resolve_listing_avionics_values(
             exact_leading_dual_proof,
         )
         .await;
+        let primary = match primary {
+            ListingAvionicsIdentityResolution::Approved {
+                identity,
+                grounded_receipt_seed: None,
+                ..
+            } if exact_source_capture_scope.is_none() && extractor.is_none() => {
+                ListingAvionicsIdentityResolution::Pending {
+                    suggested_product: Some(review_product_from_identity(&identity)),
+                    reason: AVIONICS_SIGNED_CHECKPOINT_REQUIRED_REASON.to_string(),
+                }
+            }
+            outcome => outcome,
+        };
 
         match primary {
             ListingAvionicsIdentityResolution::DeterministicGenericRejected
@@ -5958,6 +5994,15 @@ async fn complete_listing_ingestion(
         )));
     }
 
+    let authorization_state = listing_authorization_state(db, listing_id)
+        .await
+        .map_err(|error| ListingStoreError::State(error.to_string()))?;
+    if !authorization_state.all_automatic_associations_current() {
+        return Err(ListingStoreError::State(
+            AVIONICS_AUTHORIZATION_INVALIDATED.to_string(),
+        ));
+    }
+
     if let Ok(Some(identity)) = listing_aircraft_identity(db, listing_id).await {
         mark_valuation_snapshot_stale_best_effort(db, identity.aircraft_model_id).await;
     }
@@ -6071,22 +6116,21 @@ pub async fn finalize_reviewed_listing_ingestion(
             "listing {listing_id} is waiting for its immutable source identity correction receipt"
         )));
     }
-    let state = query_as_optional!(
+    let listing_exists = query_scalar_one!(
         db,
-        (String, bool),
-        "SELECT ingestion_state, is_verified FROM aircraft_sale_listings WHERE id = ?",
+        i64,
+        "SELECT COUNT(*) FROM aircraft_sale_listings WHERE id = ?",
         listing_id
-    )?
-    .ok_or_else(|| ListingStoreError::NotFound(format!("listing {listing_id} not found")))?;
+    )? == 1;
+    if !listing_exists {
+        return Err(ListingStoreError::NotFound(format!(
+            "listing {listing_id} not found"
+        )));
+    }
     if listing_has_pending_review(db, listing_id).await? {
         return Err(ListingStoreError::State(format!(
             "listing {listing_id} still has a pending review"
         )));
-    }
-    // A response retry after successful publication must be free and
-    // idempotent.
-    if state.0 == "ready" && state.1 {
-        return Ok(ListingFinalizationOutcome::Ready);
     }
     if let Err(error) = ensure_listing_canonical_aircraft_identity(db, listing_id).await {
         return quarantine_after_error(db, listing_id, error).await;
@@ -6272,11 +6316,9 @@ async fn mark_reviewed_listing_ready(db: &AppDb, listing_id: i64) -> StoreResult
     Ok(())
 }
 
-/// Publish with a post-lock snapshot on Postgres. Child avionics/review writes
-/// use `ROW EXCLUSIVE` table locks, so taking these conflicting locks in a
-/// separate statement before the ready update closes the READ COMMITTED race
-/// where the parent and child triggers could otherwise miss each other's
-/// uncommitted changes. SQLite already serializes writers.
+/// Publish only from the same locked snapshot that proves current avionics
+/// authority. PostgreSQL uses a serializable transaction plus the existing
+/// child-table locks; SQLite acquires its writer lock before revalidation.
 async fn execute_ready_listing_update(
     db: &AppDb,
     statement: &str,
@@ -6284,16 +6326,46 @@ async fn execute_ready_listing_update(
 ) -> StoreResult<u64> {
     let statement = db.sql(statement);
     match db.backend() {
-        DatabaseBackend::Sqlite(pool) => Ok(sqlx::query(&statement)
-            .bind(listing_id)
-            .execute(pool)
-            .await?
-            .rows_affected()),
-        DatabaseBackend::Postgres(pool) => {
+        DatabaseBackend::Sqlite(pool) => {
             let mut transaction = pool.begin().await?;
+            sqlx::query("UPDATE aircraft_sale_listings SET updated_at = updated_at WHERE id = ?")
+                .bind(listing_id)
+                .execute(&mut *transaction)
+                .await?;
+            let authorization_state =
+                listing_authorization_state_sqlite(db, &mut transaction, listing_id)
+                    .await
+                    .map_err(|error| ListingStoreError::State(error.to_string()))?;
+            if !authorization_state.all_automatic_associations_current() {
+                return Err(ListingStoreError::State(
+                    AVIONICS_AUTHORIZATION_INVALIDATED.to_string(),
+                ));
+            }
+            let updated = sqlx::query(&statement)
+                .bind(listing_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+            transaction.commit().await?;
+            Ok(updated)
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let mut connection = pool.acquire().await?;
+            let mut transaction = connection
+                .begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE")
+                .await?;
             sqlx::query(POSTGRES_LISTING_CHILD_LOCK_SQL)
                 .execute(&mut *transaction)
                 .await?;
+            let authorization_state =
+                listing_authorization_state_postgres(db, &mut transaction, listing_id)
+                    .await
+                    .map_err(|error| ListingStoreError::State(error.to_string()))?;
+            if !authorization_state.all_automatic_associations_current() {
+                return Err(ListingStoreError::State(
+                    AVIONICS_AUTHORIZATION_INVALIDATED.to_string(),
+                ));
+            }
             let updated = sqlx::query(&statement)
                 .bind(listing_id)
                 .execute(&mut *transaction)
@@ -6752,6 +6824,7 @@ async fn replace_listing_avionics(
         installed_collision_closure_sha256: String,
         installed_capabilities: Vec<StoredGroundedCapabilityRow>,
         replacement_reuse: bool,
+        replacement_collision_closure_sha256: Option<String>,
         replacement_capabilities: Vec<StoredGroundedCapabilityRow>,
         link_source_notes: Option<String>,
     }
@@ -6772,6 +6845,16 @@ async fn replace_listing_avionics(
 
     // Validate the entire replacement set before touching existing links.
     // The transaction below then makes trigger/race failures all-or-nothing.
+    let needs_reuse_capture = avionics.iter().any(|item| {
+        item.grounded_capabilities.is_empty()
+            || (item.replaces_avionics_model_id.is_some()
+                && item.replacement_grounded_capabilities.is_empty())
+    });
+    let exact_capture_scope = if needs_reuse_capture {
+        exact_signed_listing_checkpoint_scope(db, listing_id).await?
+    } else {
+        None
+    };
     let mut prepared = Vec::new();
     for item in &avionics {
         if matches!(
@@ -6987,40 +7070,6 @@ async fn replace_listing_avionics(
         ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     );
-    let select_exact_capture_sql = match db.backend() {
-        DatabaseBackend::Sqlite(_) => db.sql(
-            r#"
-            SELECT submission.rendered_html, submission.rendered_html_sha256,
-                   submission.extracted_listing_json
-            FROM plugin_submissions submission
-            JOIN aircraft_sale_listings listing
-              ON listing.id = submission.canonical_listing_id
-            WHERE submission.id = ?
-              AND listing.id = ?
-              AND submission.rendered_html_sha256 = ?
-              AND submission.source_url = ?
-              AND listing.source_url = submission.source_url
-              AND submission.extracted_listing_json IS NOT NULL
-              AND submission.extraction_error IS NULL
-            "#,
-        ),
-        DatabaseBackend::Postgres(_) => db.sql(
-            r#"
-            SELECT submission.rendered_html, submission.rendered_html_sha256,
-                   submission.extracted_listing_json
-            FROM plugin_submissions submission
-            JOIN aircraft_sale_listings listing
-              ON listing.id = submission.canonical_listing_id
-            WHERE submission.id = ?
-              AND listing.id = ?
-              AND submission.rendered_html_sha256 = ?
-              AND submission.source_url = ?
-              AND listing.source_url = submission.source_url
-              AND submission.extracted_listing_json IS NOT NULL
-              AND submission.extraction_error IS NULL
-            "#,
-        ),
-    };
     let insert_reuse_authorization_sql = db.sql(
         r#"
         INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
@@ -7030,16 +7079,31 @@ async fn replace_listing_avionics(
           plugin_submission_id, extracted_listing_sha256,
           collision_closure_sha256
         )
-        SELECT ?, 'installed', ?, 'manufacturer_reuse', ?,
+        SELECT ?, ?, ?, 'manufacturer_reuse', ?,
                attestation.product_fingerprint, NULL, ?, ?, ?, ?
         FROM avionics_product_reuse_attestations attestation
         WHERE attestation.avionics_model_id = ?
         "#,
     );
+    let select_authorization_capture_sql = db.sql(
+        r#"
+        SELECT submission.rendered_html, submission.rendered_html_sha256,
+               submission.extracted_listing_json, listing.source_url
+        FROM plugin_submissions submission
+        JOIN aircraft_sale_listings listing
+          ON listing.id = submission.canonical_listing_id
+        WHERE submission.id = ?
+          AND listing.id = ?
+          AND submission.rendered_html_sha256 = ?
+          AND submission.source_url = listing.source_url
+          AND submission.extracted_listing_json IS NOT NULL
+          AND submission.extraction_error IS NULL
+        "#,
+    );
     let approved_catalog_rows_sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
     let active_collision_rows_sql = db.sql(ACTIVE_COLLISION_CATALOG_ROWS_SQL);
     macro_rules! replace_in_transaction {
-        ($pool:expr, $reuse_is_current:path, $countable_reuse_is_current:path) => {{
+        ($pool:expr, $reuse_is_current:path, $countable_reuse_is_current:path, $active_collision_revision:path) => {{
             let mut transaction = $pool.begin().await?;
             if matches!(db.backend(), DatabaseBackend::Postgres(_)) {
                 sqlx::query(&lock_reuse_sql)
@@ -7128,34 +7192,10 @@ async fn replace_listing_avionics(
                         item.avionics_model_id
                     )));
                 }
-                let installed_collision_closure_sha256 = if exact_count_basis {
-                    let collision_member_ids = active_collision_closure_member_ids(
-                        &active_collision_rows,
-                        item.avionics_model_id,
-                    )
-                    .ok_or_else(|| {
-                        ListingStoreError::Validation(format!(
-                            "avionics catalog id {} has no active collision closure",
-                            item.avionics_model_id
-                        ))
-                    })?;
-                    let mut current_reuse_ids = HashSet::new();
-                    for collision_member_id in collision_member_ids {
-                        if $reuse_is_current(db, &mut transaction, collision_member_id).await? {
-                            current_reuse_ids.insert(collision_member_id);
-                        }
-                    }
-                    fingerprint_active_collision_closure(
-                        &active_collision_rows,
-                        &current_reuse_ids,
-                        item.avionics_model_id,
-                    )
-                    .ok_or_else(|| {
-                        ListingStoreError::Validation(format!(
-                            "avionics catalog id {} lost its active reuse collision closure",
-                            item.avionics_model_id
-                        ))
-                    })?
+                let installed_collision_closure_sha256 = if installed_reuse {
+                    $active_collision_revision(db, &mut transaction, item.avionics_model_id)
+                        .await
+                        .map_err(|error| ListingStoreError::State(error.to_string()))?
                 } else {
                     current_collision.clone()
                 };
@@ -7236,7 +7276,11 @@ async fn replace_listing_avionics(
                 }
                 let installed_reuse = installed_reuse && installed_capabilities.is_empty();
 
-                let (replacement_reuse, replacement_capabilities) =
+                let (
+                    replacement_reuse,
+                    replacement_collision_closure_sha256,
+                    replacement_capabilities,
+                ) =
                     if let Some(target_id) = item.replaces_avionics_model_id {
                         let current_target_product = catalog_product_fingerprint_from_rows(
                             &catalog_rows,
@@ -7319,9 +7363,20 @@ async fn replace_listing_avionics(
                                 "replacement avionics catalog id {target_id} is not eligible for current-policy reuse and has no exact pending grounded capability"
                             )));
                         }
-                        (reuse && rows.is_empty(), rows)
+                        let authorization_collision = if reuse && rows.is_empty() {
+                            $active_collision_revision(db, &mut transaction, target_id)
+                                .await
+                                .map_err(|error| ListingStoreError::State(error.to_string()))?
+                        } else {
+                            current_target_collision
+                        };
+                        (
+                            reuse && rows.is_empty(),
+                            Some(authorization_collision),
+                            rows,
+                        )
                     } else {
-                        (true, Vec::new())
+                        (true, None, Vec::new())
                     };
                 let link_source_notes = if installed_reuse && replacement_reuse {
                     item.source_notes.clone()
@@ -7350,6 +7405,7 @@ async fn replace_listing_avionics(
                     installed_collision_closure_sha256,
                     installed_capabilities,
                     replacement_reuse,
+                    replacement_collision_closure_sha256,
                     replacement_capabilities,
                     link_source_notes,
                 });
@@ -7367,6 +7423,41 @@ async fn replace_listing_avionics(
                     "listing {listing_id} pending grounded capability set does not exactly cover the materialized avionics graph"
                 )));
             }
+            let reuse_capture = if authorizations.iter().any(|authorization| {
+                authorization.installed_reuse
+                    || (authorization.replacement_reuse
+                        && authorization.replacement_collision_closure_sha256.is_some())
+            }) {
+                let scope = exact_capture_scope.as_ref().ok_or_else(|| {
+                    ListingStoreError::Validation(format!(
+                        "listing {listing_id} has locally reusable avionics but no exact signed extraction checkpoint"
+                    ))
+                })?;
+                let capture: (String, String, String, String) =
+                    sqlx::query_as(&select_authorization_capture_sql)
+                        .bind(scope.plugin_submission_id)
+                        .bind(listing_id)
+                        .bind(scope.rendered_html_sha256.as_str())
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                        .ok_or_else(|| {
+                            ListingStoreError::Validation(format!(
+                                "listing {listing_id} lost the exact signed extraction checkpoint needed for local avionics reuse"
+                            ))
+                        })?;
+                if format!("{:x}", Sha256::digest(capture.0.as_bytes()))
+                    != scope.rendered_html_sha256
+                    || format!("{:x}", Sha256::digest(capture.2.as_bytes()))
+                        != scope.extracted_listing_sha256
+                {
+                    return Err(ListingStoreError::State(format!(
+                        "listing {listing_id} signed extraction checkpoint content no longer matches its hashes"
+                    )));
+                }
+                Some((scope, capture))
+            } else {
+                None
+            };
             sqlx::query(&delete_sql)
                 .bind(listing_id)
                 .execute(&mut *transaction)
@@ -7383,131 +7474,12 @@ async fn replace_listing_avionics(
                     .bind(item.replaces_avionics_model_id)
                     .fetch_one(&mut *transaction)
                     .await?;
-                if authorization.installed_reuse
-                    && matches!(
-                        item.source_confidence_basis.as_ref(),
-                        Some(
-                            ListingSourceConfidenceBasis::ExactControllerLeadingDualCountableUnit(_)
-                        )
-                    )
-                {
-                    let ListingSourceConfidenceBasis::ExactControllerLeadingDualCountableUnit(
-                        proof,
-                    ) = item
-                        .source_confidence_basis
-                        .as_ref()
-                        .expect("exact-count persistence branch has a confidence basis")
-                    else {
-                        unreachable!("exact-count persistence branch has its typed proof")
-                    };
-                    let evidence_text = authorization
-                        .link_source_notes
-                        .as_deref()
-                        .filter(|evidence| !evidence.trim().is_empty())
-                        .ok_or_else(|| {
-                            ListingStoreError::Validation(format!(
-                                "countable-unit avionics catalog id {} requires exact retained listing evidence",
-                                item.avionics_model_id
-                            ))
-                        })?;
-                    if evidence_text != proof.evidence_text() {
-                        return Err(ListingStoreError::Validation(format!(
-                            "countable-unit avionics catalog id {} no longer carries the exact Controller evidence that produced its source proof",
-                            item.avionics_model_id
-                        )));
-                    }
-                    let (rendered_html, evidence_capture_sha256, extracted_listing_json): (
-                        String,
-                        String,
-                        String,
-                    ) =
-                        sqlx::query_as(&select_exact_capture_sql)
-                    .bind(proof.plugin_submission_id())
-                    .bind(listing_id)
-                    .bind(proof.rendered_html_sha256())
-                    .bind(proof.source_url())
-                    .fetch_optional(&mut *transaction)
-                    .await?
-                    .ok_or_else(|| {
-                        ListingStoreError::Validation(format!(
-                            "countable-unit avionics catalog id {} lost the exact signed Controller capture that produced its source proof",
-                            item.avionics_model_id
-                        ))
-                    })?;
-                    let computed_capture_sha256 =
-                        format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
-                    if evidence_capture_sha256 != proof.rendered_html_sha256()
-                        || computed_capture_sha256 != evidence_capture_sha256
-                        || format!(
-                            "{:x}",
-                            Sha256::digest(extracted_listing_json.as_bytes())
-                        ) != proof.extracted_listing_sha256()
-                        || !current_checkpoint_contains_avionics_source_evidence(
-                            &extracted_listing_json,
-                            evidence_text,
-                        )
-                    {
-                        return Err(ListingStoreError::State(format!(
-                            "countable-unit avionics catalog id {} resolved content outside its exact capture hash",
-                            item.avionics_model_id
-                        )));
-                    }
-                    let exact_capture_source =
-                        crate::html::listing::source::listing_extraction_source(
-                            proof.source_url(),
-                            &rendered_html,
-                        )
-                        .map_err(|error| {
-                            ListingStoreError::Validation(format!(
-                                "countable-unit avionics catalog id {} lost its exact retained Controller source envelope: {error}",
-                                item.avionics_model_id,
-                            ))
-                        })?;
-                    if !controller_extraction_source_has_exact_avionics_line(
-                        proof.source_url(),
-                        &exact_capture_source,
-                        evidence_text,
-                    ) {
-                        return Err(ListingStoreError::Validation(format!(
-                            "countable-unit avionics catalog id {} lost the exact Controller field that produced its source proof",
-                            item.avionics_model_id
-                        )));
-                    }
-                    let observation_sha256 = association_observation_sha256_from_values(
-                        listing_id,
-                        listing_link_id,
-                        ListingAssociationRole::Installed,
-                        item.avionics_model_id,
-                        item.avionics_model_id,
-                        item.replaces_avionics_model_id,
-                        item.quantity,
-                        item.configuration_action.as_str(),
-                        evidence_text,
-                    );
-                    let inserted = sqlx::query(&insert_reuse_authorization_sql)
-                        .bind(listing_link_id)
-                        .bind(item.avionics_model_id)
-                        .bind(observation_sha256)
-                        .bind(evidence_capture_sha256)
-                        .bind(proof.plugin_submission_id())
-                        .bind(proof.extracted_listing_sha256())
-                        .bind(authorization.installed_collision_closure_sha256.as_str())
-                        .bind(item.avionics_model_id)
-                        .execute(&mut *transaction)
-                        .await?
-                        .rows_affected();
-                    if inserted != 1 {
-                        return Err(ListingStoreError::Validation(format!(
-                            "countable-unit avionics catalog id {} lost its reuse attestation before authorization",
-                            item.avionics_model_id
-                        )));
-                    }
-                }
-                for (role, target_id, reuse, capabilities, quantity) in [
+                for (role, target_id, reuse, collision_closure, capabilities, quantity) in [
                     (
                         ListingAssociationRole::Installed,
                         item.avionics_model_id,
                         authorization.installed_reuse,
+                        Some(authorization.installed_collision_closure_sha256.as_str()),
                         authorization.installed_capabilities.as_slice(),
                         item.quantity,
                     ),
@@ -7515,6 +7487,7 @@ async fn replace_listing_avionics(
                         ListingAssociationRole::Replacement,
                         item.replaces_avionics_model_id.unwrap_or_default(),
                         authorization.replacement_reuse,
+                        authorization.replacement_collision_closure_sha256.as_deref(),
                         authorization.replacement_capabilities.as_slice(),
                         1,
                     ),
@@ -7522,7 +7495,102 @@ async fn replace_listing_avionics(
                     if target_id <= 0 {
                         continue;
                     }
-                    if !reuse {
+                    if reuse {
+                        let (scope, (rendered_html, _, extracted_listing_json, source_url)) =
+                            reuse_capture.as_ref().ok_or_else(|| {
+                                ListingStoreError::State(
+                                    "local avionics reuse lost its exact capture scope".to_string(),
+                                )
+                            })?;
+                        let evidence_text = authorization
+                            .link_source_notes
+                            .as_deref()
+                            .filter(|evidence| !evidence.trim().is_empty())
+                            .ok_or_else(|| {
+                                ListingStoreError::Validation(format!(
+                                    "reused avionics catalog id {target_id} requires exact retained listing evidence"
+                                ))
+                            })?;
+                        if !current_checkpoint_contains_avionics_source_evidence(
+                            extracted_listing_json,
+                            evidence_text,
+                        ) {
+                            return Err(ListingStoreError::Validation(format!(
+                                "reused avionics catalog id {target_id} is absent from the exact retained extraction checkpoint"
+                            )));
+                        }
+                        if role == ListingAssociationRole::Installed {
+                            if let Some(
+                                ListingSourceConfidenceBasis::ExactControllerLeadingDualCountableUnit(
+                                    proof,
+                                ),
+                            ) = item.source_confidence_basis.as_ref()
+                            {
+                                if evidence_text != proof.evidence_text()
+                                    || scope.plugin_submission_id != proof.plugin_submission_id()
+                                    || scope.rendered_html_sha256 != proof.rendered_html_sha256()
+                                    || scope.extracted_listing_sha256
+                                        != proof.extracted_listing_sha256()
+                                {
+                                    return Err(ListingStoreError::Validation(format!(
+                                        "countable-unit avionics catalog id {target_id} no longer carries the exact Controller checkpoint that produced its source proof"
+                                    )));
+                                }
+                                let exact_capture_source =
+                                    crate::html::listing::source::listing_extraction_source(
+                                        source_url,
+                                        rendered_html,
+                                    )
+                                    .map_err(|error| {
+                                        ListingStoreError::Validation(format!(
+                                            "countable-unit avionics catalog id {target_id} lost its exact retained Controller source envelope: {error}"
+                                        ))
+                                    })?;
+                                if !controller_extraction_source_has_exact_avionics_line(
+                                    source_url,
+                                    &exact_capture_source,
+                                    evidence_text,
+                                ) {
+                                    return Err(ListingStoreError::Validation(format!(
+                                        "countable-unit avionics catalog id {target_id} lost the exact Controller field that produced its source proof"
+                                    )));
+                                }
+                            }
+                        }
+                        let observation_sha256 = association_observation_sha256_from_values(
+                            listing_id,
+                            listing_link_id,
+                            role,
+                            target_id,
+                            item.avionics_model_id,
+                            item.replaces_avionics_model_id,
+                            item.quantity,
+                            item.configuration_action.as_str(),
+                            evidence_text,
+                        );
+                        let inserted = sqlx::query(&insert_reuse_authorization_sql)
+                            .bind(listing_link_id)
+                            .bind(role.as_str())
+                            .bind(target_id)
+                            .bind(observation_sha256)
+                            .bind(scope.rendered_html_sha256.as_str())
+                            .bind(scope.plugin_submission_id)
+                            .bind(scope.extracted_listing_sha256.as_str())
+                            .bind(collision_closure.ok_or_else(|| {
+                                ListingStoreError::State(format!(
+                                    "reused avionics catalog id {target_id} has no collision closure"
+                                ))
+                            })?)
+                            .bind(target_id)
+                            .execute(&mut *transaction)
+                            .await?
+                            .rows_affected();
+                        if inserted != 1 {
+                            return Err(ListingStoreError::Validation(format!(
+                                "avionics catalog id {target_id} lost its reuse attestation before authorization"
+                            )));
+                        }
+                    } else {
                         let product_fingerprint = capabilities[0].product_fingerprint.as_str();
                         let collision_closure = capabilities[0].collision_closure_sha256.as_str();
                         let exact_scope = exact_capability_scope
@@ -7589,14 +7657,16 @@ async fn replace_listing_avionics(
             replace_in_transaction!(
                 pool,
                 reuse_attestation_is_current_sqlite,
-                countable_unit_reuse_attestation_is_current_sqlite
+                countable_unit_reuse_attestation_is_current_sqlite,
+                active_collision_closure_revision_sha256_sqlite
             )
         }
         DatabaseBackend::Postgres(pool) => {
             replace_in_transaction!(
                 pool,
                 reuse_attestation_is_current_postgres,
-                countable_unit_reuse_attestation_is_current_postgres
+                countable_unit_reuse_attestation_is_current_postgres,
+                active_collision_closure_revision_sha256_postgres
             )
         }
     }
@@ -9096,6 +9166,7 @@ mod tests {
         ))];
         let retained = "<main>The aircraft has a Garmin GTX-345R installed.</main>";
         let source_units = test_listing_evidence_units("https://example.com/listing", retained);
+        let exact_source_capture_scope = validated_test_source_capture_scope(retained);
 
         let pending = resolve_listing_avionics_values(
             &db,
@@ -9105,7 +9176,7 @@ mod tests {
             Some("The aircraft has a Garmin GTX-345R installed."),
             Some(&source_units),
             None,
-            None,
+            Some(&exact_source_capture_scope),
         )
         .await
         .expect("the normalized label should resolve locally without Gemini");
@@ -10226,6 +10297,7 @@ mod tests {
         let retained =
             "Garmin GDU 1044B Flight Display\nGarmin GDU 1044B Flight Display\nUNRELATED FIELD";
         let source_units = test_listing_evidence_units("https://example.com/listing", retained);
+        let exact_source_capture_scope = validated_test_source_capture_scope(retained);
 
         let resolved = resolve_listing_avionics_values(
             &db,
@@ -10235,7 +10307,7 @@ mod tests {
             Some(retained),
             Some(&source_units),
             None,
-            None,
+            Some(&exact_source_capture_scope),
         )
         .await
         .expect("each exact occurrence should use the same attested local identity");
@@ -10614,6 +10686,8 @@ mod tests {
             "https://example.com/listing",
             "Garmin GNS 430W changes Garmin GPS",
         );
+        let exact_source_capture_scope =
+            validated_test_source_capture_scope("Garmin GNS 430W changes Garmin GPS");
 
         for configured_extractor in [None, Some(&unreachable)] {
             for action in ["replaces", "removes"] {
@@ -10637,7 +10711,7 @@ mod tests {
                     Some("Garmin GNS 430W changes Garmin GPS"),
                     Some(&source_units),
                     None,
-                    None,
+                    Some(&exact_source_capture_scope),
                 )
                 .await
                 .expect("each occurrence role should resolve independently");
@@ -12118,6 +12192,16 @@ mod tests {
     ) -> crate::html::listing::source::ListingEvidenceUnits {
         crate::html::listing::source::listing_evidence_units(source_url, retained_html)
             .expect("test listing should produce source-unit proof")
+    }
+
+    fn validated_test_source_capture_scope(
+        retained_source: &str,
+    ) -> ExactListingSourceCaptureScope {
+        ExactListingSourceCaptureScope {
+            plugin_submission_id: 1,
+            rendered_html_sha256: format!("{:x}", Sha256::digest(retained_source.as_bytes())),
+            extracted_listing_sha256: "0".repeat(64),
+        }
     }
 
     fn parsed_avionics(model: &str) -> ParsedAvionics {
@@ -14041,7 +14125,7 @@ mod tests {
             INSERT INTO aircraft_sale_listing_avionics (
               aircraft_sale_listing_id, avionics_model_id, source, source_notes,
               source_confidence
-            ) VALUES (?, ?, 'listing', 'explicitly installed suite', 'high')
+            ) VALUES (?, ?, 'listing_review', 'explicitly installed suite', 'high')
             "#,
             listing_id,
             suite_id
@@ -14140,6 +14224,214 @@ mod tests {
                 .await
                 .expect("local finalization should not require Gemini or scalar avionics prices"),
             super::ListingFinalizationOutcome::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_requires_live_authority_for_automatic_avionics_only() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        let variant_id = super::pending_aircraft_compatibility_variant_id(&db)
+            .await
+            .expect("pending compatibility variant should exist");
+        let avionics_model_id = ensure_approved_test_avionics_model(&db, "Garmin", "G5", "Display")
+            .await
+            .expect("approved avionics should seed");
+        let listing_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            ) VALUES (?, ?, 'https://example.test/authority-completion',
+                      2020, 150000, 500)
+            RETURNING id
+            "#,
+            variant_id,
+            user.id
+        )
+        .expect("listing should seed");
+        execute_query!(
+            &db,
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, source,
+              source_notes, source_confidence
+            ) VALUES (?, ?, 'listing', 'Garmin G5 installed', 'high')
+            "#,
+            listing_id,
+            avionics_model_id
+        )
+        .expect("automatic listing association should seed");
+
+        let error = super::complete_listing_ingestion(&db, listing_id)
+            .await
+            .expect_err("automatic avionics without live authority must not complete");
+        assert_eq!(error.to_string(), super::AVIONICS_AUTHORIZATION_INVALIDATED);
+
+        execute_query!(
+            &db,
+            "UPDATE aircraft_sale_listing_avionics SET source = 'listing_review' WHERE aircraft_sale_listing_id = ?",
+            listing_id
+        )
+        .expect("reviewer authority should replace automatic provenance");
+        assert_eq!(
+            super::complete_listing_ingestion(&db, listing_id)
+                .await
+                .expect("explicit reviewer authority is row-free"),
+            super::ListingFinalizationOutcome::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn manufacturer_reuse_authorizes_installed_and_replacement_endpoints_with_active_closures(
+    ) {
+        const SOURCE_URL: &str = "https://example.test/active-reuse-authorization";
+        const EVIDENCE: &str = "Garmin GNX 375 replaces Garmin GTX 327";
+
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        let variant_id = super::pending_aircraft_compatibility_variant_id(&db)
+            .await
+            .expect("pending compatibility variant should exist");
+        let installed_id = ensure_approved_test_avionics_model(&db, "Garmin", "GNX 375", "GPS")
+            .await
+            .expect("installed product should seed");
+        let replacement_id =
+            ensure_approved_test_avionics_model(&db, "Garmin", "GTX 327", "Transponder")
+                .await
+                .expect("replacement product should seed");
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, installed_id).await;
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, replacement_id).await;
+
+        let listing_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            ) VALUES (?, ?, ?, 2020, 150000, 500)
+            RETURNING id
+            "#,
+            variant_id,
+            user.id,
+            SOURCE_URL
+        )
+        .expect("listing should seed");
+        let rendered_html = format!("<main>{EVIDENCE}</main>");
+        let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
+        let extracted_listing_json = serde_json::to_string(
+            &preview_manual_listing(&json!({
+                "manufacturer": "Cessna",
+                "model": "182",
+                "variant": "182T",
+                "model_year": 2020,
+                "asking_price_usd": 150000,
+                "currency": "USD",
+                "airframe_hours": 500,
+                "status": "active",
+                "avionics": [{
+                    "manufacturer": "Garmin",
+                    "model": "GNX 375",
+                    "types": ["GPS"],
+                    "quantity": 1,
+                    "configuration_action": "replaces",
+                    "replaces": {
+                        "manufacturer": "Garmin",
+                        "model": "GTX 327",
+                        "types": ["Transponder"]
+                    },
+                    "source_evidence_text": EVIDENCE,
+                    "source_confidence": "high"
+                }]
+            }))
+            .parsed_listing,
+        )
+        .expect("signed extraction checkpoint should serialize");
+        let install_id = query_scalar_one!(
+            &db,
+            i64,
+            "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, 'active-reuse-key') RETURNING id",
+            user.id
+        )
+        .expect("plugin install should seed");
+        query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO plugin_submissions (
+              user_id, plugin_install_id, source_url, rendered_html,
+              rendered_html_sha256, signature_base64, canonical_listing_id,
+              extracted_listing_json
+            ) VALUES (?, ?, ?, ?, ?, 'active-reuse-signature', ?, ?)
+            RETURNING id
+            "#,
+            user.id,
+            install_id,
+            SOURCE_URL,
+            rendered_html.as_str(),
+            rendered_html_sha256.as_str(),
+            listing_id,
+            extracted_listing_json.as_str()
+        )
+        .expect("signed submission should seed");
+
+        let mut value = ListingAvionicsValue::from_parsed(ParsedAvionics {
+            manufacturer: Some("Garmin".to_string()),
+            model: "GNX 375".to_string(),
+            avionics_types: vec!["GPS".to_string()],
+            quantity: 1,
+            configuration_action: "replaces".to_string(),
+            replaces: Some(ParsedAvionicsReference {
+                manufacturer: Some("Garmin".to_string()),
+                model: "GTX 327".to_string(),
+                avionics_types: vec!["Transponder".to_string()],
+            }),
+            source_evidence_text: Some(EVIDENCE.to_string()),
+            source_confidence: Some("high".to_string()),
+        });
+        value.avionics_model_id = Some(installed_id);
+        value.replaces_avionics_model_id = Some(replacement_id);
+        value.source_confidence_basis = Some(ListingSourceConfidenceBasis::RetainedHigh);
+
+        replace_listing_avionics(&db, listing_id, &[value])
+            .await
+            .expect("manufacturer reuse should persist both endpoint authorizations");
+
+        let authorization_state =
+            crate::avionics::authorization::listing_authorization_state(&db, listing_id)
+                .await
+                .expect("persisted authority should load");
+        assert!(authorization_state.all_automatic_associations_current());
+        assert_eq!(
+            query_scalar_one!(
+                &db,
+                i64,
+                r#"
+                SELECT COUNT(*)
+                FROM aircraft_sale_listing_avionics_link_authorizations authorization
+                JOIN aircraft_sale_listing_avionics link
+                  ON link.id = authorization.listing_link_id
+                WHERE link.aircraft_sale_listing_id = ?
+                  AND authorization.authorization_kind = 'manufacturer_reuse'
+                  AND authorization.association_role IN ('installed', 'replacement')
+                "#,
+                listing_id
+            )
+            .expect("endpoint authorization count should load"),
+            2
         );
     }
 

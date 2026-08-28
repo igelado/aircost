@@ -38,10 +38,6 @@ impl ExactControllerLeadingDualEvidenceProof {
         self.plugin_submission_id
     }
 
-    pub(crate) fn source_url(&self) -> &str {
-        &self.source_url
-    }
-
     pub(crate) fn rendered_html_sha256(&self) -> &str {
         &self.rendered_html_sha256
     }

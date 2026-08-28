@@ -275,8 +275,9 @@ the installation-evidence confidence on the link is independent from catalog
 identity confidence. A listing cannot contain the same canonical product twice
 or install and replace the same product. Ready or verified listing associations
 are immutable. A transition to `ready` additionally requires positive quantity,
-approved endpoints, high confidence, and `listing` or `listing_review`
-provenance for every avionics link.
+approved endpoints, high confidence, and `listing`,
+`listing_explicit_count`, or `listing_review` provenance for every avionics
+link.
 
 `aircraft_sale_listing_avionics_link_authorizations` records the current authority
 for each exact installed or replacement endpoint. A link is authorized either
@@ -290,6 +291,17 @@ chronology, and exact decoded evidence. This read boundary is required because
 SQLite cannot compute the checkpoint SHA-256 in a trigger. The latter
 authorization does not confer reuse authority on any other listing. Neither
 form stores a provider dossier or duplicates listing evidence.
+Automatic `listing` and `listing_explicit_count` links require a current row
+for the installed endpoint and, for `replaces` or `removes`, a second current
+row for the replacement endpoint. `listing_review` is the explicit human
+authority and therefore remains row-free. Deleting any authorization from a
+surviving ready or verified listing atomically quarantines and unverifies the
+listing with `avionics_authorization_invalidated`; authorization is live
+publication authority, not historical audit evidence.
+Publication revalidates the full hash-level authority state inside the same
+writer-locked SQLite or serializable PostgreSQL transaction that changes the
+listing to `ready`; the structural ready trigger is an additional row-shape
+guard, not a substitute for runtime re-hashing.
 
 `aircraft_sale_listing_avionics_grounded_capabilities` is a one-use retry
 capability, not an evidence archive or catalog attestation. One row binds an
@@ -417,8 +429,9 @@ Listings are created through either the web API or plugin submission path:
 12. If any avionics aspects remain unresolved, atomically upsert the complete
    one-row review bundle and set the listing to `pending_review`. Enrichment is
    skipped while that row exists.
-13. Otherwise, complete and validate the remaining listing-specific evidence
-   and canonical associations. Resolve factory-reference readiness separately
+13. Otherwise, complete and validate the remaining listing-specific evidence,
+   canonical associations, and every current automatic avionics endpoint
+   authorization. Resolve factory-reference readiness separately
    for valuation; a missing model-year reference is reported as typed gaps and
    does not block listing verification.
 14. Mark the listing `ready` after every listing-specific readiness query

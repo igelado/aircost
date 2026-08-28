@@ -10,6 +10,7 @@ use std::fmt;
 use serde::Serialize;
 use sqlx::FromRow;
 
+use crate::aircraft::faa::require_listing_admission;
 use crate::aircraft::reference::persistence::{
     listing_reference_status, ListingReferenceStatus, ReferenceGap,
 };
@@ -18,6 +19,7 @@ use crate::aircraft::verification::{
     preview_listing_aircraft_verification, AircraftVerificationMethod, AircraftVerificationOutcome,
     AircraftVerificationServices,
 };
+use crate::avionics::authorization::listing_authorization_state;
 use crate::avionics::verification::{
     preflight_listing_avionics, provider_request_plan_for_listing_preflights,
     verify_listing_avionics, AvionicsProviderRequestPlan, AvionicsVerificationCheckpoint,
@@ -368,7 +370,16 @@ pub async fn verify_listing(
     let initial_reference = listing_reference_status(db, listing_id)
         .await
         .map_err(|error| ListingVerificationError::Database(error.to_string()))?;
-    if initial.ingestion_state == "ready" && initial.is_verified {
+    let automatic_avionics_current = listing_authorization_state(db, listing_id)
+        .await
+        .map_err(|error| ListingVerificationError::Database(error.to_string()))?
+        .all_automatic_associations_current();
+    let aircraft_admission_current = require_listing_admission(db, listing_id).await.is_ok();
+    if initial.ingestion_state == "ready"
+        && initial.is_verified
+        && aircraft_admission_current
+        && automatic_avionics_current
+    {
         return Ok(ListingVerificationOutcome {
             listing_id,
             status: "already_verified".to_string(),
