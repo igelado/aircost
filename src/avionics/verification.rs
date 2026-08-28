@@ -43,7 +43,7 @@ use crate::listing::avionics::{
     approved_avionics_product_key, preview_avionics_product_key,
     validate_canonical_avionics_actions, CanonicalAvionicsAction,
 };
-use crate::listing::evidence::{identity_span_has_boundaries, ListingEvidenceContext};
+use crate::listing::evidence::ListingEvidenceContext;
 use crate::listing::review::automation::{
     apply_automated_avionics_review, unrelated_preserved_avionics_blocker,
     validate_automated_avionics_link, AutomatedAssociationAuthorization, AutomatedAvionicsLink,
@@ -827,7 +827,6 @@ async fn preflight_listing(
             return report;
         }
     };
-    let raw_avionics = coalesce_explicit_numbered_instances(raw_avionics, &listing_context);
     for raw in &raw_avionics {
         if raw_candidate_structure_issue(raw).is_some() {
             report.invalid_retained_observations += 1;
@@ -1473,7 +1472,7 @@ async fn process_listing(
         Ok((preserved_links, remaining_aspects)) => {
             residual_aspects = remaining_aspects;
             for link in preserved_links {
-                if let Err(error) = merge_or_push_prepared_link(&mut prepared, link) {
+                if let Err(error) = reconcile_or_push_prepared_link(&mut prepared, link) {
                     blocking_reasons.push(format!(
                         "preserved association conflicts with another accepted link: {error}"
                     ));
@@ -1497,9 +1496,9 @@ async fn process_listing(
         );
         return listing_report;
     }
-    // Keep source-array coordinates before the presentation-level numbered
-    // instance coalescer changes cardinality. Durable discard receipts are
-    // bound to the retained extraction, never to that derived work list.
+    // Durable disposition and association receipts remain bound to the exact
+    // retained source-array coordinates. Post-validation processing must not
+    // change occurrence cardinality or infer physical-unit quantity.
     let mut occurrence_dispositions = Vec::new();
     let mut linked_occurrence_guards = Vec::new();
     for (occurrence_index, raw) in raw_avionics.iter().enumerate() {
@@ -1554,8 +1553,6 @@ async fn process_listing(
             }
         }
     }
-    let raw_avionics = coalesce_explicit_numbered_instances(raw_avionics, &listing_context);
-
     // Route every retained observation before executing identity resolution.
     // Structurally invalid and exact generic-category observations remain
     // provider-free; concrete observations still let exact local identities
@@ -2736,10 +2733,10 @@ fn merge_prepared_link_for_candidate(
     incoming: PreparedLink,
     attempt: &mut IdentityAttempt,
 ) -> Result<(), String> {
-    match merge_or_push_prepared_link(prepared, incoming) {
+    match reconcile_or_push_prepared_link(prepared, incoming) {
         Ok(true) => {
             attempt.report.reason.push_str(
-                "; coalesced with another independently resolved capability row for the same verified product",
+                "; reconciled the exact retained checkpoint occurrence with its preserved listing-link guard",
             );
             Ok(())
         }
@@ -3063,7 +3060,7 @@ fn observation_text(
     )
 }
 
-fn merge_or_push_prepared_link(
+fn reconcile_or_push_prepared_link(
     prepared: &mut Vec<PreparedLink>,
     incoming: PreparedLink,
 ) -> Result<bool, String> {
@@ -3071,14 +3068,14 @@ fn merge_or_push_prepared_link(
         .iter()
         .position(|link| link.identity_key == incoming.identity_key)
     {
-        merge_duplicate_link(&mut prepared[index], &incoming)?;
+        reconcile_preserved_link_or_reject_duplicate(&mut prepared[index], &incoming)?;
         return Ok(true);
     }
     prepared.push(incoming);
     Ok(false)
 }
 
-fn merge_duplicate_link(
+fn reconcile_preserved_link_or_reject_duplicate(
     existing: &mut PreparedLink,
     incoming: &PreparedLink,
 ) -> Result<(), String> {
@@ -3113,257 +3110,10 @@ fn merge_duplicate_link(
         return Ok(());
     }
 
-    let same_action = existing.configuration_action == incoming.configuration_action;
-    let compatible_replacement = match existing.configuration_action.as_str() {
-        "installed" => {
-            existing.replaces_avionics_model_id.is_none()
-                && incoming.replaces_avionics_model_id.is_none()
-                && existing
-                    .expected_replacement_collision_closure_sha256
-                    .is_none()
-                && incoming
-                    .expected_replacement_collision_closure_sha256
-                    .is_none()
-        }
-        "replaces" | "removes" => {
-            existing.replacement_identity_key.is_some()
-                && existing.replacement_identity_key == incoming.replacement_identity_key
-                && existing.expected_replacement_collision_closure_sha256
-                    == incoming.expected_replacement_collision_closure_sha256
-        }
-        _ => false,
-    };
-    if !same_action
-        || !compatible_replacement
-        || existing.expected_collision_closure_sha256 != incoming.expected_collision_closure_sha256
-        || existing.preserved_association_guard != incoming.preserved_association_guard
-        || existing.authorization != incoming.authorization
-        || existing.replacement_authorization != incoming.replacement_authorization
-    {
-        return Err(format!(
-            "catalog id {} resolved from multiple raw rows with conflicting action, replacement, or collision-closure semantics",
-            existing.avionics_model_id
-        ));
-    }
-    existing.quantity = existing.quantity.max(incoming.quantity);
-    // One durable association corroboration must point to one exact source
-    // span. Joining independently extracted excerpts manufactures text that
-    // may not occur contiguously in the retained listing.
-    if existing.source_notes.is_none() {
-        existing.source_notes = incoming.source_notes.clone();
-    }
-    existing.source_confidence = conservative_confidence(
-        existing.source_confidence.as_deref(),
-        incoming.source_confidence.as_deref(),
-    );
-    Ok(())
-}
-
-fn conservative_confidence(left: Option<&str>, right: Option<&str>) -> Option<String> {
-    let rank = |confidence: &str| match confidence {
-        "low" => 0,
-        "medium" => 1,
-        "high" => 2,
-        _ => -1,
-    };
-    match (left, right) {
-        (Some(left), Some(right)) => Some(
-            if rank(left) <= rank(right) {
-                left
-            } else {
-                right
-            }
-            .to_string(),
-        ),
-        _ => None,
-    }
-}
-
-/// Repair one narrow extraction-shape error without treating repeated prose as
-/// extra hardware. Gemini occasionally emits one row per radio position even
-/// though the listing extractor contract requires one product row with a
-/// quantity. We combine only exact raw installed identities whose independently
-/// retained source excerpts prove distinct numbered positions (for example an
-/// unnumbered first row plus `#2`, or `#1` plus `#2`).
-///
-/// Manufacturer and model spellings remain byte-for-byte equal and capability
-/// labels are compared only as an order-independent set of exact strings. Row
-/// count never determines quantity, and ambiguous duplicates remain separate.
-fn coalesce_explicit_numbered_instances(
-    observations: Vec<ParsedAvionics>,
-    listing_context: &ListingEvidenceContext,
-) -> Vec<ParsedAvionics> {
-    let mut consumed = vec![false; observations.len()];
-    let mut coalesced = Vec::with_capacity(observations.len());
-
-    for seed_index in 0..observations.len() {
-        if consumed[seed_index] {
-            continue;
-        }
-        let Some((mut selected_indices, highest_ordinal)) =
-            explicit_numbered_instance_group(&observations, seed_index, listing_context)
-        else {
-            consumed[seed_index] = true;
-            coalesced.push(observations[seed_index].clone());
-            continue;
-        };
-
-        selected_indices.sort_unstable();
-        let mut merged = observations[selected_indices[0]].clone();
-        let mut evidence = Vec::with_capacity(selected_indices.len());
-        let mut quantity = highest_ordinal;
-        let mut confidence = merged.source_confidence.clone();
-        for (position, index) in selected_indices.iter().copied().enumerate() {
-            let observation = &observations[index];
-            consumed[index] = true;
-            quantity = quantity.max(observation.quantity);
-            let excerpt = observation
-                .source_evidence_text
-                .as_deref()
-                .expect("numbered-instance group requires retained evidence")
-                .trim();
-            if !evidence.iter().any(|existing| existing == excerpt) {
-                evidence.push(excerpt.to_string());
-            }
-            if position > 0 {
-                confidence = conservative_confidence(
-                    confidence.as_deref(),
-                    observation.source_confidence.as_deref(),
-                );
-            }
-        }
-        merged.quantity = quantity;
-        merged.source_evidence_text = Some(evidence.join("\n"));
-        merged.source_confidence = confidence;
-        coalesced.push(merged);
-    }
-
-    coalesced
-}
-
-fn explicit_numbered_instance_group(
-    observations: &[ParsedAvionics],
-    seed_index: usize,
-    listing_context: &ListingEvidenceContext,
-) -> Option<(Vec<usize>, i64)> {
-    let seed = observations.get(seed_index)?;
-    if !eligible_installed_observation(seed) {
-        return None;
-    }
-
-    let mut unnumbered = Vec::<usize>::new();
-    let mut numbered = Vec::<(i64, usize)>::new();
-    for (index, observation) in observations.iter().enumerate().skip(seed_index) {
-        if !exact_installed_observation_match(seed, observation) {
-            continue;
-        }
-        let evidence = observation.source_evidence_text.as_deref()?.trim();
-        if evidence.is_empty()
-            || !listing_context
-                .for_candidate(
-                    literal_observation_manufacturer(&observation.manufacturer)
-                        .expect("numbered-instance coalescing requires a literal manufacturer"),
-                    &observation.model,
-                    Some(evidence),
-                )
-                .contains(evidence)
-        {
-            continue;
-        }
-        match explicit_unit_ordinal(evidence, &observation.model) {
-            Some(ordinal)
-                if !numbered
-                    .iter()
-                    .any(|(existing_ordinal, _)| *existing_ordinal == ordinal) =>
-            {
-                numbered.push((ordinal, index));
-            }
-            Some(_) => {}
-            None if !unnumbered.iter().any(|existing_index| {
-                observations[*existing_index]
-                    .source_evidence_text
-                    .as_deref()
-                    == observation.source_evidence_text.as_deref()
-            }) =>
-            {
-                unnumbered.push(index);
-            }
-            None => {}
-        }
-    }
-    numbered.sort_unstable_by_key(|(ordinal, _)| *ordinal);
-    let highest_ordinal = numbered.last().map(|(ordinal, _)| *ordinal)?;
-    if highest_ordinal < 2 {
-        return None;
-    }
-
-    let mut selected = numbered.iter().map(|(_, index)| *index).collect::<Vec<_>>();
-    if selected.len() < 2 {
-        selected.push(*unnumbered.first()?);
-    }
-    if !selected.contains(&seed_index) {
-        return None;
-    }
-    Some((selected, highest_ordinal))
-}
-
-fn eligible_installed_observation(observation: &ParsedAvionics) -> bool {
-    observation.configuration_action == "installed"
-        && observation.replaces.is_none()
-        && observation.quantity > 0
-        && literal_observation_manufacturer(&observation.manufacturer).is_some()
-        && !observation.model.is_empty()
-        && !observation.avionics_types.is_empty()
-}
-
-fn exact_installed_observation_match(left: &ParsedAvionics, right: &ParsedAvionics) -> bool {
-    if !eligible_installed_observation(right)
-        || left.manufacturer != right.manufacturer
-        || left.model != right.model
-        || left.configuration_action != right.configuration_action
-        || left.replaces != right.replaces
-    {
-        return false;
-    }
-    exact_capability_set(&left.avionics_types) == exact_capability_set(&right.avionics_types)
-}
-
-fn exact_capability_set(capabilities: &[String]) -> Vec<&str> {
-    let mut capabilities = capabilities.iter().map(String::as_str).collect::<Vec<_>>();
-    capabilities.sort_unstable();
-    capabilities.dedup();
-    capabilities
-}
-
-fn explicit_unit_ordinal(evidence: &str, model: &str) -> Option<i64> {
-    if model.is_empty() {
-        return None;
-    }
-    let evidence_lower = evidence.to_ascii_lowercase();
-    let model_lower = model.to_ascii_lowercase();
-    evidence_lower
-        .match_indices(&model_lower)
-        .filter(|(model_start, _)| {
-            identity_span_has_boundaries(evidence, *model_start, *model_start + model_lower.len())
-        })
-        .find_map(|(model_start, _)| {
-            let model_end = model_start + model_lower.len();
-            let suffix = evidence.get(model_end..)?;
-            let bounded_suffix = suffix.get(..suffix.len().min(96)).unwrap_or(suffix);
-            let hash_offset = bounded_suffix.find('#')?;
-            let after_hash = bounded_suffix.get(hash_offset + 1..)?.trim_start();
-            let digit_count = after_hash.bytes().take_while(u8::is_ascii_digit).count();
-            if digit_count == 0
-                || after_hash
-                    .as_bytes()
-                    .get(digit_count)
-                    .is_some_and(u8::is_ascii_alphanumeric)
-            {
-                return None;
-            }
-            let ordinal = after_hash.get(..digit_count)?.parse::<i64>().ok()?;
-            (1..=64).contains(&ordinal).then_some(ordinal)
-        })
+    Err(format!(
+        "catalog id {} resolved from multiple retained avionics occurrences; extraction must contain exactly one occurrence per canonical product with explicit physical-unit quantity",
+        existing.avionics_model_id
+    ))
 }
 
 fn identity_request(
@@ -5910,164 +5660,6 @@ mod tests {
         assert_eq!(parsed[1].source_confidence.as_deref(), Some("medium"));
     }
 
-    fn installed_observation(
-        capabilities: &[&str],
-        quantity: i64,
-        evidence: &str,
-    ) -> ParsedAvionics {
-        ParsedAvionics {
-            manufacturer: Some("King".to_string()),
-            model: "KX-170B".to_string(),
-            avionics_types: capabilities
-                .iter()
-                .map(|capability| (*capability).to_string())
-                .collect(),
-            quantity,
-            configuration_action: "installed".to_string(),
-            replaces: None,
-            source_evidence_text: Some(evidence.to_string()),
-            source_confidence: Some("high".to_string()),
-        }
-    }
-
-    #[test]
-    fn explicit_base_and_number_two_become_one_quantity_two_observation() {
-        let first = "King KX-170B Nav-Com w/ VOR, Localizer & Glideslope";
-        let second = "King KX-170B Nav-Com #2 w/ Vor & Localizer";
-        let context = ListingEvidenceContext::from_cleaned_text(format!("{first}\n{second}"));
-        let observations = vec![
-            installed_observation(&["NAV", "COM"], 1, first),
-            installed_observation(&["COM", "NAV"], 1, second),
-        ];
-
-        let coalesced = coalesce_explicit_numbered_instances(observations, &context);
-
-        assert_eq!(coalesced.len(), 1);
-        assert_eq!(coalesced[0].quantity, 2);
-        assert_eq!(
-            coalesced[0].source_evidence_text.as_deref(),
-            Some(
-                "King KX-170B Nav-Com w/ VOR, Localizer & Glideslope\nKing KX-170B Nav-Com #2 w/ Vor & Localizer"
-            )
-        );
-        assert_eq!(coalesced[0].avionics_types, vec!["NAV", "COM"]);
-    }
-
-    #[test]
-    fn explicit_numbered_pair_uses_the_highest_supported_ordinal() {
-        let first = "King KX-170B Nav-Com #1 installed";
-        let second = "King KX-170B Nav-Com #2 installed";
-        let context = ListingEvidenceContext::from_cleaned_text(format!("{first}\n{second}"));
-
-        let coalesced = coalesce_explicit_numbered_instances(
-            vec![
-                installed_observation(&["NAV", "COM"], 1, first),
-                installed_observation(&["NAV", "COM"], 1, second),
-            ],
-            &context,
-        );
-
-        assert_eq!(coalesced.len(), 1);
-        assert_eq!(coalesced[0].quantity, 2);
-    }
-
-    #[test]
-    fn repeated_unnumbered_narrative_is_not_counted_as_extra_hardware() {
-        let evidence = "King KX-170B Nav-Com installed";
-        let context = ListingEvidenceContext::from_cleaned_text(evidence);
-        let observations = vec![
-            installed_observation(&["NAV", "COM"], 1, evidence),
-            installed_observation(&["NAV", "COM"], 1, evidence),
-        ];
-
-        let unchanged = coalesce_explicit_numbered_instances(observations, &context);
-
-        assert_eq!(unchanged.len(), 2);
-        assert!(unchanged
-            .iter()
-            .all(|observation| observation.quantity == 1));
-    }
-
-    #[test]
-    fn differing_capabilities_or_actions_do_not_form_a_numbered_group() {
-        let first = "King KX-170B Nav-Com installed";
-        let second = "King KX-170B Nav #2 installed";
-        let replacement = "King KX-170B Nav-Com #2 replaces King KX-165";
-        let context =
-            ListingEvidenceContext::from_cleaned_text(format!("{first}\n{second}\n{replacement}"));
-        let mut replacement_observation = installed_observation(&["NAV", "COM"], 1, replacement);
-        replacement_observation.configuration_action = "replaces".to_string();
-        replacement_observation.replaces = Some(crate::models::ParsedAvionicsReference {
-            manufacturer: Some("King".to_string()),
-            model: "KX-165".to_string(),
-            avionics_types: vec!["NAV".to_string(), "COM".to_string()],
-        });
-
-        let unchanged = coalesce_explicit_numbered_instances(
-            vec![
-                installed_observation(&["NAV", "COM"], 1, first),
-                installed_observation(&["NAV"], 1, second),
-                replacement_observation,
-            ],
-            &context,
-        );
-
-        assert_eq!(unchanged.len(), 3);
-        assert!(unchanged
-            .iter()
-            .all(|observation| observation.quantity == 1));
-    }
-
-    #[test]
-    fn numbered_evidence_must_be_an_exact_retained_source_excerpt() {
-        let first = "King KX-170B Nav-Com installed";
-        let context = ListingEvidenceContext::from_cleaned_text(first);
-        let observations = vec![
-            installed_observation(&["NAV", "COM"], 1, first),
-            installed_observation(&["NAV", "COM"], 1, "King KX-170B Nav-Com #2 installed"),
-        ];
-
-        let unchanged = coalesce_explicit_numbered_instances(observations, &context);
-
-        assert_eq!(unchanged.len(), 2);
-    }
-
-    #[test]
-    fn numbered_instance_model_must_not_match_inside_a_longer_product_code() {
-        let first = "Garmin G5 display installed";
-        let second = "Garmin G500 display #2 installed";
-        let context = ListingEvidenceContext::from_cleaned_text(format!("{first}\n{second}"));
-        let observations = vec![
-            ParsedAvionics {
-                manufacturer: Some("Garmin".to_string()),
-                model: "G5".to_string(),
-                avionics_types: vec!["PFD".to_string()],
-                quantity: 1,
-                configuration_action: "installed".to_string(),
-                replaces: None,
-                source_evidence_text: Some(first.to_string()),
-                source_confidence: Some("high".to_string()),
-            },
-            ParsedAvionics {
-                manufacturer: Some("Garmin".to_string()),
-                model: "G5".to_string(),
-                avionics_types: vec!["PFD".to_string()],
-                quantity: 1,
-                configuration_action: "installed".to_string(),
-                replaces: None,
-                source_evidence_text: Some(second.to_string()),
-                source_confidence: Some("high".to_string()),
-            },
-        ];
-
-        let unchanged = coalesce_explicit_numbered_instances(observations, &context);
-
-        assert_eq!(unchanged.len(), 2);
-        assert!(unchanged
-            .iter()
-            .all(|observation| observation.quantity == 1));
-    }
-
     #[test]
     fn automatic_acceptance_requires_exact_high_listing_evidence() {
         let capabilities = vec!["GPS".to_string()];
@@ -7432,7 +7024,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_capability_rows_merge_conservatively() {
+    fn duplicate_product_rows_fail_closed_without_mutating_the_first_occurrence() {
         let mut existing = PreparedLink {
             identity_key: "catalog:42".to_string(),
             avionics_model_id: 42,
@@ -7464,18 +7056,14 @@ mod tests {
             preserved_association_guard: None,
         };
 
-        merge_duplicate_link(&mut existing, &incoming).unwrap();
+        let error =
+            reconcile_preserved_link_or_reject_duplicate(&mut existing, &incoming).unwrap_err();
 
-        assert_eq!(existing.quantity, 2);
+        assert!(error.contains("multiple retained avionics occurrences"));
+        assert!(error.contains("explicit physical-unit quantity"));
+        assert_eq!(existing.quantity, 1);
         assert_eq!(existing.source_notes.as_deref(), Some("GPS navigator"));
-        assert_eq!(existing.source_confidence.as_deref(), Some("medium"));
-
-        let no_confidence = PreparedLink {
-            source_confidence: None,
-            ..incoming
-        };
-        merge_duplicate_link(&mut existing, &no_confidence).unwrap();
-        assert_eq!(existing.source_confidence, None);
+        assert_eq!(existing.source_confidence.as_deref(), Some("high"));
     }
 
     fn preserved_guard(
@@ -7513,7 +7101,7 @@ mod tests {
             ..preserved.clone()
         };
 
-        assert!(merge_duplicate_link(&mut preserved, &fresh).is_err());
+        assert!(reconcile_preserved_link_or_reject_duplicate(&mut preserved, &fresh).is_err());
 
         assert_eq!(preserved.preserved_association_guard, Some(guard));
         assert_eq!(preserved.quantity, 1);
@@ -7531,11 +7119,15 @@ mod tests {
             preserved_association_guard: None,
             ..evidence_missing.clone()
         };
-        assert!(merge_duplicate_link(&mut evidence_missing, &unbound_evidence_missing).is_err());
+        assert!(reconcile_preserved_link_or_reject_duplicate(
+            &mut evidence_missing,
+            &unbound_evidence_missing
+        )
+        .is_err());
     }
 
     #[test]
-    fn exact_checkpoint_occurrence_coalesces_with_its_preserved_guard() {
+    fn exact_checkpoint_occurrence_reconciles_with_its_preserved_guard() {
         let guard = preserved_guard(416, &"a".repeat(64));
         let mut preserved = PreparedLink {
             identity_key: "catalog:94".to_string(),
@@ -7557,7 +7149,8 @@ mod tests {
             ..preserved.clone()
         };
 
-        merge_duplicate_link(&mut preserved, &exact_checkpoint_occurrence).unwrap();
+        reconcile_preserved_link_or_reject_duplicate(&mut preserved, &exact_checkpoint_occurrence)
+            .unwrap();
 
         assert_eq!(preserved.preserved_association_guard, Some(guard));
         assert_eq!(preserved.quantity, 1);
@@ -7591,7 +7184,7 @@ mod tests {
             ..fresh.clone()
         };
 
-        assert!(merge_duplicate_link(&mut fresh, &preserved).is_err());
+        assert!(reconcile_preserved_link_or_reject_duplicate(&mut fresh, &preserved).is_err());
 
         assert_eq!(fresh.preserved_association_guard, None);
         assert_eq!(fresh.quantity, 1);
@@ -7638,7 +7231,9 @@ mod tests {
 
         for mismatch in mismatches {
             let mut existing = original.clone();
-            assert!(merge_duplicate_link(&mut existing, &mismatch).is_err());
+            assert!(
+                reconcile_preserved_link_or_reject_duplicate(&mut existing, &mismatch).is_err()
+            );
             assert_eq!(
                 existing.preserved_association_guard,
                 Some(original_guard.clone())
@@ -7652,8 +7247,8 @@ mod tests {
     }
 
     #[test]
-    fn gnx_375_gps_and_transponder_rows_become_one_physical_link() {
-        let mut prepared = [PreparedLink {
+    fn gnx_375_gps_and_transponder_rows_require_one_explicit_product_occurrence() {
+        let mut existing = PreparedLink {
             identity_key: "catalog:375".to_string(),
             avionics_model_id: 375,
             authorization: None,
@@ -7667,7 +7262,7 @@ mod tests {
             replacement_identity_key: None,
             expected_replacement_collision_closure_sha256: None,
             preserved_association_guard: None,
-        }];
+        };
         let transponder_row = PreparedLink {
             identity_key: "catalog:375".to_string(),
             avionics_model_id: 375,
@@ -7684,22 +7279,19 @@ mod tests {
             preserved_association_guard: None,
         };
 
-        let existing = prepared
-            .iter_mut()
-            .find(|link| link.avionics_model_id == transponder_row.avionics_model_id)
-            .expect("both capability rows resolve to the same catalog product");
-        merge_duplicate_link(existing, &transponder_row).unwrap();
+        let error = reconcile_preserved_link_or_reject_duplicate(&mut existing, &transponder_row)
+            .unwrap_err();
 
-        assert_eq!(prepared.len(), 1);
-        assert_eq!(prepared[0].quantity, 1, "capabilities are not extra units");
+        assert!(error.contains("multiple retained avionics occurrences"));
+        assert_eq!(existing.quantity, 1);
         assert_eq!(
-            prepared[0].source_notes.as_deref(),
+            existing.source_notes.as_deref(),
             Some("GNX 375 GPS navigator installed")
         );
     }
 
     #[test]
-    fn dry_run_new_capability_rows_coalesce_by_verified_product_identifier() {
+    fn dry_run_duplicate_preview_product_key_fails_closed() {
         let gps = ApprovedAvionicsIdentity {
             id: 0,
             manufacturer: "Garmin".to_string(),
@@ -7724,7 +7316,7 @@ mod tests {
         assert_eq!(gps_key, transponder_key);
 
         let mut prepared = Vec::new();
-        assert!(!merge_or_push_prepared_link(
+        assert!(!reconcile_or_push_prepared_link(
             &mut prepared,
             PreparedLink {
                 identity_key: gps_key,
@@ -7743,7 +7335,7 @@ mod tests {
             },
         )
         .unwrap());
-        assert!(merge_or_push_prepared_link(
+        let error = reconcile_or_push_prepared_link(
             &mut prepared,
             PreparedLink {
                 identity_key: transponder_key,
@@ -7761,7 +7353,8 @@ mod tests {
                 preserved_association_guard: None,
             },
         )
-        .unwrap());
+        .unwrap_err();
+        assert!(error.contains("multiple retained avionics occurrences"));
         assert_eq!(prepared.len(), 1);
         assert_eq!(
             prepared[0].source_notes.as_deref(),
@@ -7792,7 +7385,7 @@ mod tests {
             ..existing.clone()
         };
 
-        assert!(merge_duplicate_link(&mut existing, &conflicting).is_err());
+        assert!(reconcile_preserved_link_or_reject_duplicate(&mut existing, &conflicting).is_err());
         assert_eq!(existing.configuration_action, "installed");
         assert_eq!(existing.replaces_avionics_model_id, None);
 
@@ -7802,10 +7395,11 @@ mod tests {
             ..existing.clone()
         };
         let same_unresolved_replacement = unresolved_replacement.clone();
-        assert!(
-            merge_duplicate_link(&mut unresolved_replacement, &same_unresolved_replacement)
-                .is_err()
-        );
+        assert!(reconcile_preserved_link_or_reject_duplicate(
+            &mut unresolved_replacement,
+            &same_unresolved_replacement,
+        )
+        .is_err());
     }
 
     fn prepared_action(
@@ -9333,8 +8927,10 @@ mod tests {
         assert_eq!(report.prepared_link_count, 1);
         assert_eq!(report.accepted, 0);
         assert_eq!(report.remaining_review_aspects, 2);
-        assert!(report.error.as_deref().is_some_and(|error| error
-            .contains("conflicting action, replacement, or collision-closure semantics")));
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("multiple retained avionics occurrences")));
         assert_eq!(report.candidates.len(), 1);
         assert_eq!(report.candidates[0].candidate_index, 0);
         assert_eq!(report.candidates[0].catalog_id, Some(product_id));
@@ -9548,8 +9144,10 @@ mod tests {
 
         assert_eq!(request_count.load(Ordering::SeqCst), 0, "{report:#?}");
         assert_eq!(report.status, "blocked");
-        assert!(report.error.as_deref().is_some_and(|error| error
-            .contains("conflicting action, replacement, or collision-closure semantics")));
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("multiple retained avionics occurrences")));
         assert_eq!(report.candidates.len(), 4);
         assert!(report
             .candidates
@@ -10588,7 +10186,7 @@ mod tests {
         assert!(report
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("multiple raw rows")));
+            .is_some_and(|error| error.contains("multiple retained avionics occurrences")));
 
         let (persisted_json, extraction_error): (String, Option<String>) = sqlx::query_as(
             "SELECT extracted_listing_json, extraction_error FROM plugin_submissions WHERE id = ?",
