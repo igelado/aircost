@@ -98,6 +98,7 @@ WHERE listing.source_url = 'https://listing.example/reuse-v2'
 -- Reconstruct the exact v1 parent contract. Rerunning the canonical v1 and
 -- association migrations below restores every predecessor trigger and index.
 PRAGMA foreign_keys = OFF;
+DROP TRIGGER IF EXISTS aircraft_sale_listings_ready_semantic_avionics;
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_link_update;
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_reuse_delete;
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_model_proof_update;
