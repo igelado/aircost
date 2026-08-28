@@ -2612,7 +2612,7 @@ mod tests {
     use crate::listing::review::{
         restage_unattested_preserved_products, stage_pending_review, ListingAssociationRole,
         ListingReview, PendingReviewAspect, ResolveReviewRequest, ReviewAircraftIdentityState,
-        ReviewAircraftIdentityStatus, ReviewAircraftSummary, ReviewAspectId,
+        ReviewAircraftIdentityStatus, ReviewAircraftSummary, ReviewAspectId, ReviewProduct,
     };
     use crate::listing::run::{
         claim_next_verification_run_item, create_verification_run, get_verification_run,
@@ -3081,6 +3081,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verification_run_worker_applies_a_zero_provider_plan_without_gemini() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlite_pool(&db);
+        let (owner_user_id, listing_id) = insert_review_listing(&db).await;
+        insert_server_faa_admission(&db, listing_id).await;
+        let evidence = "Garmin GNS 430W installed";
+        let submission_id = insert_review_bound_submission(
+            &db,
+            owner_user_id,
+            listing_id,
+            &format!("<p>{evidence}</p>"),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
+        )
+        .bind(
+            serde_json::json!({
+                "manufacturer": "Test Aircraft",
+                "model": "Test Model",
+                "variant": "Test Variant",
+                "model_year": 2020,
+                "asking_price_usd": 450000,
+                "currency": "USD",
+                "airframe_hours": 900,
+                "engine_hours": null,
+                "engine_time_basis": "unknown",
+                "engine_time_evidence": null,
+                "engine_time_confidence": null,
+                "propeller_hours": null,
+                "propeller_time_basis": "unknown",
+                "propeller_time_evidence": null,
+                "propeller_time_confidence": null,
+                "installed_engine": null,
+                "installed_propeller": null,
+                "registration_number": "N123AB",
+                "serial_number": null,
+                "status": "for_sale",
+                "avionics": [{
+                    "manufacturer": "Garmin",
+                    "model": "GNS 430W",
+                    "types": ["GPS"],
+                    "quantity": 1,
+                    "configuration_action": "installed",
+                    "replaces": null,
+                    "source_evidence_text": evidence,
+                    "source_confidence": "high"
+                }],
+                "valuation_facts": []
+            })
+            .to_string(),
+        )
+        .bind(submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let product_id = insert_approved_garmin_product(&db).await;
+        attest_approved_garmin_product(&db, product_id).await;
+        stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[PendingReviewAspect::avionics(
+                "server:keyless-local:0",
+                "avionics",
+                "Garmin GNS 430W",
+                evidence,
+                "exact catalog suggestion requires replay",
+                1,
+                "installed",
+                Some(evidence.to_string()),
+                Some("high".to_string()),
+            )
+            .with_suggested_product(ReviewProduct::verified(
+                product_id,
+                "Garmin",
+                "GNS 430W",
+                vec!["GPS".to_string()],
+            ))],
+        )
+        .await
+        .unwrap();
+
+        let preflight = crate::listing::verification::verify_listings(
+            &db,
+            crate::listing::verification::ListingVerificationMode::Preflight,
+            &crate::listing::verification::ListingVerificationScope::new(1, Some(listing_id), None),
+            crate::listing::verification::ListingVerificationServices::unavailable(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !preflight.provider_request_plan.requires_provider(),
+            "unexpected provider plan: {:#?}",
+            preflight.provider_request_plan
+        );
+
+        let created = create_verification_run(
+            &db,
+            &CreateVerificationRunRequest {
+                owner_user_id,
+                idempotency_key: "worker-keyless-local-test".to_string(),
+                listing_ids: vec![listing_id],
+            },
+        )
+        .await
+        .unwrap();
+        let lease_token = "test-worker-keyless-local-lease";
+        let claim = claim_next_verification_run_item(&db, lease_token, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("the queued item should be claimable");
+        process_claimed_verification_run_item(&test_state(db.clone()), claim, lease_token).await;
+
+        let run = get_verification_run(&db, owner_user_id, created.run.id)
+            .await
+            .unwrap();
+        assert_eq!(run.status, VerificationRunStatus::Completed);
+        assert_eq!(run.failed_items, 0);
+        assert_eq!(run.pending_review_items, 1);
+        let page = list_verification_run_items(
+            &db,
+            owner_user_id,
+            run.id,
+            &VerificationRunItemsQuery::default(),
+        )
+        .await
+        .unwrap();
+        let item = &page.items[0];
+        assert_eq!(item.status, VerificationRunItemStatus::PendingReview);
+        assert_ne!(
+            item.reason_code.as_deref(),
+            Some("automatic_verification_unavailable")
+        );
+        assert_eq!(
+            item.outcome
+                .as_ref()
+                .and_then(|outcome| outcome["avionics"]["accepted"].as_u64()),
+            Some(1)
+        );
+        let stored: (i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics
+                WHERE aircraft_sale_listing_id = ? AND avionics_model_id = ?),
+              (SELECT COUNT(*) FROM aircraft_sale_listing_pending_reviews
+                WHERE listing_id = ?),
+              (SELECT COUNT(*) FROM gemini_api_usage
+                WHERE aircraft_sale_listing_id = ?)
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .bind(listing_id)
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, (1, 0, 0));
+    }
+
+    #[tokio::test]
     async fn cancelling_a_run_stops_queued_work_without_stealing_the_current_lease() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let (owner_user_id, first_listing_id) = insert_review_listing(&db).await;
@@ -3184,6 +3346,96 @@ mod tests {
         .await
         .unwrap();
         (owner_user_id, listing_id)
+    }
+
+    async fn insert_server_faa_admission(db: &AppDb, listing_id: i64) {
+        let pool = sqlite_pool(db);
+        sqlx::query(
+            "UPDATE aircraft_sale_listings SET registration_number = 'N123AB', serial_number = NULL WHERE id = ?",
+        )
+        .bind(listing_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let release_url =
+            format!("https://www.faa.gov/aircraft-registry/server-test-{listing_id}.zip");
+        let archive_sha256 = sha256_hex(release_url.as_bytes());
+        let evidence_source_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO curation_evidence_sources (
+              source_url, resolved_url, source_title, publisher, source_domain,
+              source_tier, content_sha256, retrieved_at
+            ) VALUES (
+              ?, ?, 'FAA registry fixture', 'Federal Aviation Administration',
+              'faa.gov', 'regulator_primary', ?, CURRENT_TIMESTAMP
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(&release_url)
+        .bind(&release_url)
+        .bind(&archive_sha256)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let snapshot_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO faa_registry_snapshots (
+              evidence_source_id, snapshot_date, source_url, archive_sha256,
+              source_manifest_sha256, target_set_sha256,
+              master_member_name, master_member_sha256,
+              aircraft_member_name, aircraft_member_sha256,
+              engine_member_name, engine_member_sha256, record_hash_domain
+            ) VALUES (
+              ?, '2026-08-27', ?, ?, ?, ?, 'MASTER.txt', ?,
+              'ACFTREF.txt', ?, 'ENGINE.txt', ?,
+              'aircost-faa-master-retained-aircraft-projection-v1'
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(evidence_source_id)
+        .bind(&release_url)
+        .bind(&archive_sha256)
+        .bind("b".repeat(64))
+        .bind("c".repeat(64))
+        .bind("d".repeat(64))
+        .bind("e".repeat(64))
+        .bind("f".repeat(64))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO faa_registry_aircraft (
+              snapshot_id, n_number, aircraft_code, year_manufactured,
+              source_record_sha256
+            ) VALUES (?, 'N123AB', 'TEST-1', 2020, ?)
+            "#,
+        )
+        .bind(snapshot_id)
+        .bind("0".repeat(64))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO faa_registry_aircraft_references (
+              snapshot_id, aircraft_code, manufacturer_name, model_name
+            ) VALUES (?, 'TEST-1', 'CESSNA', '182H')
+            "#,
+        )
+        .bind(snapshot_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO faa_registry_coverage (snapshot_id, n_number, lookup_status) VALUES (?, 'N123AB', 'matched')",
+        )
+        .bind(snapshot_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn insert_review_bound_submission(

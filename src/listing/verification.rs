@@ -284,6 +284,13 @@ pub struct ListingVerificationProviderPlan {
     pub finalization_note: String,
 }
 
+impl ListingVerificationProviderPlan {
+    /// Whether executing this exact page can require a provider-backed stage.
+    pub fn requires_provider(&self) -> bool {
+        self.aircraft_grounding_candidates > 0 || self.avionics.requires_provider()
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ListingVerificationReport {
     pub mode: String,
@@ -423,6 +430,13 @@ pub async fn verify_listing(
         let preflight = preflight_listing_avionics(db, listing_id, avionics_mode)
             .await
             .map_err(|error| ListingVerificationError::Avionics(error.to_string()))?;
+        let avionics_requires_provider = match &preflight {
+            ListingAvionicsVerificationPreflight::NoPendingReview { .. } => false,
+            ListingAvionicsVerificationPreflight::PendingReview { report } => {
+                provider_request_plan_for_listing_preflights(std::slice::from_ref(report))
+                    .requires_provider()
+            }
+        };
         match mode {
             ListingVerificationMode::Preflight => {
                 avionics_preflight_stage(preflight, pending_before_avionics)
@@ -439,21 +453,22 @@ pub async fn verify_listing(
                 avionics_preflight_stage(preflight, pending_before_avionics)
             }
             ListingVerificationMode::Preview | ListingVerificationMode::Apply => {
-                let extractor = services.extractor.ok_or_else(|| {
-                    ListingVerificationError::Unavailable(
+                if avionics_requires_provider && services.extractor.is_none() {
+                    return Err(ListingVerificationError::Unavailable(
                         "automatic avionics verification requires configured Gemini services"
                             .to_string(),
-                    )
-                })?;
+                    ));
+                }
                 let execution_mode = if mode == ListingVerificationMode::Apply {
                     AvionicsVerificationExecutionMode::Apply
                 } else {
                     AvionicsVerificationExecutionMode::Preview
                 };
                 let usage_before = listing_gemini_usage_count(db, listing_id).await.ok();
-                let outcome = verify_listing_avionics(db, extractor, execution_mode, listing_id)
-                    .await
-                    .map_err(|error| ListingVerificationError::Avionics(error.to_string()))?;
+                let outcome =
+                    verify_listing_avionics(db, services.extractor, execution_mode, listing_id)
+                        .await
+                        .map_err(|error| ListingVerificationError::Avionics(error.to_string()))?;
                 let usage_after = listing_gemini_usage_count(db, listing_id).await.ok();
                 avionics_stage(
                     outcome,
@@ -1384,6 +1399,25 @@ mod tests {
             ListingVerificationScope::new(1, Some(1), Some(2)).validate(),
             Err(ListingVerificationError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn provider_plan_requires_services_for_aircraft_or_avionics_work() {
+        let mut plan = ListingVerificationProviderPlan {
+            aircraft_grounding_candidates: 0,
+            avionics: AvionicsProviderRequestPlan::default(),
+            finalization_enrichment_requests_included: false,
+            finalization_note: String::new(),
+        };
+        assert!(!plan.requires_provider());
+
+        plan.aircraft_grounding_candidates = 1;
+        assert!(plan.requires_provider());
+
+        plan.aircraft_grounding_candidates = 0;
+        plan.avionics
+            .known_total_provider_requests_validation_envelope_maximum = 1;
+        assert!(plan.requires_provider());
     }
 
     #[tokio::test]
