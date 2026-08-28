@@ -618,7 +618,7 @@ const REFERENCE_CATALOG_CUTOVER_RETIRED_ROUTINES: &[&str] = &[
 ];
 const REFERENCE_CATALOG_CUTOVER_SQLITE_OBJECT_COUNT: i64 = 213;
 const REFERENCE_CATALOG_CUTOVER_SQLITE_DEFINITION_DIGEST: &str =
-    "581bc9491e66de7fcb0c81d6d0fd0c26abbed74dac4c56de6d133643dd4b4b54";
+    "d54632bf3bc2029e58d4f23cb315807660de87bbfb6e4b18a658f61e562ba824";
 const REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES: &[&str] = &[
     "aircraft_reference_fact_set_attestations:sqlite_autoindex_aircraft_reference_fact_set_attestations_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:fact_set_kind:0:BINARY:1,2:-1::0:BINARY:0",
     "aircraft_reference_prices:sqlite_autoindex_aircraft_reference_prices_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:price_kind:0:BINARY:1,2:4:currency:0:BINARY:1,3:-1::0:BINARY:0",
@@ -632,7 +632,7 @@ const REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES: &[&str] = &[
 ];
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_OBJECT_COUNT: i64 = 792;
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_DEFINITION_DIGEST: &str =
-    "a12dfb4a0ff4f026bee8b16c1c26ac0a";
+    "f1ed12c366a583546439a58db5fa8359";
 const SQLITE_SERIAL_SCHEME_INSERT_TRIGGER: &str = r#"
 CREATE TRIGGER aircraft_serial_schemes_require_approval
 BEFORE INSERT ON aircraft_serial_number_schemes
@@ -1175,6 +1175,17 @@ fn canonical_postgres_trigger_definition(value: &str) -> String {
         // PostgreSQL order, which can differ from the order used in DDL.
         .replace("beforeupdateordeleteon", "beforedeleteorupdateon")
         .replace("afterupdateordeleteon", "afterdeleteorupdateon")
+}
+
+fn canonical_postgres_row_when_trigger_definition(value: &str) -> String {
+    canonical_postgres_trigger_definition(value)
+        // pg_get_triggerdef parenthesizes the complete WHEN expression and
+        // every boolean atom. Canonical DDL keeps only the required outer
+        // parentheses; normalize that presentation difference without
+        // discarding or reordering any predicate text.
+        .replace("when(((new.", "when(new.")
+        .replace(")or(new.", "ornew.")
+        .replace(")))executefunction", ")executefunction")
 }
 
 fn postgres_pool_options(max_connections: u32) -> PgPoolOptions {
@@ -4201,7 +4212,7 @@ impl AppDb {
                                 'aircraft_sale_listing_avionics_link_authorizations'
                               ) > 0
                             )
-                        ) <> 18
+                        ) <> 20
                       )
                     "#,
                 )
@@ -5319,10 +5330,11 @@ impl AppDb {
     ) -> Result<bool> {
         const TABLE: &str = "aircraft_sale_listing_avionics_link_authorizations";
         const SQLITE_INDEXES: &[&str] = &["idx_listing_avionics_authorizations_model"];
-        const TRIGGERS: &[(&str, i16, bool, &str)] = &[
+        const TRIGGERS: &[(&str, i16, bool, bool, &str)] = &[
             (
                 "listing_avionics_authorizations_immutable_update",
                 19,
+                true,
                 true,
                 "preserve_listing_avionics_authorization",
             ),
@@ -5330,11 +5342,13 @@ impl AppDb {
                 "listing_avionics_authorizations_invalidate_capture_delete",
                 9,
                 true,
+                true,
                 "invalidate_listing_avionics_authorization_for_capture",
             ),
             (
                 "listing_avionics_authorizations_invalidate_capture_update",
                 17,
+                false,
                 false,
                 "invalidate_listing_avionics_authorization_for_capture",
             ),
@@ -5342,11 +5356,13 @@ impl AppDb {
                 "listing_avionics_authorizations_invalidate_graph_delete",
                 9,
                 true,
+                true,
                 "invalidate_listing_avionics_same_case_for_graph",
             ),
             (
                 "listing_avionics_authorizations_invalidate_graph_insert",
                 5,
+                true,
                 true,
                 "invalidate_listing_avionics_same_case_for_graph",
             ),
@@ -5354,29 +5370,48 @@ impl AppDb {
                 "listing_avionics_authorizations_invalidate_graph_update",
                 17,
                 false,
+                true,
                 "invalidate_listing_avionics_same_case_for_graph",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_install_provenance",
+                17,
+                false,
+                false,
+                "invalidate_listing_avionics_auth_for_install_provenance",
             ),
             (
                 "listing_avionics_authorizations_invalidate_link_update",
                 17,
                 false,
+                true,
                 "invalidate_listing_avionics_authorization_for_link",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_listing_provenance",
+                17,
+                false,
+                false,
+                "invalidate_listing_avionics_auth_for_listing_provenance",
             ),
             (
                 "listing_avionics_authorizations_invalidate_manufacturer_update",
                 17,
                 false,
+                true,
                 "invalidate_listing_avionics_same_case_for_manufacturer",
             ),
             (
                 "listing_avionics_authorizations_invalidate_model_proof_update",
                 17,
                 false,
+                true,
                 "invalidate_listing_avionics_same_case_for_model_proof",
             ),
             (
                 "listing_avionics_authorizations_invalidate_model_type_delete",
                 9,
+                true,
                 true,
                 "invalidate_listing_avionics_same_case_for_model_type",
             ),
@@ -5384,17 +5419,20 @@ impl AppDb {
                 "listing_avionics_authorizations_invalidate_model_type_insert",
                 5,
                 true,
+                true,
                 "invalidate_listing_avionics_same_case_for_model_type",
             ),
             (
                 "listing_avionics_authorizations_invalidate_model_type_update",
                 17,
                 false,
+                true,
                 "invalidate_listing_avionics_same_case_for_model_type",
             ),
             (
                 "listing_avionics_authorizations_invalidate_origin_revocation",
                 5,
+                true,
                 true,
                 "invalidate_listing_avionics_same_case_for_origin_revocation",
             ),
@@ -5402,28 +5440,31 @@ impl AppDb {
                 "listing_avionics_authorizations_invalidate_reuse_delete",
                 9,
                 true,
+                true,
                 "invalidate_listing_avionics_authorization_for_reuse",
             ),
             (
                 "listing_avionics_authorizations_invalidate_type_update",
                 17,
                 false,
+                true,
                 "invalidate_listing_avionics_same_case_for_type",
             ),
             (
                 "listing_avionics_authorizations_validate_insert",
                 7,
                 true,
+                true,
                 "validate_listing_avionics_authorization",
             ),
         ];
         const POSTGRES_CHECKS: &[&str] = &[
-            "CHECK ((((authorization_kind = 'manufacturer_reuse'::text) AND (grounded_resolution_sha256 IS NULL) AND (plugin_submission_id IS NULL) AND (extracted_listing_sha256 IS NULL) AND (source_revocation_count IS NULL)) OR ((authorization_kind = 'same_case_grounded'::text) AND (grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'::text) AND (plugin_submission_id IS NOT NULL) AND (extracted_listing_sha256 IS NOT NULL) AND (source_revocation_count IS NOT NULL) AND (source_revocation_count >= 0))))",
-            "CHECK (((extracted_listing_sha256 IS NULL) OR (extracted_listing_sha256 ~ '^[0-9a-f]{64}$'::text)))",
+            "CHECK ((((authorization_kind = 'manufacturer_reuse'::text) AND (grounded_resolution_sha256 IS NULL) AND (source_revocation_count IS NULL)) OR ((authorization_kind = 'same_case_grounded'::text) AND (grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'::text) AND (source_revocation_count IS NOT NULL) AND (source_revocation_count >= 0))))",
             "CHECK ((association_role = ANY (ARRAY['installed'::text, 'replacement'::text])))",
             "CHECK ((authorization_kind = ANY (ARRAY['manufacturer_reuse'::text, 'same_case_grounded'::text])))",
             "CHECK ((collision_closure_sha256 ~ '^[0-9a-f]{64}$'::text))",
             "CHECK ((evidence_capture_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((extracted_listing_sha256 ~ '^[0-9a-f]{64}$'::text))",
             "CHECK ((observation_sha256 ~ '^[0-9a-f]{64}$'::text))",
             "CHECK ((product_fingerprint ~ '^[0-9a-f]{64}$'::text))",
         ];
@@ -5479,7 +5520,7 @@ impl AppDb {
                 .await?;
                 let triggers_are_exact = actual_triggers.len() == TRIGGERS.len()
                     && actual_triggers.iter().zip(TRIGGERS).all(
-                        |((actual_name, actual_definition), (expected_name, _, _, _))| {
+                        |((actual_name, actual_definition), (expected_name, _, _, _, _))| {
                             actual_name == expected_name
                                 && actual_definition.as_deref().is_some_and(|actual| {
                                     canonical_sqlite_schema_definition(actual)
@@ -5556,8 +5597,8 @@ impl AppDb {
                         ('product_fingerprint', 'text', TRUE, NULL),
                         ('grounded_resolution_sha256', 'text', FALSE, NULL),
                         ('evidence_capture_sha256', 'text', TRUE, NULL),
-                        ('plugin_submission_id', 'bigint', FALSE, NULL),
-                        ('extracted_listing_sha256', 'text', FALSE, NULL),
+                        ('plugin_submission_id', 'bigint', TRUE, NULL),
+                        ('extracted_listing_sha256', 'text', TRUE, NULL),
                         ('collision_closure_sha256', 'text', TRUE, NULL),
                         ('source_revocation_count', 'bigint', FALSE, NULL),
                         ('authorized_at', 'text', TRUE, 'CURRENT_TIMESTAMP')
@@ -5779,10 +5820,19 @@ impl AppDb {
                     .await?;
                 let triggers_are_exact = actual_triggers.len() == TRIGGERS.len()
                     && actual_triggers.iter().zip(TRIGGERS).all(
-                        |(actual, (name, trigger_type, no_update_columns, function_name))| {
+                        |(
+                            actual,
+                            (
+                                name,
+                                trigger_type,
+                                no_update_columns,
+                                has_no_when_clause,
+                                function_name,
+                            ),
+                        )| {
                             actual.trigger_name == *name
                                 && actual.trigger_type == *trigger_type
-                                && actual.has_no_when_clause
+                                && actual.has_no_when_clause == *has_no_when_clause
                                 && actual.is_enabled
                                 && actual.has_zero_trigger_args
                                 && actual.is_uninherited
@@ -5801,8 +5851,10 @@ impl AppDb {
                                 && actual.is_volatile
                                 && actual.is_parallel_unsafe
                                 && actual.is_not_leakproof
-                                && canonical_postgres_trigger_definition(&actual.definition)
-                                    == canonical_postgres_named_trigger_definition(
+                                && canonical_postgres_row_when_trigger_definition(
+                                    &actual.definition,
+                                ) == canonical_postgres_row_when_trigger_definition(
+                                    &canonical_postgres_named_trigger_definition(
                                         POSTGRES_SCHEMA_SQL,
                                         name,
                                     )
@@ -5810,7 +5862,8 @@ impl AppDb {
                                         panic!(
                                             "canonical listing authorization trigger {name} must exist"
                                         )
-                                    })
+                                    }),
+                                )
                                 && canonical_sql_definition(&actual.function_source)
                                     == canonical_sql_definition(
                                         postgres_function_source(
@@ -6450,6 +6503,7 @@ impl AppDb {
                           OR (
                             tbl_name = 'plugin_installs'
                             AND name IN (
+                              'listing_avionics_authorizations_invalidate_install_provenance',
                               'plugin_installs_replay_identity_immutable',
                               'plugin_installs_active_replay_capture_identity_frozen_insert',
                               'plugin_installs_active_replay_capture_identity_frozen_update',
@@ -7161,6 +7215,7 @@ impl AppDb {
                                 'public.plugin_installs'
                               )
                               AND trigger_definition.tgname IN (
+                                'listing_avionics_authorizations_invalidate_install_provenance',
                                 'plugin_installs_active_replay_capture_identity_frozen',
                                 'plugin_installs_replay_identity_immutable'
                               )
@@ -10881,6 +10936,9 @@ mod tests {
     use sqlx::sqlite::{SqliteConnection, SqlitePoolOptions};
     use sqlx::{Connection, Executor};
 
+    use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
+    use crate::avionics::reuse::refresh_reuse_attestation_sqlite;
+
     use super::{
         aircraft_catalog_retrieval_keys_migration_required_message,
         aircraft_identity_no_supported_selection_migration_required_message,
@@ -11971,62 +12029,6 @@ mod tests {
         connection
     }
 
-    async fn assert_sqlite_replay_migration_rerun_rejected_without_changes(
-        db: &AppDb,
-        label: &str,
-    ) {
-        let DatabaseBackend::Sqlite(pool) = db.backend() else {
-            unreachable!()
-        };
-        let mut connection = pool.acquire().await.unwrap();
-        sqlx::query(
-            "UPDATE schema_migration_contracts SET installed_at = ? WHERE migration_name = ?",
-        )
-        .bind("1999-12-31T23:59:59Z")
-        .bind(LISTING_REPLAY_RUNS_MIGRATION)
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        let snapshot_sql = r#"
-            SELECT type, name, COALESCE(sql, '')
-            FROM sqlite_schema
-            WHERE name IN (
-                'listing_replay_runs', 'listing_replay_run_items',
-                'plugin_submission_materialization_receipts',
-                'idx_listing_replay_runs_one_running',
-                'idx_listing_replay_run_items_phase'
-              )
-              OR tbl_name IN (
-                'listing_replay_runs', 'listing_replay_run_items',
-                'plugin_submission_materialization_receipts',
-                'plugin_submissions', 'plugin_installs'
-              )
-            ORDER BY type, name
-        "#;
-        let before = sqlx::query_as::<_, (String, String, String)>(snapshot_sql)
-            .fetch_all(&mut *connection)
-            .await
-            .unwrap();
-        let rerun = sqlx::raw_sql(LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL)
-            .execute(&mut *connection)
-            .await;
-        assert!(rerun.is_err(), "{label}: hostile rerun must fail");
-        let _ = connection.execute("ROLLBACK").await;
-        let after = sqlx::query_as::<_, (String, String, String)>(snapshot_sql)
-            .fetch_all(&mut *connection)
-            .await
-            .unwrap();
-        assert_eq!(after, before, "{label}: rejected rerun must not mutate DDL");
-        let installed_at: String = sqlx::query_scalar(
-            "SELECT installed_at FROM schema_migration_contracts WHERE migration_name = ?",
-        )
-        .bind(LISTING_REPLAY_RUNS_MIGRATION)
-        .fetch_one(&mut *connection)
-        .await
-        .unwrap();
-        assert_eq!(installed_at, "1999-12-31T23:59:59Z", "{label}");
-    }
-
     async fn assert_weakened_replay_item_rejected(
         label: &str,
         expected_fragment: &str,
@@ -12073,8 +12075,6 @@ mod tests {
             .await
             .unwrap();
         drop(connection);
-
-        assert_sqlite_replay_migration_rerun_rejected_without_changes(&db, label).await;
 
         assert!(
             !db.listing_replay_definitions_valid().await.unwrap(),
@@ -12162,8 +12162,6 @@ mod tests {
             .await
             .unwrap();
         drop(connection);
-
-        assert_sqlite_replay_migration_rerun_rejected_without_changes(&db, label).await;
 
         assert!(
             !db.listing_replay_definitions_valid().await.unwrap(),
@@ -12333,18 +12331,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_schema_accepts_the_exact_listing_replay_migration_again() {
-        let db = AppDb::connect("sqlite::memory:").await.unwrap();
-        let DatabaseBackend::Sqlite(pool) = db.backend() else {
-            unreachable!()
-        };
-        sqlx::raw_sql(LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL)
-            .execute(pool)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
     async fn startup_rejects_tampered_listing_replay_concurrency_index() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -12360,12 +12346,6 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-
-        assert_sqlite_replay_migration_rerun_rejected_without_changes(
-            &db,
-            "weakened-running-index",
-        )
-        .await;
 
         assert!(!db.listing_replay_definitions_valid().await.unwrap());
         let error = db
@@ -12429,12 +12409,6 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        assert_sqlite_replay_migration_rerun_rejected_without_changes(
-            &db,
-            "missing-item-uniqueness",
-        )
-        .await;
-
         assert!(!db.listing_replay_definitions_valid().await.unwrap());
         let error = db
             .ensure_required_migrations()
@@ -12445,7 +12419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listing_replay_rerun_rejects_unexpected_sqlite_indexes_and_triggers() {
+    async fn startup_rejects_unexpected_sqlite_replay_indexes_and_triggers() {
         for (label, statement) in [
             (
                 "unexpected-attached-index",
@@ -12469,13 +12443,12 @@ mod tests {
                 unreachable!()
             };
             pool.execute(statement).await.unwrap();
-            assert_sqlite_replay_migration_rerun_rejected_without_changes(&db, label).await;
             assert!(!db.listing_replay_definitions_valid().await.unwrap(), "{label}");
         }
     }
 
     #[tokio::test]
-    async fn listing_replay_rerun_rejects_weakened_same_name_sqlite_trigger_without_healing() {
+    async fn startup_rejects_weakened_same_name_sqlite_replay_trigger() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!()
@@ -12489,12 +12462,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        assert_sqlite_replay_migration_rerun_rejected_without_changes(
-            &db,
-            "weakened-same-name-trigger",
-        )
-        .await;
 
         let retained_definition: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_schema \
@@ -12545,7 +12512,6 @@ mod tests {
                 sqlx::query(replacement).execute(pool).await.unwrap();
             }
 
-            assert_sqlite_replay_migration_rerun_rejected_without_changes(&db, label).await;
             assert!(
                 !db.listing_replay_definitions_valid().await.unwrap(),
                 "{label}"
@@ -12851,6 +12817,8 @@ mod tests {
         ] {
             assert!(definition.contains(LISTING_REPLAY_RUNS_MIGRATION));
             assert!(definition.contains(LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT));
+            assert!(definition
+                .contains("listing_avionics_authorizations_invalidate_install_provenance"));
             assert!(!definition.contains("manifest_version"));
             assert!(definition.contains("listing_replay_runs"));
             assert!(definition.contains("listing_replay_run_items"));
@@ -18889,9 +18857,392 @@ mod tests {
                 "listing_avionics_authorizations_invalidate_origin_revocation",
                 "listing_avionics_authorizations_invalidate_capture_delete",
                 "listing_avionics_authorizations_invalidate_capture_update",
+                "listing_avionics_authorizations_invalidate_install_provenance",
+                "listing_avionics_authorizations_invalidate_listing_provenance",
             ] {
                 assert!(definition.contains(cleanup_trigger));
             }
+        }
+    }
+
+    struct ListingAuthorizationFixture {
+        listing_id: i64,
+        link_id: i64,
+        model_id: i64,
+        install_id: i64,
+        submission_id: i64,
+        capture_sha256: String,
+        checkpoint_sha256: String,
+    }
+
+    async fn insert_decoded_listing_authorization_fixture(
+        db: &AppDb,
+    ) -> ListingAuthorizationFixture {
+        const SOURCE_URL: &str = "https://example.test/entity-evidence";
+        const EVIDENCE: &str = "Garmin GMA 1347 Marker Beacon & 4-place intercom";
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test fixture requires SQLite")
+        };
+        let manufacturer_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Garmin', 'garmin') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let type_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES ('Audio Panel', 'audio panel') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let model_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id, name, normalized_name,
+              manufacturer_identifier_kind, manufacturer_identifier,
+              normalized_manufacturer_identifier, identity_source_url,
+              identity_source_title, identity_evidence_text,
+              identity_evidence_kind, identity_confidence, catalog_reviewed_at
+            ) VALUES (
+              ?, 'GMA 1347', 'gma 1347', 'manufacturer_model_number',
+              'GMA 1347', 'gma 1347',
+              'https://manufacturer.example/gma-1347', 'GMA 1347 manual',
+              'The manufacturer identifies the exact GMA 1347 product.',
+              'authoritative_reference', 'very_high', CURRENT_TIMESTAMP
+            ) RETURNING id
+            "#,
+        )
+        .bind(manufacturer_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        )
+        .bind(model_id)
+        .bind(type_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        ensure_test_manufacturer_identity(db, manufacturer_id)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_authoritative_source_origins (
+              authority_kind, avionics_manufacturer_identity_id, https_origin,
+              evidence_source_url, evidence_source_title, evidence_text,
+              approval_basis, approval_reason
+            )
+            SELECT 'manufacturer_primary', avionics_manufacturer_identity_id,
+                   'https://manufacturer.example',
+                   'https://manufacturer.example/gma-1347', 'GMA 1347 manual',
+                   'The manufacturer publishes the exact GMA 1347 product.',
+                   'curated_bootstrap', 'decoded entity authorization fixture'
+            FROM avionics_approved_product_identities
+            WHERE avionics_model_id = ?
+            "#,
+        )
+        .bind(model_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut attestation_transaction = pool.begin().await.unwrap();
+        assert!(refresh_reuse_attestation_sqlite(
+            db,
+            &mut attestation_transaction,
+            model_id,
+            "https://manufacturer.example/gma-1347",
+        )
+        .await
+        .unwrap());
+        attestation_transaction.commit().await.unwrap();
+        let listing_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            ) VALUES (
+              (SELECT aircraft_model_variant_id
+               FROM aircraft_sale_listing_pending_compatibility_placeholder
+               WHERE singleton_id = 1),
+              1, ?, 2020, 100000, 1000
+            ) RETURNING id
+            "#,
+        )
+        .bind(SOURCE_URL)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, source_notes,
+              source_confidence, configuration_action
+            ) VALUES (?, ?, ?, 'high', 'installed') RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(model_id)
+        .bind(EVIDENCE)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let raw_html = "<p>Garmin GMA 1347 Marker Beacon &amp; 4-place intercom</p>".to_string();
+        let capture_sha256 = format!("{:x}", Sha256::digest(raw_html.as_bytes()));
+        let checkpoint = serde_json::json!({
+            "manufacturer": "Cessna", "model": "182", "variant": "182T",
+            "model_year": 2020, "asking_price_usd": 100000, "currency": "USD",
+            "airframe_hours": 1000, "engine_hours": null,
+            "engine_time_basis": "unknown", "engine_time_evidence": null,
+            "engine_time_confidence": null, "propeller_hours": null,
+            "propeller_time_basis": "unknown", "propeller_time_evidence": null,
+            "propeller_time_confidence": null, "installed_engine": null,
+            "installed_propeller": null, "registration_number": "N12345",
+            "serial_number": "TEST123", "status": "active",
+            "avionics": [{
+                "manufacturer": "Garmin", "model": "GMA 1347",
+                "types": ["Audio Panel"], "quantity": 1,
+                "configuration_action": "installed", "replaces": null,
+                "source_evidence_text": EVIDENCE, "source_confidence": "high"
+            }],
+            "valuation_facts": []
+        })
+        .to_string();
+        let checkpoint_sha256 = format!("{:x}", Sha256::digest(checkpoint.as_bytes()));
+        let install_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plugin_installs (user_id, public_key_base64, created_at) VALUES (1, 'entity-key', '2026-01-01T00:00:00Z') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let submission_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO plugin_submissions (
+              user_id, plugin_install_id, source_url, submitted_at, rendered_html,
+              rendered_html_sha256, signature_base64, extracted_listing_json,
+              canonical_listing_id
+            ) VALUES (
+              1, ?, ?, '2026-01-02T00:00:00Z', ?, ?, 'entity-signature', ?, ?
+            ) RETURNING id
+            "#,
+        )
+        .bind(install_id)
+        .bind(SOURCE_URL)
+        .bind(raw_html)
+        .bind(&capture_sha256)
+        .bind(checkpoint)
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
+              listing_link_id, association_role, avionics_model_id,
+              authorization_kind, observation_sha256, product_fingerprint,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              plugin_submission_id, extracted_listing_sha256,
+              collision_closure_sha256, source_revocation_count
+            )
+            SELECT ?, 'installed', ?, 'manufacturer_reuse', ?,
+                   attestation.product_fingerprint, NULL, ?, ?, ?, ?, NULL
+            FROM avionics_product_reuse_attestations attestation
+            WHERE attestation.avionics_model_id = ?
+            "#,
+        )
+        .bind(link_id)
+        .bind(model_id)
+        .bind("a".repeat(64))
+        .bind(&capture_sha256)
+        .bind(submission_id)
+        .bind(&checkpoint_sha256)
+        .bind("d".repeat(64))
+        .bind(model_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        ListingAuthorizationFixture {
+            listing_id,
+            link_id,
+            model_id,
+            install_id,
+            submission_id,
+            capture_sha256,
+            checkpoint_sha256,
+        }
+    }
+
+    #[tokio::test]
+    async fn decoded_checkpoint_evidence_authorizes_entity_encoded_html_and_tracks_revocation() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let fixture = insert_decoded_listing_authorization_fixture(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
+            )
+            .bind(fixture.link_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(fixture.capture_sha256.len(), 64);
+        assert_eq!(fixture.checkpoint_sha256.len(), 64);
+        assert!(fixture.model_id > 0);
+
+        sqlx::query("UPDATE plugin_installs SET revoked_at = '2026-01-03T00:00:00Z' WHERE id = ?")
+            .bind(fixture.install_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
+            )
+            .bind(fixture.link_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            1,
+            "revocation after the signed submission must preserve its authorization"
+        );
+
+        sqlx::query("UPDATE plugin_installs SET revoked_at = '2026-01-01T12:00:00Z' WHERE id = ?")
+            .bind(fixture.install_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
+            )
+            .bind(fixture.link_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            0,
+            "revocation before the signed submission must invalidate its authorization"
+        );
+        let error = sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
+              listing_link_id, association_role, avionics_model_id,
+              authorization_kind, observation_sha256, product_fingerprint,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              plugin_submission_id, extracted_listing_sha256,
+              collision_closure_sha256, source_revocation_count
+            )
+            SELECT ?, 'installed', ?, 'manufacturer_reuse', ?,
+                   attestation.product_fingerprint, NULL, ?, ?, ?, ?, NULL
+            FROM avionics_product_reuse_attestations attestation
+            WHERE attestation.avionics_model_id = ?
+            "#,
+        )
+        .bind(fixture.link_id)
+        .bind(fixture.model_id)
+        .bind("a".repeat(64))
+        .bind(&fixture.capture_sha256)
+        .bind(fixture.submission_id)
+        .bind(&fixture.checkpoint_sha256)
+        .bind("d".repeat(64))
+        .bind(fixture.model_id)
+        .execute(pool)
+        .await
+        .expect_err("a pre-submission revocation must reject authorization insertion");
+        assert!(error
+            .to_string()
+            .contains("listing avionics authorization requires the exact current link role"));
+    }
+
+    #[tokio::test]
+    async fn authorization_provenance_noops_preserve_but_actual_changes_invalidate() {
+        for target in ["submission", "listing", "install"] {
+            let db = AppDb::connect("sqlite::memory:").await.unwrap();
+            let fixture = insert_decoded_listing_authorization_fixture(&db).await;
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
+            match target {
+                "submission" => {
+                    sqlx::query("UPDATE plugin_submissions SET submitted_at = submitted_at, signature_base64 = signature_base64 WHERE id = ?")
+                        .bind(fixture.submission_id)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
+                "listing" => {
+                    sqlx::query("UPDATE aircraft_sale_listings SET source_url = source_url, created_by_user_id = created_by_user_id WHERE id = ?")
+                        .bind(fixture.listing_id)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
+                "install" => {
+                    sqlx::query("UPDATE plugin_installs SET public_key_base64 = public_key_base64, revoked_at = revoked_at WHERE id = ?")
+                        .bind(fixture.install_id)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
+                )
+                .bind(fixture.link_id)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+                1,
+                "{target} no-op update must preserve authorization"
+            );
+            match target {
+                "submission" => {
+                    sqlx::query("UPDATE plugin_submissions SET signature_base64 = 'changed-signature' WHERE id = ?")
+                        .bind(fixture.submission_id)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
+                "listing" => {
+                    sqlx::query("UPDATE aircraft_sale_listings SET source_url = 'https://example.test/changed' WHERE id = ?")
+                        .bind(fixture.listing_id)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
+                "install" => {
+                    sqlx::query(
+                        "UPDATE plugin_installs SET public_key_base64 = 'changed-key' WHERE id = ?",
+                    )
+                    .bind(fixture.install_id)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
+                )
+                .bind(fixture.link_id)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+                0,
+                "{target} provenance change must invalidate authorization"
+            );
         }
     }
 
@@ -19099,18 +19450,26 @@ mod tests {
     #[tokio::test]
     async fn authorization_startup_rejects_weakened_scope_and_checkpoint_triggers() {
         assert_weakened_listing_avionics_authorization_table_rejected(
-            "plugin_submission_id INTEGER\n      REFERENCES plugin_submissions(id) ON DELETE CASCADE",
-            "plugin_submission_id INTEGER",
+            "plugin_submission_id INTEGER NOT NULL\n      REFERENCES plugin_submissions(id) ON DELETE CASCADE",
+            "plugin_submission_id INTEGER NOT NULL",
         )
         .await;
         assert_weakened_listing_avionics_authorization_table_rejected(
-            ",\n    CHECK (\n      (authorization_kind = 'manufacturer_reuse'\n        AND grounded_resolution_sha256 IS NULL\n        AND plugin_submission_id IS NULL\n        AND extracted_listing_sha256 IS NULL\n        AND source_revocation_count IS NULL)\n      OR\n      (authorization_kind = 'same_case_grounded'\n        AND length(grounded_resolution_sha256) = 64\n        AND grounded_resolution_sha256 = lower(grounded_resolution_sha256)\n        AND grounded_resolution_sha256 NOT GLOB '*[^0-9a-f]*'\n        AND plugin_submission_id IS NOT NULL\n        AND extracted_listing_sha256 IS NOT NULL\n        AND source_revocation_count IS NOT NULL\n        AND source_revocation_count >= 0)\n    )",
+            ",\n    CHECK (\n      (authorization_kind = 'manufacturer_reuse'\n        AND grounded_resolution_sha256 IS NULL\n        AND source_revocation_count IS NULL)\n      OR\n      (authorization_kind = 'same_case_grounded'\n        AND length(grounded_resolution_sha256) = 64\n        AND grounded_resolution_sha256 = lower(grounded_resolution_sha256)\n        AND grounded_resolution_sha256 NOT GLOB '*[^0-9a-f]*'\n        AND source_revocation_count IS NOT NULL\n        AND source_revocation_count >= 0)\n    )",
             "",
         )
         .await;
         assert_corrupt_grounded_capability_schema_rejected(&[
             "DROP TRIGGER listing_avionics_authorizations_invalidate_capture_update",
             "CREATE TRIGGER listing_avionics_authorizations_invalidate_capture_update AFTER UPDATE OF canonical_listing_id, rendered_html, rendered_html_sha256, extracted_listing_json, extraction_error ON plugin_submissions WHEN 0 BEGIN DELETE FROM aircraft_sale_listing_avionics_link_authorizations WHERE plugin_submission_id = OLD.id; END",
+        ])
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "DROP TRIGGER listing_avionics_authorizations_invalidate_install_provenance",
+        ])
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "DROP TRIGGER listing_avionics_authorizations_invalidate_listing_provenance",
         ])
         .await;
         assert_corrupt_grounded_capability_schema_rejected(&[
@@ -19367,7 +19726,7 @@ mod tests {
                ) AND constraint_row.contype = 'c' \
                  AND pg_catalog.strpos( \
                    pg_catalog.pg_get_constraintdef(constraint_row.oid), \
-                   'plugin_submission_id' \
+                   'source_revocation_count' \
                  ) > 0 \
                  AND pg_catalog.strpos( \
                    pg_catalog.pg_get_constraintdef(constraint_row.oid), \

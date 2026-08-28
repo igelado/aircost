@@ -31,7 +31,9 @@ use crate::avionics::reuse::{
     countable_unit_reuse_attestation_is_current_sqlite,
 };
 use crate::db::{AppDb, DatabaseBackend};
+use crate::listing::replay::retained_capture_timestamp_chronology_valid;
 use crate::listing::review::{association_observation_sha256_from_values, ListingAssociationRole};
+use crate::plugin::current_checkpoint_contains_avionics_source_evidence;
 use crate::valuation::dataset::{require_snapshot_faa_admission, technical_field_count};
 use crate::valuation::{
     source_backed_component_observation, FactoryReferenceFeature, SupportGrade, ValuationBreakdown,
@@ -178,6 +180,8 @@ struct ListingAvionicsEstimateRow {
     authorization_product_fingerprint: Option<String>,
     current_reuse_product_fingerprint: Option<String>,
     authorization_evidence_capture_sha256: Option<String>,
+    authorization_plugin_submission_id: Option<i64>,
+    authorization_extracted_listing_sha256: Option<String>,
     authorization_collision_closure_sha256: Option<String>,
 }
 
@@ -197,6 +201,10 @@ impl From<ListingAvionicsEstimateRow> for AvionicsEstimateRow {
 #[derive(Debug, FromRow)]
 struct RetainedListingAvionicsCaptureRow {
     rendered_html: String,
+    extracted_listing_json: String,
+    install_created_at: String,
+    submitted_at: String,
+    install_revoked_at: Option<String>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -891,6 +899,10 @@ async fn listing_avionics_estimates(
             AS current_reuse_product_fingerprint,
           authorization.evidence_capture_sha256
             AS authorization_evidence_capture_sha256,
+          authorization.plugin_submission_id
+            AS authorization_plugin_submission_id,
+          authorization.extracted_listing_sha256
+            AS authorization_extracted_listing_sha256,
           authorization.collision_closure_sha256
             AS authorization_collision_closure_sha256
         FROM aircraft_sale_listing_avionics link
@@ -979,6 +991,8 @@ macro_rules! explicit_count_listing_avionics_is_current {
             Some(authorization_product_fingerprint),
             Some(current_reuse_product_fingerprint),
             Some(authorization_evidence_capture_sha256),
+            Some(authorization_plugin_submission_id),
+            Some(authorization_extracted_listing_sha256),
             Some(authorization_collision_closure_sha256),
         ) = (
             row.source_notes.as_deref(),
@@ -988,6 +1002,8 @@ macro_rules! explicit_count_listing_avionics_is_current {
             row.authorization_product_fingerprint.as_deref(),
             row.current_reuse_product_fingerprint.as_deref(),
             row.authorization_evidence_capture_sha256.as_deref(),
+            row.authorization_plugin_submission_id,
+            row.authorization_extracted_listing_sha256.as_deref(),
             row.authorization_collision_closure_sha256.as_deref(),
         )
         else {
@@ -1021,21 +1037,47 @@ macro_rules! explicit_count_listing_avionics_is_current {
         }
         let capture_sql = $db.sql(
             r#"
-            SELECT rendered_html
-            FROM plugin_submissions
-            WHERE canonical_listing_id = ?
-              AND rendered_html_sha256 = ?
+            SELECT submission.rendered_html, submission.extracted_listing_json,
+                   install.created_at AS install_created_at,
+                   submission.submitted_at,
+                   install.revoked_at AS install_revoked_at
+            FROM plugin_submissions submission
+            JOIN plugin_installs install
+              ON install.id = submission.plugin_install_id
+             AND install.user_id = submission.user_id
+            JOIN aircraft_sale_listings listing
+              ON listing.id = submission.canonical_listing_id
+             AND listing.created_by_user_id = submission.user_id
+             AND listing.source_url = submission.source_url
+            WHERE submission.id = ?
+              AND submission.canonical_listing_id = ?
+              AND submission.rendered_html_sha256 = ?
+              AND submission.extracted_listing_json IS NOT NULL
+              AND submission.extraction_error IS NULL
             "#,
         );
-        let captures = sqlx::query_as::<_, RetainedListingAvionicsCaptureRow>(&capture_sql)
+        let capture = sqlx::query_as::<_, RetainedListingAvionicsCaptureRow>(&capture_sql)
+            .bind(authorization_plugin_submission_id)
             .bind($listing_id)
             .bind(authorization_evidence_capture_sha256)
-            .fetch_all(&mut **$transaction)
+            .fetch_optional(&mut **$transaction)
             .await?;
-        let capture_is_current = captures.iter().any(|capture| {
+        let capture_is_current = capture.is_some_and(|capture| {
             format!("{:x}", Sha256::digest(capture.rendered_html.as_bytes()))
                 == authorization_evidence_capture_sha256
-                && capture.rendered_html.contains(source_notes)
+                && format!(
+                    "{:x}",
+                    Sha256::digest(capture.extracted_listing_json.as_bytes())
+                ) == authorization_extracted_listing_sha256
+                && retained_capture_timestamp_chronology_valid(
+                    &capture.install_created_at,
+                    &capture.submitted_at,
+                    capture.install_revoked_at.as_deref(),
+                )
+                && current_checkpoint_contains_avionics_source_evidence(
+                    &capture.extracted_listing_json,
+                    source_notes,
+                )
         });
         if !capture_is_current {
             return Ok(false);
@@ -1296,11 +1338,13 @@ mod tests {
         avionics_suite_memberships, ground_estimate_to_reference, listing_avionics_estimates,
         listing_value_point, require_valuation_model_faa_admission, resolve_avionics_configuration,
         AircraftListingPointRow, AircraftReferenceValuationBasis, AvionicsConfigurationLink,
-        AvionicsSuiteMembership, ListingAssociationRole,
+        AvionicsSuiteMembership, ListingAssociationRole, RetainedListingAvionicsCaptureRow,
     };
     use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
     use crate::avionics::reuse::refresh_reuse_attestation_sqlite;
     use crate::db::{AppDb, DatabaseBackend};
+    use crate::listing::replay::retained_capture_timestamp_chronology_valid;
+    use crate::plugin::current_checkpoint_contains_avionics_source_evidence;
     use crate::valuation::{
         DepreciationPoint, SupportGrade, ValuationBreakdown, ValuationError, ValuationEstimate,
         ValuationModel, ValuationQuery,
@@ -1974,10 +2018,11 @@ mod tests {
             INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
               listing_link_id, association_role, avionics_model_id,
               authorization_kind, observation_sha256, product_fingerprint,
-              evidence_capture_sha256, collision_closure_sha256
+              evidence_capture_sha256, plugin_submission_id,
+              extracted_listing_sha256, collision_closure_sha256
             )
             SELECT ?, 'installed', ?, 'manufacturer_reuse', ?,
-                   product_fingerprint, ?, ?
+                   product_fingerprint, ?, ?, ?, ?
             FROM avionics_product_reuse_attestations
             WHERE avionics_model_id = ?
         "#;
@@ -1988,7 +2033,7 @@ mod tests {
         let listing_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO aircraft_sale_listings (
-              aircraft_model_variant_id, created_by_user_id, model_year,
+              aircraft_model_variant_id, created_by_user_id, source_url, model_year,
               asking_price_usd, airframe_hours
             ) VALUES (
               (
@@ -1996,7 +2041,7 @@ mod tests {
                 FROM aircraft_sale_listing_pending_compatibility_placeholder
                 WHERE singleton_id = 1
               ),
-              1, 2020, 100000, 1000
+              1, 'https://example.test/listing', 2020, 100000, 1000
             )
             RETURNING id
             "#,
@@ -2090,26 +2135,64 @@ mod tests {
 
         let rendered_html = format!("<html><body>{EVIDENCE}</body></html>");
         let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
+        let checkpoint = serde_json::json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2020,
+            "asking_price_usd": 100000,
+            "currency": "USD",
+            "airframe_hours": 1000,
+            "engine_hours": null,
+            "engine_time_basis": "unknown",
+            "engine_time_evidence": null,
+            "engine_time_confidence": null,
+            "propeller_hours": null,
+            "propeller_time_basis": "unknown",
+            "propeller_time_evidence": null,
+            "propeller_time_confidence": null,
+            "installed_engine": null,
+            "installed_propeller": null,
+            "registration_number": "N12345",
+            "serial_number": "TEST123",
+            "status": "active",
+            "avionics": [{
+                "manufacturer": "Garmin",
+                "model": "GIA63W",
+                "types": ["COM"],
+                "quantity": 2,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": EVIDENCE,
+                "source_confidence": "high"
+            }],
+            "valuation_facts": []
+        })
+        .to_string();
+        let checkpoint_sha256 = format!("{:x}", Sha256::digest(checkpoint.as_bytes()));
         let install_id: i64 = sqlx::query_scalar(
             "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (1, 'aircraft-explicit-count-key') RETURNING id",
         )
         .fetch_one(pool)
         .await
         .unwrap();
-        sqlx::query(
+        let submission_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO plugin_submissions (
               user_id, plugin_install_id, source_url, rendered_html,
-              rendered_html_sha256, signature_base64, canonical_listing_id
+              rendered_html_sha256, signature_base64, extracted_listing_json,
+              canonical_listing_id
             ) VALUES (1, ?, 'https://example.test/listing', ?, ?,
-                      'aircraft-explicit-count-signature', ?)
+                      'aircraft-explicit-count-signature', ?, ?)
+            RETURNING id
             "#,
         )
         .bind(install_id)
         .bind(&rendered_html)
         .bind(&rendered_html_sha256)
+        .bind(&checkpoint)
         .bind(listing_id)
-        .execute(pool)
+        .fetch_one(pool)
         .await
         .unwrap();
         let link_id: i64 = sqlx::query_scalar(
@@ -2146,11 +2229,38 @@ mod tests {
             .bind(model_id)
             .bind(&observation_sha256)
             .bind(&rendered_html_sha256)
+            .bind(submission_id)
+            .bind(&checkpoint_sha256)
             .bind(&collision_closure_sha256)
             .bind(model_id)
             .execute(pool)
             .await
             .unwrap();
+
+        assert!(current_checkpoint_contains_avionics_source_evidence(
+            &checkpoint,
+            EVIDENCE,
+        ));
+        let retained_capture: RetainedListingAvionicsCaptureRow = sqlx::query_as(
+            r#"
+            SELECT submission.rendered_html, submission.extracted_listing_json,
+                   install.created_at AS install_created_at,
+                   submission.submitted_at,
+                   install.revoked_at AS install_revoked_at
+            FROM plugin_submissions submission
+            JOIN plugin_installs install ON install.id = submission.plugin_install_id
+            WHERE submission.id = ?
+            "#,
+        )
+        .bind(submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(retained_capture_timestamp_chronology_valid(
+            &retained_capture.install_created_at,
+            &retained_capture.submitted_at,
+            retained_capture.install_revoked_at.as_deref(),
+        ));
 
         let current = listing_avionics_estimates(&db, listing_id).await.unwrap();
         assert_eq!(
@@ -2171,8 +2281,34 @@ mod tests {
         sqlx::query(INSERT_AUTHORIZATION_SQL)
             .bind(link_id)
             .bind(model_id)
+            .bind(&observation_sha256)
+            .bind(&rendered_html_sha256)
+            .bind(submission_id)
+            .bind("0".repeat(64))
+            .bind(&collision_closure_sha256)
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(listing_avionics_estimates(&db, listing_id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        sqlx::query(
+            "DELETE FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
+        )
+        .bind(link_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(INSERT_AUTHORIZATION_SQL)
+            .bind(link_id)
+            .bind(model_id)
             .bind("0".repeat(64))
             .bind(&rendered_html_sha256)
+            .bind(submission_id)
+            .bind(&checkpoint_sha256)
             .bind(&collision_closure_sha256)
             .bind(model_id)
             .execute(pool)

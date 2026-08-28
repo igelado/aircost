@@ -3479,6 +3479,45 @@ mod tests {
         .unwrap()
     }
 
+    async fn store_current_review_avionics_checkpoint(
+        db: &AppDb,
+        submission_id: i64,
+        avionics: serde_json::Value,
+    ) {
+        let checkpoint = json!({
+            "manufacturer": "Test Aircraft",
+            "model": "Test Model",
+            "variant": "Test Variant",
+            "model_year": 2020,
+            "asking_price_usd": 450000,
+            "currency": "USD",
+            "airframe_hours": 900,
+            "engine_hours": null,
+            "engine_time_basis": "unknown",
+            "engine_time_evidence": null,
+            "engine_time_confidence": null,
+            "propeller_hours": null,
+            "propeller_time_basis": "unknown",
+            "propeller_time_evidence": null,
+            "propeller_time_confidence": null,
+            "installed_engine": null,
+            "installed_propeller": null,
+            "registration_number": null,
+            "serial_number": null,
+            "status": "for_sale",
+            "avionics": avionics,
+            "valuation_facts": []
+        });
+        sqlx::query(
+            "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
+        )
+        .bind(checkpoint.to_string())
+        .bind(submission_id)
+        .execute(sqlite_pool(db))
+        .await
+        .unwrap();
+    }
+
     async fn insert_approved_garmin_product(db: &AppDb) -> i64 {
         insert_approved_garmin_product_named(db, "GNS 430W", "011-01064-40").await
     }
@@ -3820,6 +3859,21 @@ mod tests {
             "<html><body>Garmin GNS 430W P/N 011-01064-40 shown in the listing</body></html>",
         )
         .await;
+        store_current_review_avionics_checkpoint(
+            &db,
+            submission_id,
+            json!([{
+                "manufacturer": "Garmin",
+                "model": "GNS 430W",
+                "types": ["GPS"],
+                "quantity": 2,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "Garmin GNS 430W P/N 011-01064-40 shown in the listing",
+                "source_confidence": "high"
+            }]),
+        )
+        .await;
         let preserved_id = insert_approved_garmin_product(&db).await;
         let link_id: i64 = sqlx::query_scalar(
             r#"
@@ -3950,6 +4004,21 @@ mod tests {
             "<html><body><p>Two Garmin GNS <strong>430W</strong>\n navigators</p></body></html>",
         )
         .await;
+        store_current_review_avionics_checkpoint(
+            &db,
+            submission_id,
+            json!([{
+                "manufacturer": "Garmin",
+                "model": "GNS 430W",
+                "types": ["GPS"],
+                "quantity": 2,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "Two Garmin GNS 430W navigators",
+                "source_confidence": "high"
+            }]),
+        )
+        .await;
         let product_id = insert_approved_garmin_product(&db).await;
         attest_approved_garmin_product(&db, product_id).await;
         let ordinary = PendingReviewAspect::avionics(
@@ -4043,6 +4112,21 @@ mod tests {
         attest_approved_garmin_product(&db, product_id).await;
         let generated_explanation =
             "The candidate 'GDL690A' was identified as a typo for Garmin GDL 69A.";
+        store_current_review_avionics_checkpoint(
+            &db,
+            submission_id,
+            json!([{
+                "manufacturer": "Garmin",
+                "model": "GDL 69A",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": generated_explanation,
+                "source_confidence": "high"
+            }]),
+        )
+        .await;
         let aspect = PendingReviewAspect::avionics(
             "observation-25",
             "avionics_identity",
@@ -4076,9 +4160,12 @@ mod tests {
         .await
         .expect_err("generated reasoning must not authorize an automatic listing link");
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(error
-            .message
-            .contains("exact structurally visible-body span"));
+        assert!(
+            error
+                .message
+                .contains("exact structurally visible-body span"),
+            "{error:?}"
+        );
 
         let link_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",

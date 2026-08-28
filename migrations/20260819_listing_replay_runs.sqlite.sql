@@ -570,6 +570,7 @@ replay_contract_guard(accepted) AS (
           OR (
             tbl_name = 'plugin_installs'
             AND name IN (
+              'listing_avionics_authorizations_invalidate_install_provenance',
               'plugin_installs_replay_identity_immutable',
               'plugin_installs_active_replay_capture_identity_frozen_insert',
               'plugin_installs_active_replay_capture_identity_frozen_update',

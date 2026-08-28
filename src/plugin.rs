@@ -1407,6 +1407,25 @@ pub(crate) fn parse_current_checkpoint_payload(
     Ok((parsed_listing, identity_recovery))
 }
 
+/// Return whether one exact current listing checkpoint retains the supplied
+/// avionics occurrence evidence. Listing evidence is decoded visible text, so
+/// its durable proof is the checkpoint field rather than a byte substring of
+/// the HTML capture (where characters such as `&` may remain entity-encoded).
+pub(crate) fn current_checkpoint_contains_avionics_source_evidence(
+    extracted_listing_json: &str,
+    evidence_text: &str,
+) -> bool {
+    if evidence_text.trim().is_empty() {
+        return false;
+    }
+    parse_current_checkpoint_payload(extracted_listing_json).is_ok_and(|(listing, _)| {
+        listing
+            .avionics
+            .iter()
+            .any(|occurrence| occurrence.source_evidence_text.as_deref() == Some(evidence_text))
+    })
+}
+
 fn validate_checkpoint_visual_recovery(
     parsed_listing: &ParsedListing,
     recovery: &crate::aircraft::curation::visual::VisualIdentifierResolution,
@@ -2837,8 +2856,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        classify_replay_aircraft_admission, extract_capture_to_current_checkpoint,
-        load_checkpoint_capture,
+        classify_replay_aircraft_admission, current_checkpoint_contains_avionics_source_evidence,
+        extract_capture_to_current_checkpoint, load_checkpoint_capture,
         materialize_plugin_submission_checkpoint as materialize_pinned_checkpoint,
         parse_current_checkpoint_payload, reprocess_plugin_submission, sha256_hex,
         signature_message, store_plugin_extraction_checkpoint, submit_plugin_html,
@@ -5857,5 +5876,55 @@ mod tests {
         let error = parse_current_checkpoint_payload(&payload.to_string())
             .expect_err("an omitted current manufacturer member must not deserialize as null");
         assert!(error.to_string().contains("manufacturer"));
+    }
+
+    #[test]
+    fn checkpoint_evidence_matches_decoded_visible_text_not_raw_html_entities() {
+        let checkpoint = json!({
+            "manufacturer":"Cessna","model":"182","variant":"182T","model_year":2020,
+            "asking_price_usd":200000.0,"currency":"USD","airframe_hours":500.0,
+            "engine_hours":null,"engine_time_basis":"unknown","engine_time_evidence":null,
+            "engine_time_confidence":null,"propeller_hours":null,"propeller_time_basis":"unknown",
+            "propeller_time_evidence":null,"propeller_time_confidence":null,"installed_engine":null,
+            "installed_propeller":null,"registration_number":"N182PF","serial_number":null,
+            "status":"active",
+            "avionics":[
+                {
+                    "manufacturer":"Garmin","model":"GMA 1347","types":["Audio Panel"],
+                    "quantity":1,"configuration_action":"installed","replaces":null,
+                    "source_evidence_text":"Garmin GMA 1347 Marker Beacon & 4-place intercom",
+                    "source_confidence":"high"
+                },
+                {
+                    "manufacturer":"Bendix/King","model":"KAP 140","types":["Autopilot"],
+                    "quantity":1,"configuration_action":"installed","replaces":null,
+                    "source_evidence_text":"Bendix/King KAP 140 Two Axis Autopilot & Altitude Preselect",
+                    "source_confidence":"high"
+                }
+            ],
+            "valuation_facts":[]
+        })
+        .to_string();
+
+        assert!(current_checkpoint_contains_avionics_source_evidence(
+            &checkpoint,
+            "Garmin GMA 1347 Marker Beacon & 4-place intercom"
+        ));
+        assert!(current_checkpoint_contains_avionics_source_evidence(
+            &checkpoint,
+            "Bendix/King KAP 140 Two Axis Autopilot & Altitude Preselect"
+        ));
+        assert!(!current_checkpoint_contains_avionics_source_evidence(
+            &checkpoint,
+            "Garmin GMA 1347 Marker Beacon &amp; 4-place intercom"
+        ));
+        assert!(!current_checkpoint_contains_avionics_source_evidence(
+            &checkpoint,
+            ""
+        ));
+        assert!(!current_checkpoint_contains_avionics_source_evidence(
+            "{\"avionics\":[}",
+            "Garmin GMA 1347 Marker Beacon & 4-place intercom"
+        ));
     }
 }

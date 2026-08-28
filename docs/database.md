@@ -280,9 +280,16 @@ provenance for every avionics link.
 
 `aircraft_sale_listing_avionics_link_authorizations` records the current authority
 for each exact installed or replacement endpoint. A link is authorized either
-by a current global manufacturer-reuse attestation or by the independently
-grounded resolution for that exact listing capture. The latter does not confer
-reuse authority on any other listing.
+by a current global manufacturer-reuse attestation together with the exact
+signed submission, rendered-capture hash, parsed-checkpoint hash, and decoded
+checkpoint occurrence, or by the independently grounded resolution bound to
+that same exact checkpoint. Every runtime consumer that relies on an
+authorization row re-hashes both retained capture and checkpoint bytes and
+rechecks signed submission ownership, source, install timestamp/revocation
+chronology, and exact decoded evidence. This read boundary is required because
+SQLite cannot compute the checkpoint SHA-256 in a trigger. The latter
+authorization does not confer reuse authority on any other listing. Neither
+form stores a provider dossier or duplicates listing evidence.
 
 `aircraft_sale_listing_avionics_grounded_capabilities` is a one-use retry
 capability, not an evidence archive or catalog attestation. One row binds an
