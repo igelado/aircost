@@ -10192,13 +10192,17 @@ impl AppDb {
                         r#"
                         INSERT INTO users (
                           email, display_name, auth_provider, auth_subject
-                        ) VALUES (?, ?, ?, ?)
+                        ) SELECT ?, ?, ?, ?
+                        WHERE NOT EXISTS (
+                          SELECT 1 FROM users WHERE auth_subject = ?
+                        )
                         ON CONFLICT (auth_subject) DO NOTHING
                         "#,
                     )
                     .bind(DEVELOPER_EMAIL)
                     .bind("Developer")
                     .bind("local")
+                    .bind(DEVELOPER_AUTH_SUBJECT)
                     .bind(DEVELOPER_AUTH_SUBJECT)
                     .execute(&mut *transaction)
                     .await?;
@@ -10268,7 +10272,10 @@ impl AppDb {
                         r#"
                         INSERT INTO public.users (
                           email, display_name, auth_provider, auth_subject
-                        ) VALUES ($1, $2, $3, $4)
+                        ) SELECT $1, $2, $3, $4
+                        WHERE NOT EXISTS (
+                          SELECT 1 FROM public.users WHERE auth_subject = $4
+                        )
                         ON CONFLICT (auth_subject) DO NOTHING
                         "#,
                     )
@@ -12307,6 +12314,118 @@ mod tests {
             pool.close().await;
             drop(reopened);
         }
+        std::fs::remove_file(database_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_normal_startup_preserves_an_active_replay_capture_identity() {
+        let (database_path, database_url) = unique_sqlite_test_database("active-replay-startup");
+        let initialized = AppDb::connect(&database_url).await.unwrap();
+        let developer = initialized.current_user(None).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = initialized.backend() else {
+            unreachable!()
+        };
+        let install_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plugin_installs (user_id, public_key_base64) \
+             VALUES (?, 'active-replay-startup-key') RETURNING id",
+        )
+        .bind(developer.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let submission_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, rendered_html,
+                 rendered_html_sha256, signature_base64
+               ) VALUES (?, ?, 'https://example.test/active-replay-startup', '<html/>',
+                         ?, 'signature') RETURNING id"#,
+        )
+        .bind(developer.id)
+        .bind(install_id)
+        .bind("a".repeat(64))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO listing_replay_runs \
+             (manifest_sha256, manifest_capture_count) VALUES (?, 1) RETURNING id",
+        )
+        .bind("b".repeat(64))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO listing_replay_run_items (
+                 run_id, plugin_submission_id, position, expected_rendered_html_sha256
+               ) VALUES (?, ?, 0, ?)"#,
+        )
+        .bind(run_id)
+        .bind(submission_id)
+        .bind("a".repeat(64))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"UPDATE listing_replay_runs
+               SET status = 'running', active_phase = 'extraction',
+                   owner_token = 'active-replay-startup-owner',
+                   heartbeat_at_epoch_seconds = 1, started_at = CURRENT_TIMESTAMP
+               WHERE id = ?"#,
+        )
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE listing_replay_submission_inventory_lock \
+             SET active_run_id = ?, concurrency_token = concurrency_token + 1 \
+             WHERE singleton_id = 1",
+        )
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let before: (String, String, Option<i64>, i64) = sqlx::query_as(
+            r#"SELECT run.status, run.owner_token, inventory.active_run_id,
+                      inventory.concurrency_token
+               FROM listing_replay_runs run
+               CROSS JOIN listing_replay_submission_inventory_lock inventory
+               WHERE run.id = ? AND inventory.singleton_id = 1"#,
+        )
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        drop(initialized);
+
+        let reopened = AppDb::connect(&database_url)
+            .await
+            .expect("normal startup must not attempt to reinsert the existing developer user");
+        let DatabaseBackend::Sqlite(pool) = reopened.backend() else {
+            unreachable!()
+        };
+        let after: (String, String, Option<i64>, i64) = sqlx::query_as(
+            r#"SELECT run.status, run.owner_token, inventory.active_run_id,
+                      inventory.concurrency_token
+               FROM listing_replay_runs run
+               CROSS JOIN listing_replay_submission_inventory_lock inventory
+               WHERE run.id = ? AND inventory.singleton_id = 1"#,
+        )
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1
+        );
+        pool.close().await;
+        drop(reopened);
         std::fs::remove_file(database_path).unwrap();
     }
 
