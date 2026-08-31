@@ -11,6 +11,7 @@ import {
   associationsNeedingSourceRecovery,
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
+  canonicalProductSelectionConflicts,
   characterLimitState,
   describeAircraftIdentity,
   describeProductAssociationOutcome,
@@ -31,6 +32,7 @@ import {
   productAttestationDraft,
   productDetailRequestMayCommit,
   reviewAreaForAspect,
+  reviewPresentationSummary,
   reviewProductIdentitySourceValidation,
   runProductAssociationWorkers,
   summarizeProductAssociations,
@@ -533,6 +535,170 @@ test("exports the two exact review areas and classifies only known aspect kinds"
   assert.equal(reviewAreaForAspect({ kind: "avionic" }), null);
   assert.equal(reviewAreaForAspect({}), null);
   assert.equal(reviewAreaForAspect(null), null);
+});
+
+test("summarizes an aircraft-only review without inventing avionics work", () => {
+  const summary = reviewPresentationSummary({
+    listing_id: 23,
+    aircraft_identity: {
+      status: "curation_required",
+      reason_code: "canonical_identity_assignment_missing",
+    },
+    aspects: [],
+    review_payload_sha256: "a".repeat(64),
+    catalog_revision_sha256: "b".repeat(64),
+  });
+
+  assert.deepEqual(summary.aircraft, { verified: false, blocking: true });
+  assert.deepEqual(summary.avionics, {
+    total: 0,
+    decided: 0,
+    remaining: 0,
+    hasDirtyCorrections: false,
+  });
+  assert.equal(summary.defaultArea, "aircraft");
+  assert.equal(
+    summary.subtitle,
+    "Listing 23 · No avionics decisions · Aircraft curation required",
+  );
+  assert.equal(
+    summary.progress,
+    "No avionics decisions remain · aircraft curation required",
+  );
+  assert.deepEqual(summary.manualReviewEligibility, {
+    eligible: false,
+    gates: {
+      aircraftVerified: false,
+      allAvionicsDecided: true,
+      correctionsSaved: true,
+      reviewPayloadPresent: true,
+      catalogRevisionPresent: true,
+    },
+  });
+});
+
+test("keeps aircraft blocking separate from mixed avionics decision progress", () => {
+  const summary = reviewPresentationSummary({
+    listing_id: 41,
+    aircraft_identity: {
+      status: "curation_required",
+      reason_code: "aircraft_model_mismatch",
+    },
+    aspects: [
+      { id: "avionics:0:primary", kind: "avionics" },
+      { id: "avionics:1:primary", kind: "avionics_candidate" },
+      { id: "aircraft:identity", kind: "aircraft" },
+    ],
+    review_payload_sha256: "a".repeat(64),
+    catalog_revision_sha256: "b".repeat(64),
+  }, [
+    { aspectId: "avionics:0:primary", valid: true, dirty: false },
+    { aspectId: "avionics:1:primary", valid: false, dirty: false },
+    { aspectId: "aircraft:identity", valid: true, dirty: false },
+  ]);
+
+  assert.deepEqual(summary.aircraft, { verified: false, blocking: true });
+  assert.deepEqual(summary.avionics, {
+    total: 2,
+    decided: 1,
+    remaining: 1,
+    hasDirtyCorrections: false,
+  });
+  assert.equal(summary.defaultArea, "aircraft");
+  assert.equal(
+    summary.subtitle,
+    "Listing 41 · 2 avionics decisions · Aircraft curation required",
+  );
+  assert.equal(
+    summary.progress,
+    "1 of 2 avionics decision remains · aircraft curation required",
+  );
+  assert.equal(summary.manualReviewEligibility.eligible, false);
+});
+
+test("allows final manual review only when every independent gate passes", () => {
+  const review = {
+    listing_id: 52,
+    aircraft_identity: {
+      status: "verified",
+      reason_code: null,
+      faa_n_number: "N123AB",
+      faa_snapshot_id: 7,
+    },
+    aspects: [
+      { id: "avionics:0:primary", kind: "avionics" },
+      { id: "avionics:1:primary", kind: "avionics_identity" },
+    ],
+    review_payload_sha256: "a".repeat(64),
+    catalog_revision_sha256: "b".repeat(64),
+  };
+  const decided = [
+    { aspectId: "avionics:0:primary", valid: true, dirty: false },
+    { aspectId: "avionics:1:primary", valid: true, dirty: false },
+  ];
+  const complete = reviewPresentationSummary(review, decided);
+
+  assert.deepEqual(complete.aircraft, { verified: true, blocking: false });
+  assert.deepEqual(complete.avionics, {
+    total: 2,
+    decided: 2,
+    remaining: 0,
+    hasDirtyCorrections: false,
+  });
+  assert.equal(complete.defaultArea, "avionics");
+  assert.equal(complete.progress, "All 2 avionics decisions complete");
+  assert.equal(complete.manualReviewEligibility.eligible, true);
+  assert.deepEqual(complete.manualReviewEligibility.gates, {
+    aircraftVerified: true,
+    allAvionicsDecided: true,
+    correctionsSaved: true,
+    reviewPayloadPresent: true,
+    catalogRevisionPresent: true,
+  });
+
+  const dirty = reviewPresentationSummary(review, [
+    decided[0],
+    { ...decided[1], dirty: true },
+  ]);
+  assert.equal(dirty.avionics.hasDirtyCorrections, true);
+  assert.equal(dirty.manualReviewEligibility.eligible, false);
+  assert.equal(dirty.manualReviewEligibility.gates.correctionsSaved, false);
+
+  const missingHashes = reviewPresentationSummary({
+    ...review,
+    review_payload_sha256: " ",
+    catalog_revision_sha256: null,
+  }, decided);
+  assert.equal(missingHashes.manualReviewEligibility.eligible, false);
+  assert.equal(missingHashes.manualReviewEligibility.gates.reviewPayloadPresent, false);
+  assert.equal(missingHashes.manualReviewEligibility.gates.catalogRevisionPresent, false);
+});
+
+test("detects one canonical product selected for distinct occurrences", () => {
+  assert.deepEqual(canonicalProductSelectionConflicts([
+    { aspectId: "avionics:0:primary", productId: 375, quantity: 1 },
+    { aspectId: "avionics:1:primary", productId: 375, quantity: 1 },
+    { aspectId: "avionics:2:primary", productId: 345, quantity: 1 },
+  ]), [{
+    productId: 375,
+    aspectIds: ["avionics:0:primary", "avionics:1:primary"],
+  }]);
+});
+
+test("does not confuse repeated input or explicit quantity with duplicate occurrences", () => {
+  assert.deepEqual(canonicalProductSelectionConflicts([
+    { aspectId: "avionics:0:primary", productId: 375, quantity: 2 },
+    { aspectId: "avionics:0:primary", productId: 375, quantity: 2 },
+    { aspectId: "avionics:1:primary", productId: 345, quantity: 1 },
+  ]), []);
+  assert.deepEqual(canonicalProductSelectionConflicts([
+    { aspectId: "avionics:0:primary", productId: 375, quantity: 1 },
+    { aspectId: "avionics:0:primary", productId: 345, quantity: 1 },
+  ]), []);
+  assert.deepEqual(canonicalProductSelectionConflicts([
+    { aspectId: "ignored", productId: 0, quantity: 1 },
+    { aspectId: "", productId: 375, quantity: 1 },
+  ]), []);
 });
 
 test("preselects use-verified only for an explicit positive suggested product", () => {

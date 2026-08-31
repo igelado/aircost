@@ -19,6 +19,21 @@ const AVIONICS_COMPLETE = new Set([
   "verified",
 ]);
 
+const AUTOMATIC_AVIONICS_STATUSES = new Set([
+  "ready_legacy_reextraction",
+  "ready_retained_observations",
+]);
+
+const FAILED_STAGE_STATUSES = new Set([
+  "error",
+  "failed",
+]);
+
+const AUTOMATIC_FINALIZATION_INGESTION_STATES = new Set([
+  "incomplete",
+  "pending_review",
+]);
+
 const RUN_STATUSES = new Set([
   "queued",
   "running",
@@ -131,6 +146,7 @@ export function pipelineRowsFromResponse(payload) {
     const aircraft = stageView("aircraft", listing?.aircraft);
     const avionics = stageView("avionics", listing?.avionics);
     const reference = referenceStageView(listing?.reference, listing?.finalization);
+    const finalization = stageView("finalization", listing?.finalization);
     const gemini = geminiRequirement(listing);
     const reason = listingReason(listing, aircraft, avionics, reference);
     return [{
@@ -144,6 +160,7 @@ export function pipelineRowsFromResponse(payload) {
       aircraft,
       avionics,
       reference,
+      finalization,
       gemini,
       reason,
     }];
@@ -348,6 +365,24 @@ export function pipelineAutomaticEligibility(row) {
   if (!row || typeof row !== "object") {
     return { eligible: false, reason: "Listing status is unavailable." };
   }
+  const aircraftStatus = nonBlank(row.aircraft?.status);
+  const avionicsStatus = nonBlank(row.avionics?.status);
+  const finalizationStatus = nonBlank(row.finalization?.status);
+  const identityComplete = row.aircraft?.complete === true
+    && row.avionics?.complete === true;
+  const finalizationRunnable = identityComplete
+    && finalizationStatus === "ready"
+    && AUTOMATIC_FINALIZATION_INGESTION_STATES.has(row.finalIngestionState);
+  const referenceOnly = identityComplete
+    && row.reference?.status === "pending_reference"
+    && !finalizationRunnable;
+
+  if (referenceOnly) {
+    return {
+      eligible: false,
+      reason: "Only factory-reference work remains; automatic verification cannot advance it.",
+    };
+  }
   if (
     row.status === "verified"
     || row.status === "already_verified"
@@ -356,17 +391,52 @@ export function pipelineAutomaticEligibility(row) {
     return { eligible: false, reason: "The listing is already verified." };
   }
   if (
-    row.aircraft?.status === "rejected"
-    || row.avionics?.status === "faa_rejected"
+    aircraftStatus === "rejected"
+    || avionicsStatus === "faa_rejected"
   ) {
     return {
       eligible: false,
       reason: "The aircraft was deterministically rejected by mandatory FAA admission.",
     };
   }
+  if (row.status === "failed" || [
+    aircraftStatus,
+    avionicsStatus,
+    finalizationStatus,
+  ].some((status) => FAILED_STAGE_STATUSES.has(status))) {
+    return {
+      eligible: false,
+      reason: "Automatic verification failed; inspect the failure before retrying.",
+    };
+  }
+  if (row.status === "blocked") {
+    return {
+      eligible: false,
+      reason: "The listing is blocked and has no safe automatic verification path.",
+    };
+  }
+
+  const aircraftRunnable = aircraftStatus === "locally_assignable"
+    || (
+      aircraftStatus === "pending"
+      && row.aircraft?.reasonCode === "grounding_required"
+    );
+  const avionicsRunnable = AUTOMATIC_AVIONICS_STATUSES.has(avionicsStatus);
+  if (aircraftRunnable || avionicsRunnable || finalizationRunnable) {
+    return {
+      eligible: true,
+      reason: "The listing has automatic identity or readiness work available.",
+    };
+  }
+  if (row.hasPendingReview === true) {
+    return {
+      eligible: false,
+      reason: "Only manual review remains; automatic verification cannot advance this listing.",
+    };
+  }
   return {
-    eligible: true,
-    reason: "The listing has automatic identity or readiness work available.",
+    eligible: false,
+    reason: "No runnable automatic verification stage remains.",
   };
 }
 
@@ -502,45 +572,45 @@ function stageView(area, value) {
   const reason = REASON_COPY[reasonCode] || suppliedReason || "";
   if (area === "aircraft") {
     if (AIRCRAFT_COMPLETE.has(status)) {
-      return stage(status, "Verified", reason, true, "complete");
+      return stage(status, "Verified", reason, true, "complete", reasonCode);
     }
     if (status === "locally_assignable") {
-      return stage(status, "Ready locally", reason, false, "ready");
+      return stage(status, "Ready locally", reason, false, "ready", reasonCode);
     }
     if (status === "rejected") {
-      return stage(status, "FAA rejected", reason, false, "blocked");
+      return stage(status, "FAA rejected", reason, false, "blocked", reasonCode);
     }
-    return stage(status, "Verification needed", reason, false, "pending");
+    return stage(status, "Verification needed", reason, false, "pending", reasonCode);
   }
   if (area === "avionics") {
     if (AVIONICS_COMPLETE.has(status)) {
-      return stage(status, "Complete", reason, true, "complete");
+      return stage(status, "Complete", reason, true, "complete", reasonCode);
     }
     if (status === "ready_retained_observations") {
-      return stage(status, "Ready to check", reason, false, "ready");
+      return stage(status, "Ready to check", reason, false, "ready", reasonCode);
     }
     if (status === "ready_legacy_reextraction") {
-      return stage(status, "Re-extraction needed", reason, false, "pending");
+      return stage(status, "Re-extraction needed", reason, false, "pending", reasonCode);
     }
     if (status === "skipped" || status === "faa_rejected") {
-      return stage(status, "Waiting for aircraft", reason, false, "blocked");
+      return stage(status, "Waiting for aircraft", reason, false, "blocked", reasonCode);
     }
-    return stage(status, "Review needed", reason, false, "pending");
+    return stage(status, "Review needed", reason, false, "pending", reasonCode);
   }
   if (status === "ready") {
-    return stage(status, "Ready", reason, true, "complete");
+    return stage(status, "Ready", reason, true, "complete", reasonCode);
   }
   if (status === "pending_reference") {
-    return stage(status, "Reference pending", reason, false, "reference");
+    return stage(status, "Reference pending", reason, false, "reference", reasonCode);
   }
   if (status === "failed") {
-    return stage(status, "Finalization failed", reason, false, "blocked");
+    return stage(status, "Finalization failed", reason, false, "blocked", reasonCode);
   }
-  return stage(status, "Waiting on identities", reason, false, "waiting");
+  return stage(status, "Waiting on identities", reason, false, "waiting", reasonCode);
 }
 
-function stage(status, label, reason, complete, tone) {
-  return { status, label, reason, complete, tone };
+function stage(status, label, reason, complete, tone, reasonCode) {
+  return { status, reasonCode, label, reason, complete, tone };
 }
 
 function geminiRequirement(listing) {

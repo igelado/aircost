@@ -362,18 +362,30 @@ The listing table also displays each row's ingestion state. Hovering an
 All three states are excluded from valuation and training rather than silently
 treated as ready data.
 
-## Listing Review Workspace
+## Listing Acceptance and Review Workspace
 
-The Review tab has **By product** and **By listing** queues. By product
+The Review tab separates three operator workflows by purpose:
+
+- **Automatic acceptance** runs the durable verifier for selected listings.
+  It accepts only unambiguous FAA- and source-backed identities; unresolved
+  aircraft, product variants, quantities, and occurrence collisions remain
+  pending instead of being guessed.
+- **Known avionics products** maintains a reusable manufacturer-source check
+  for an approved catalog product, then validates only locally eligible exact
+  listing occurrences.
+- **Manual review** handles the residual aircraft and avionics evidence for one
+  listing. Its Aircraft and Avionics tabs report their completion independently.
+
+The known-product queue
 collapses every hash-bound existing-product aspect onto one approved avionics
 identity. A product is attested once from a guarded OEM fetch, without Gemini,
 then its listing aspects are checked locally with bounded concurrency across
 listings and serial optimistic-lock updates within each listing. These aspects
 may represent a preserved link or an ordinary unlinked extraction observation;
-the browser uses the same verification workflow for both. By listing shows the
-aircraft, tail, year, aspect count, reason groups, and last update. Opening a
-listing shows every unresolved observation, its source context, and any
-suggested or proposed product.
+the browser uses the same verification workflow for both. The manual listing
+queue shows the aircraft, tail, year, aspect count, reason groups, and last
+update. Opening a listing shows every unresolved observation, its source
+context, and any suggested or proposed product.
 
 Review access has a server-side allowlist until durable application roles are
 available. Production deployments must provide a comma-separated list of exact
@@ -392,8 +404,16 @@ authentication adapter trusts `X-User-Email`; production must expose these
 routes only behind a trusted proxy that strips any client-supplied value and
 injects the authenticated identity itself.
 
+The manual Avionics tab is occurrence-first: each card is one exact retained
+extraction occurrence, and its quantity belongs only to that occurrence.
+Distinct cards are never silently merged after they resolve to the same catalog
+identity. Assigning two cards to one canonical product remains blocked until the
+reviewer corrects the extraction to one source-supported occurrence and explicit
+quantity, discards a duplicate observation, or selects the genuinely different
+product variant.
+
 Ordinary extracted avionics aspects offer three decisions. The reviewer chooses
-exactly one before the Verify Listing button is enabled:
+exactly one before **Complete manual review** is enabled:
 
 - **Use verified product** searches and selects one existing approved catalog
   identity.
@@ -541,14 +561,14 @@ The browser treats the dedicated response as progress, reloads the same listing
 with the verified survivor selected, and asks the reviewer to confirm once
 more. It is not displayed as a failed verification.
 
-Pipeline and opened-listing **Automatically verify** actions create the same
-durable server-owned verification run. The browser sends the selected listing
-IDs with a cryptographically random `Idempotency-Key`, stores only the returned
-run ID locally, and reloads the authoritative run and paginated item state
-after navigation or browser restart. A network retry that reports an existing
-active run resumes that run instead of starting parallel work. The browser
-never attempts to execute the aircraft, avionics, or finalization stages
-itself.
+Automatic acceptance and opened-listing **Run safe automatic checks** actions
+create the same durable server-owned verification run. The browser sends the
+selected listing IDs with a cryptographically random `Idempotency-Key`, stores
+only the returned run ID locally, and reloads the authoritative run and
+paginated item state after navigation or browser restart. A network retry that
+reports an existing active run resumes that run instead of starting parallel
+work. The browser never attempts to execute the aircraft, avionics, or
+finalization stages itself.
 
 One run processes its listings serially while exposing queued, running, and
 terminal item counts. The UI polls with request-sequence guards, shows the
@@ -559,7 +579,7 @@ displayed independently from the verification-run outcome. A manual
 review link is shown only after a provider-free refresh confirms that the
 listing still has a current pending review.
 
-Before creating a run, the browser reports the current full-Pipeline Gemini
+Before creating a run, the browser reports the current full automatic-acceptance Gemini
 request plan and warns that finalization enrichment is additional. This is a
 cost warning, not a hard budget. The avionics totals include one tools-disabled
 concreteness-classifier request for every identity that reaches grounded
@@ -579,9 +599,9 @@ reference data is not yet published, the listing can still be `verified` and
 and preview derive this display-only valuation gap from local reference rows
 without Gemini.
 
-The Review page opens on a provider-free **Pipeline** view. It follows the
-numeric `resume_after_listing_id` checkpoint from the verification preflight
-endpoint and displays every non-ready listing, including listings whose
+The Review page opens on the provider-free **Automatic acceptance** view. It
+follows the numeric `resume_after_listing_id` checkpoint from the verification
+preflight endpoint and displays every non-ready listing, including listings whose
 identity review is complete but factory reference data remains pending. The
 table keeps aircraft, avionics, and reference status separate, shows whether
 Gemini is expected or may be needed after local checks, and exposes manual
@@ -589,7 +609,8 @@ review only when the response's listing context explicitly reports a current
 pending review. Reference-pending rows remain visible and can still be selected
 when automatic identity or listing-readiness work remains.
 
-The Pipeline overview translates the current preflight stages into four
+The Automatic acceptance overview translates the current preflight stages into
+four
 operator-facing backlog categories without making provider calls:
 
 - **Current avionics review** has retained current-schema observations ready
@@ -681,9 +702,9 @@ controls. `finalize_listing` defaults to `false`, so API and batch reviewers
 can save a local review without unexpectedly starting Gemini enrichment. When
 it is `true`, the same already authorized request runs final enrichment only
 after the all-or-nothing review transaction commits. The browser sends `true`
-for its one-click Verify Listing action. The detail response supplies the
-current approved-catalog hash; resolution recomputes it while holding the write
-lock. The hash covers approved product IDs, manufacturer/model labels,
+for its one-click **Complete manual review** action. The detail response
+supplies the current approved-catalog hash; resolution recomputes it while
+holding the write lock. The hash covers approved product IDs, manufacturer/model labels,
 capabilities, stable identifiers, and approval membership only, so unrelated
 changes to preserved unreviewed or rejected legacy rows do not invalidate the
 form. If the bundle or those approved identity fields change, the API rejects

@@ -4,7 +4,10 @@ import { initializeReviewWorkspace } from "/review.js";
 const USER_HEADER = "developer";
 const VIEW_TITLES = {
   "listings-panel": ["Listings", "Sale listings and aircraft details"],
-  "review-panel": ["Review", "Resolve listing evidence before verification"],
+  "review-panel": [
+    "Acceptance & review",
+    "Accept unambiguous evidence automatically; review only the residual exceptions",
+  ],
   "aircraft-panel": ["Aircraft", "Model parameters and depreciation curves"],
   "avionics-panel": ["Avionics", "Catalog identities, capabilities, values, and usage"],
   "comparisons-panel": ["Comparisons", "Purchase, rental, and investment runs"],
