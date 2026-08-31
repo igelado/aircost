@@ -89,6 +89,7 @@ test("joins listing contexts and keeps reference-only work visible", () => {
   assert.equal(rows[0].label, "2007 Cessna 182T");
   assert.equal(rows[0].registrationNumber, "N123AB");
   assert.equal(rows[0].reference.label, "Reference pending");
+  assert.equal(rows[0].finalization.status, "ready");
   assert.equal(rows[0].hasPendingReview, false);
   assert.match(rows[0].reason, /Factory reference pending/);
   assert.equal(rows[0].gemini.kind, "none");
@@ -121,6 +122,7 @@ test("falls back safely when listing context is absent", () => {
 
   assert.equal(rows[0].label, "Listing #20");
   assert.equal(rows[0].aircraft.label, "Verification needed");
+  assert.equal(rows[0].aircraft.reasonCode, "canonical_identity_assignment_missing");
   assert.equal(rows[0].gemini.kind, "required");
   assert.equal(rows[0].hasPendingReview, false);
   assert.match(rows[0].reason, /canonical catalog assignment/);
@@ -399,23 +401,150 @@ test("creates a secure idempotency key with an insecure-context fallback", () =>
   );
 });
 
-test("keeps reference-pending listings eligible and excludes FAA rejections", () => {
-  const base = {
-    status: "pending_review",
-    finalIngestionState: "pending_review",
-    aircraft: { status: "current" },
-    avionics: { status: "ready_retained_observations" },
-    reference: { status: "not_attempted" },
-  };
-  assert.equal(pipelineAutomaticEligibility(base).eligible, true);
-  assert.equal(pipelineAutomaticEligibility({
-    ...base,
-    reference: { status: "pending_reference" },
-  }).eligible, true);
-  assert.equal(pipelineAutomaticEligibility({
-    ...base,
-    aircraft: { status: "rejected" },
-  }).eligible, false);
+test("only selects listings with a runnable automatic verification stage", () => {
+  const currentAircraftView = { status: "current", complete: true };
+  const completeAvionicsView = { status: "already_complete", complete: true };
+  const waitingFinalization = { status: "not_attempted", complete: false };
+  const cases = [
+    {
+      name: "current retained avionics review",
+      eligible: true,
+      row: {
+        status: "pending_review",
+        finalIngestionState: "pending_review",
+        aircraft: currentAircraftView,
+        avionics: { status: "ready_retained_observations", complete: false },
+        reference: { status: "pending_reference" },
+        finalization: waitingFinalization,
+      },
+    },
+    {
+      name: "legacy re-extraction",
+      eligible: true,
+      row: {
+        status: "pending_review",
+        finalIngestionState: "pending_review",
+        aircraft: currentAircraftView,
+        avionics: { status: "ready_legacy_reextraction", complete: false },
+        reference: { status: "pending_reference" },
+        finalization: waitingFinalization,
+      },
+    },
+    {
+      name: "local aircraft assignment",
+      eligible: true,
+      row: {
+        status: "pending_review",
+        finalIngestionState: "pending_review",
+        aircraft: { status: "locally_assignable", complete: false },
+        avionics: completeAvionicsView,
+        reference: { status: "pending_reference" },
+        finalization: waitingFinalization,
+      },
+    },
+    {
+      name: "grounded aircraft curation",
+      eligible: true,
+      row: {
+        status: "pending_review",
+        finalIngestionState: "pending_review",
+        aircraft: {
+          status: "pending",
+          reasonCode: "grounding_required",
+          complete: false,
+        },
+        avionics: completeAvionicsView,
+        reference: { status: "pending_reference" },
+        finalization: waitingFinalization,
+      },
+    },
+    {
+      name: "finalization after identity review",
+      eligible: true,
+      row: {
+        status: "pending_review",
+        finalIngestionState: "pending_review",
+        aircraft: currentAircraftView,
+        avionics: completeAvionicsView,
+        reference: { status: "ready" },
+        finalization: { status: "ready", complete: true },
+      },
+    },
+    {
+      name: "factory reference only",
+      eligible: false,
+      reason: /Only factory-reference work remains/,
+      row: {
+        status: "verified",
+        finalIngestionState: "ready",
+        aircraft: currentAircraftView,
+        avionics: completeAvionicsView,
+        reference: { status: "pending_reference" },
+        finalization: { status: "ready", complete: true },
+      },
+    },
+    {
+      name: "FAA rejection",
+      eligible: false,
+      reason: /rejected by mandatory FAA admission/,
+      row: {
+        status: "blocked",
+        finalIngestionState: "pending_review",
+        aircraft: { status: "rejected", complete: false },
+        avionics: { status: "faa_rejected", complete: false },
+        reference: { status: "pending_reference" },
+        finalization: waitingFinalization,
+      },
+    },
+    {
+      name: "explicit block",
+      eligible: false,
+      reason: /blocked/,
+      row: {
+        status: "blocked",
+        finalIngestionState: "pending_review",
+        aircraft: currentAircraftView,
+        avionics: { status: "blocked", complete: false },
+        reference: { status: "pending_reference" },
+        finalization: waitingFinalization,
+      },
+    },
+    {
+      name: "automatic failure",
+      eligible: false,
+      reason: /failed/,
+      row: {
+        status: "failed",
+        finalIngestionState: "pending_review",
+        aircraft: { status: "failed", complete: false },
+        avionics: { status: "error", complete: false },
+        reference: { status: "pending_reference" },
+        finalization: { status: "failed", complete: false },
+      },
+    },
+    {
+      name: "manual-only review",
+      eligible: false,
+      reason: /Only manual review remains/,
+      row: {
+        status: "pending_review",
+        finalIngestionState: "pending_review",
+        hasPendingReview: true,
+        aircraft: currentAircraftView,
+        avionics: { status: "blocked", complete: false },
+        reference: { status: "pending_reference" },
+        finalization: waitingFinalization,
+      },
+    },
+  ];
+
+  for (const scenario of cases) {
+    const result = pipelineAutomaticEligibility(scenario.row);
+    assert.equal(result.eligible, scenario.eligible, scenario.name);
+    if (scenario.reason) {
+      assert.match(result.reason, scenario.reason, scenario.name);
+    }
+  }
 });
 
 test("normalizes durable run progress and terminal item outcomes", () => {

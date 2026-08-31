@@ -234,6 +234,129 @@ export function reviewAreaForAspect(aspect) {
   return typeof kind === "string" && kind.startsWith("avionics") ? "avionics" : null;
 }
 
+export function reviewPresentationSummary(review, decisionStates = []) {
+  const avionicsAspects = Array.isArray(review?.aspects)
+    ? review.aspects.filter((aspect) => reviewAreaForAspect(aspect) === "avionics")
+    : [];
+  const decisionsByAspect = new Map();
+  for (const decision of Array.isArray(decisionStates) ? decisionStates : []) {
+    const key = opaqueAspectKey(decision?.aspectId);
+    if (key === null) {
+      continue;
+    }
+    const previous = decisionsByAspect.get(key);
+    decisionsByAspect.set(key, {
+      valid: previous ? previous.valid && decision?.valid === true : decision?.valid === true,
+      dirty: (previous?.dirty ?? false) || decision?.dirty === true,
+    });
+  }
+
+  let decided = 0;
+  let hasDirtyCorrections = false;
+  for (const aspect of avionicsAspects) {
+    const decision = decisionsByAspect.get(opaqueAspectKey(aspect?.id));
+    if (decision?.valid === true) {
+      decided += 1;
+    }
+    if (decision?.dirty === true) {
+      hasDirtyCorrections = true;
+    }
+  }
+
+  const total = avionicsAspects.length;
+  const remaining = total - decided;
+  const aircraftVerified = aircraftIdentityIsVerified(review?.aircraft_identity);
+  const reviewPayloadPresent = nonBlankString(review?.review_payload_sha256);
+  const catalogRevisionPresent = nonBlankString(review?.catalog_revision_sha256);
+  const gates = {
+    aircraftVerified,
+    allAvionicsDecided: remaining === 0,
+    correctionsSaved: !hasDirtyCorrections,
+    reviewPayloadPresent,
+    catalogRevisionPresent,
+  };
+  const listingLabel = Number.isSafeInteger(review?.listing_id) && review.listing_id > 0
+    ? `Listing ${review.listing_id}`
+    : "Listing review";
+  const avionicsSubtitle = total === 0
+    ? "No avionics decisions"
+    : `${total} avionics ${pluralizeCount(total, "decision")}`;
+  const aircraftSubtitle = aircraftVerified
+    ? "Aircraft identity verified"
+    : "Aircraft curation required";
+  const progressText = remaining === 0
+    ? (total === 0
+      ? "No avionics decisions remain"
+      : `All ${total} avionics ${pluralizeCount(total, "decision")} complete`)
+    : `${remaining} of ${total} avionics ${pluralizeCount(remaining, "decision")} ${remaining === 1 ? "remains" : "remain"}`;
+
+  return {
+    aircraft: {
+      verified: aircraftVerified,
+      blocking: !aircraftVerified,
+    },
+    avionics: {
+      total,
+      decided,
+      remaining,
+      hasDirtyCorrections,
+    },
+    defaultArea: aircraftVerified ? "avionics" : "aircraft",
+    subtitle: `${listingLabel} · ${avionicsSubtitle} · ${aircraftSubtitle}`,
+    progress: aircraftVerified
+      ? progressText
+      : `${progressText} · aircraft curation required`,
+    manualReviewEligibility: {
+      eligible: Object.values(gates).every(Boolean),
+      gates,
+    },
+  };
+}
+
+export function canonicalProductSelectionConflicts(selections) {
+  const productOccurrences = new Map();
+  for (const selection of Array.isArray(selections) ? selections : []) {
+    if (!Number.isSafeInteger(selection?.productId) || selection.productId <= 0) {
+      continue;
+    }
+    const aspectKey = opaqueAspectKey(selection?.aspectId);
+    if (aspectKey === null) {
+      continue;
+    }
+    if (!productOccurrences.has(selection.productId)) {
+      productOccurrences.set(selection.productId, new Map());
+    }
+    const occurrences = productOccurrences.get(selection.productId);
+    if (!occurrences.has(aspectKey)) {
+      occurrences.set(aspectKey, selection.aspectId);
+    }
+  }
+  return [...productOccurrences.entries()]
+    .filter(([, occurrences]) => occurrences.size > 1)
+    .map(([productId, occurrences]) => ({
+      productId,
+      aspectIds: [...occurrences.values()],
+    }));
+}
+
+function opaqueAspectKey(value) {
+  if (typeof value === "string" && value.trim()) {
+    return `string:${value}`;
+  }
+  if (Number.isSafeInteger(value)) {
+    return `integer:${value}`;
+  }
+  return null;
+}
+
+function nonBlankString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function pluralizeCount(count, singular) {
+  return count === 1 ? singular : `${singular}s`;
+}
+
 export function preselectedReviewAction(aspect) {
   if (
     !aspect

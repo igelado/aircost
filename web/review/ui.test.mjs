@@ -54,3 +54,45 @@ test("keeps listing verification disabled while a correction is unsaved", () => 
   assert.match(reviewJs, /review_payload_sha256: review\.review_payload_sha256/);
   assert.match(reviewJs, /catalog_revision_sha256: review\.catalog_revision_sha256/);
 });
+
+test("names the three workflows by acceptance and residual-review purpose", () => {
+  assert.match(indexHtml, /id="review-mode-pipeline"[^>]*>Automatic acceptance<\/button>/);
+  assert.match(indexHtml, /id="review-mode-product"[^>]*>Known avionics products<\/button>/);
+  assert.match(indexHtml, /id="review-mode-listing"[^>]*>Manual review<\/button>/);
+  assert.match(
+    indexHtml,
+    /Each card is one retained occurrence\.[\s\S]*repeated cards are never merged automatically\./,
+  );
+});
+
+test("keeps aircraft and avionics review controls in their own panels", () => {
+  const aircraftPanel = indexHtml.match(
+    /id="review-aircraft-panel"[\s\S]*?<\/section>/,
+  )?.[0] ?? "";
+  const avionicsPanel = indexHtml.match(
+    /id="review-avionics-panel"[\s\S]*?<\/section>/,
+  )?.[0] ?? "";
+  assert.match(aircraftPanel, /id="review-aircraft-summary"/);
+  assert.doesNotMatch(aircraftPanel, /rebuild-avionics-review/);
+  assert.match(avionicsPanel, /id="rebuild-avionics-review"/);
+  assert.match(avionicsPanel, /id="review-avionics-aspects"/);
+});
+
+test("shows quantity and installation for known-product occurrences", () => {
+  assert.match(
+    indexHtml,
+    /<th>Observed text<\/th>\s*<th>Quantity<\/th>\s*<th>Installation<\/th>/,
+  );
+  assert.match(reviewJs, /reviewQuantity\(association\.quantity\)/);
+  assert.match(reviewJs, /displayLabel\(association\.configuration_action\)/);
+});
+
+test("blocks duplicate canonical selections before submitting manual review", () => {
+  assert.match(reviewJs, /canonicalProductSelectionConflicts/);
+  assert.match(reviewJs, /has-product-conflict/);
+  assert.match(
+    reviewJs,
+    /Two retained occurrences select the same canonical avionics product/,
+  );
+  assert.doesNotMatch(reviewJs, /review\.aspects\.length === 0/);
+});

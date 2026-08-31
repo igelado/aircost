@@ -24,6 +24,7 @@ import {
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
   characterLimitState,
+  canonicalProductSelectionConflicts,
   describeAircraftIdentity,
   describeProductAssociationOutcome,
   describeResolvedListingOutcome,
@@ -39,6 +40,7 @@ import {
   productAttestationDraft,
   productDetailRequestMayCommit,
   reviewAreaForAspect,
+  reviewPresentationSummary,
   reviewProductIdentitySourceValidation,
   runProductAssociationWorkers,
   summarizeProductAssociations,
@@ -436,15 +438,15 @@ function setQueueMode(mode, { load = true } = {}) {
   elements.reviewProductResults.classList.toggle("is-hidden", !productMode);
   elements.reviewResults.classList.toggle("is-hidden", !listingMode);
   elements.reviewQueueTitle.textContent = pipelineMode
-    ? "Verification pipeline"
+    ? "Automatic acceptance"
     : productMode
-      ? "Avionics needing verification"
-      : "Listings needing verification";
+      ? "Known avionics products"
+      : "Residual manual review";
   elements.reviewQueueDescription.textContent = pipelineMode
-    ? "Provider-free status across every non-ready listing."
+    ? "Run safe checks across non-ready listings. Only unambiguous, source-supported identities are accepted."
     : productMode
-      ? "Verify each catalog identity and reusable source independently, then validate eligible listing associations locally."
-      : "Review every unresolved aspect of one listing at a time.";
+      ? "Maintain one reusable manufacturer source per catalog identity, then validate only eligible exact occurrences locally."
+      : "Resolve only the aircraft and avionics evidence that automatic acceptance left pending.";
   for (const metric of document.querySelectorAll(".review-product-only-metric")) {
     metric.classList.toggle("is-hidden", !productMode);
   }
@@ -464,7 +466,7 @@ function setQueueMode(mode, { load = true } = {}) {
     }
   } else {
     elements.reviewPendingLabel.textContent = "Pending listings";
-    elements.reviewAspectLabel.textContent = "Pending checks";
+    elements.reviewAspectLabel.textContent = "Avionics occurrences";
     elements.reviewReasonLabel.textContent = "Issue types";
     if (state.queueLoaded) {
       renderQueue();
@@ -686,7 +688,7 @@ function pipelineTableRow(item) {
     checkbox.disabled = activeVerificationRunIsBusy();
     checkbox.setAttribute(
       "aria-label",
-      `Select ${item.label} for automatic verification`,
+      `Select ${item.label} for automatic acceptance`,
     );
     selection.append(checkbox);
   } else {
@@ -757,7 +759,7 @@ function pipelineTableRow(item) {
     unavailable.className = "review-pipeline-no-action";
     unavailable.textContent = activeVerificationRunIsBusy()
       && verificationRunIncludesListing(item.listingId)
-      ? "Automatic verification running"
+      ? "Safe automatic checks running"
       : item.reference.status === "pending_reference"
         ? "Identity review complete"
         : "No manual review available";
@@ -819,8 +821,8 @@ function renderPipelineSelection() {
   elements.reviewPipelineSelectionCount.textContent =
     `${selectedCount} ${pluralize(selectedCount, "listing")} selected`;
   elements.reviewPipelineVerify.textContent = selectedCount > 0
-    ? `Automatically verify ${selectedCount} selected`
-    : "Automatically verify selected";
+    ? `Run safe checks for ${selectedCount} selected`
+    : "Run safe checks for selected";
   elements.reviewPipelineVerify.disabled = busy || selectedCount === 0;
   elements.reviewPipelineSelectAll.disabled = busy || actionable.length === 0;
   const allSelected = actionable.length > 0
@@ -875,7 +877,7 @@ async function startVerificationRun(listingIds, { openedListing = false } = {}) 
     rows.length > 0
     && rows.some((row) => !pipelineAutomaticEligibility(row).eligible)
   ) {
-    const message = "Refresh the Pipeline before starting automatic verification.";
+    const message = "Refresh Automatic acceptance before starting safe checks.";
     if (openedListing) {
       setWorkspaceMessage(message, true);
     } else {
@@ -888,10 +890,10 @@ async function startVerificationRun(listingIds, { openedListing = false } = {}) 
     ? "This will discard the unsaved decisions in this review. "
     : "";
   const confirmed = window.confirm(
-    `${unsavedWarning}Automatically verify ${request.listing_ids.length} `
+    `${unsavedWarning}Run safe automatic checks for ${request.listing_ids.length} `
       + `${pluralize(request.listing_ids.length, "listing")}? `
       + "Local FAA and catalog checks run first. Unresolved identities may use paid Gemini calls. "
-      + `The current full Pipeline plan includes ${plan.aircraftGroundingCandidates} aircraft `
+      + `The current full Automatic acceptance plan includes ${plan.aircraftGroundingCandidates} aircraft `
       + `grounding ${pluralize(plan.aircraftGroundingCandidates, "candidate")} and estimates `
       + `${plan.minimumBaselineRequests} minimum avionics baseline requests, `
       + `${plan.allPositiveBaselineRequests} if all avionics identities are positive, `
@@ -905,9 +907,9 @@ async function startVerificationRun(listingIds, { openedListing = false } = {}) 
   state.verificationRunCreating = true;
   if (openedListing) {
     setAutomaticVerificationBusy(true);
-    setWorkspaceMessage("Creating a durable automatic verification run…");
+    setWorkspaceMessage("Creating a durable automatic acceptance run…");
   } else {
-    setQueueMessage("Creating a durable automatic verification run…");
+    setQueueMessage("Creating a durable automatic acceptance run…");
   }
   renderPipelineSelection();
   try {
@@ -933,12 +935,12 @@ async function startVerificationRun(listingIds, { openedListing = false } = {}) 
       await resumeVerificationRun(activeRunId);
     } else if (openedListing) {
       setWorkspaceMessage(
-        `Could not start automatic verification: ${error.message}`,
+        `Could not start automatic acceptance: ${error.message}`,
         true,
       );
     } else {
       setQueueMessage(
-        `Could not start automatic verification: ${error.message}`,
+        `Could not start automatic acceptance: ${error.message}`,
         true,
       );
     }
@@ -1054,7 +1056,7 @@ async function resumeVerificationRun(runId) {
       renderPipelineTable();
       renderPipelineSelection();
     }
-    const message = `Could not refresh automatic verification run: ${error.message}`;
+    const message = `Could not refresh automatic acceptance run: ${error.message}`;
     if (state.currentReview) {
       setWorkspaceMessage(message, true);
     } else {
@@ -1118,7 +1120,7 @@ async function cancelActiveVerificationRun() {
     });
     await resumeVerificationRun(runId);
   } catch (error) {
-    setQueueMessage(`Could not stop verification run: ${error.message}`, true);
+    setQueueMessage(`Could not stop automatic acceptance run: ${error.message}`, true);
   } finally {
     state.verificationRunCancelling = false;
     renderVerificationRun();
@@ -1133,7 +1135,7 @@ function renderVerificationRun() {
   }
   elements.reviewRun.classList.remove("is-hidden");
   const status = verificationRunStatusView(run.status);
-  elements.reviewRunTitle.textContent = `Verification run #${run.id}`;
+  elements.reviewRunTitle.textContent = `Automatic acceptance run #${run.id}`;
   elements.reviewRunStatus.textContent = run.status === "cancelled"
     ? "Stopped. The run stopped after its current listing."
     : `${status.label}. ${status.detail}`;
@@ -1259,7 +1261,7 @@ async function reconcileCompletedVerificationRun(run, sequence) {
   const item = state.activeVerificationRunItemByListing.get(listingId);
   if (!item) {
     setQueueMessage(
-      `Verification run #${run.id} ${run.status}. Review the terminal results below.`,
+      `Automatic acceptance run #${run.id} ${run.status}. Review the terminal results below.`,
     );
     return;
   }
@@ -1564,6 +1566,9 @@ function renderSelectedProduct() {
   elements.reviewProductValidate.disabled = !current
     || autoVerifiable.length === 0
     || state.productBusy;
+  elements.reviewProductValidate.textContent = autoVerifiable.length > 0
+    ? `Apply to ${autoVerifiable.length} eligible unique ${pluralize(autoVerifiable.length, "occurrence")}`
+    : "No eligible unique occurrences";
   elements.reviewProductRecover.disabled = !current
     || summary.needsSourceRecovery === 0
     || state.productBusy;
@@ -1614,6 +1619,16 @@ function renderProductAssociationRows() {
         "Observed text",
         evidenceDisplay.observedText,
       );
+      const quantity = queueTextCell(
+        "Quantity",
+        reviewQuantity(association.quantity),
+      );
+      const installation = queueTextCell(
+        "Installation",
+        nonBlank(association.configuration_action)
+          ? displayLabel(association.configuration_action)
+          : "Not recorded",
+      );
       const retainedEvidence = queueTextCell(
         "Retained source evidence",
         evidenceDisplay.sourceEvidenceText,
@@ -1630,7 +1645,7 @@ function renderProductAssociationRows() {
       );
       result.title = outcome.detail;
       result.classList.add(`review-outcome-${outcome.kind}`);
-      row.append(listing, observed, retainedEvidence, result);
+      row.append(listing, observed, quantity, installation, retainedEvidence, result);
       return row;
     }),
   );
@@ -2190,7 +2205,6 @@ function isReviewDetail(review, listingId) {
     || positiveInteger(review.listing_id) !== listingId
     || !Array.isArray(review.allowed_capabilities)
     || !Array.isArray(review.aspects)
-    || review.aspects.length === 0
     || !isAircraftIdentityStatus(review.aircraft_identity)
     || !nonBlank(review.review_payload_sha256)
     || !nonBlank(review.catalog_revision_sha256)
@@ -2246,13 +2260,8 @@ function renderReview() {
     return;
   }
   elements.reviewWorkspaceTitle.textContent = review.label || `Listing ${review.listing_id}`;
-  elements.reviewWorkspaceSubtitle.textContent = [
-    `Listing ${review.listing_id}`,
-    `${review.aspects.length} pending ${pluralize(review.aspects.length, "avionics check")}`,
-    ...(!aircraftIdentityIsVerified(review.aircraft_identity)
-      ? ["Aircraft curation required"]
-      : []),
-  ].join(" · ");
+  const presentation = currentReviewPresentation();
+  elements.reviewWorkspaceSubtitle.textContent = presentation.subtitle;
   renderSource(review);
   renderAircraftSummary(review);
   state.aspectViews.clear();
@@ -2267,12 +2276,12 @@ function renderReview() {
     ),
   );
   elements.reviewAvionicsAspects.setAttribute("aria-busy", "false");
-  const aircraftBlockerCount = aircraftIdentityIsVerified(review.aircraft_identity) ? 0 : 1;
+  const aircraftBlockerCount = presentation.aircraft.blocking ? 1 : 0;
   elements.reviewAircraftTabCount.textContent = String(aircraftBlockerCount);
   elements.reviewAvionicsTabCount.textContent = String(avionicsAspects.length);
   const requestedArea = reviewAreaFromLocation();
   setActiveReviewArea(
-    requestedArea ?? (aircraftBlockerCount ? "aircraft" : "avionics"),
+    requestedArea ?? presentation.defaultArea,
     { updateLocation: requestedArea === null },
   );
   elements.reviewStale.classList.add("is-hidden");
@@ -2603,16 +2612,15 @@ function renderAspect(aspect, index, total) {
   const eyebrow = document.createElement("span");
   eyebrow.className = "review-eyebrow";
   eyebrow.textContent = [
-    displayLabel(aspect.kind || "aspect"),
+    `Occurrence ${index + 1} of ${total}`,
     displayLabel(aspect.configuration_action || "installed"),
-    `${index + 1} of ${total}`,
   ].join(" · ");
   const title = document.createElement("h3");
-  title.textContent = aspect.label || `Aspect ${index + 1}`;
+  title.textContent = aspect.label || `Avionics occurrence ${index + 1}`;
   headingGroup.append(eyebrow, title);
   const status = document.createElement("span");
   status.className = "review-decision-status pending";
-  status.textContent = "Needs decision";
+  status.textContent = "Review required";
   header.append(headingGroup, status);
 
   const context = document.createElement("div");
@@ -2642,13 +2650,13 @@ function renderAspect(aspect, index, total) {
   observation.className = "review-observation";
   const observationLabel = document.createElement("span");
   observationLabel.className = "review-eyebrow";
-  observationLabel.textContent = "Observed in listing";
+  observationLabel.textContent = "Extracted occurrence";
   const observationText = document.createElement("p");
   observationText.textContent = aspect.observed_text || "No source observation recorded.";
   const observationMetadata = document.createElement("dl");
   observationMetadata.className = "review-observation-metadata";
   observationMetadata.append(
-    reviewMetadataItem("Quantity", reviewQuantity(aspect.quantity)),
+    reviewMetadataItem("Explicit quantity", reviewQuantity(aspect.quantity)),
     reviewMetadataItem(
       "Source confidence",
       nonBlank(aspect.source_confidence)
@@ -2688,7 +2696,7 @@ function renderAspect(aspect, index, total) {
     sourceStatus.className = `review-catalog-message ${sourceCurrent ? "review-status-current" : "review-status-required"}`;
     sourceStatus.textContent = sourceCurrent
       ? "Reusable manufacturer source is current."
-      : "Reusable manufacturer source check is still required in By product.";
+      : "Reusable manufacturer source check is still required in Known avionics products.";
     const associationAction = document.createElement("button");
     associationAction.type = "button";
     associationAction.className = "button";
@@ -3295,12 +3303,52 @@ function syncAspectView(key) {
   for (const [action, panel] of view.panels) {
     panel.classList.toggle("is-hidden", draft.action !== action);
   }
-  const validation = validateDraft(draft);
+  const conflict = currentCanonicalProductConflicts().find(
+    (item) => item.aspectIds.some((aspectId) => aspectKey(aspectId) === key),
+  );
+  const validation = conflict
+    ? {
+      valid: false,
+      message: "This canonical product is selected for another retained occurrence. Keep one source-supported occurrence with the explicit total quantity, discard a duplicate observation, or choose the genuinely different product variant.",
+    }
+    : validateDraft(draft);
   view.article.classList.toggle("is-decided", validation.valid);
+  view.article.classList.toggle("has-product-conflict", conflict !== undefined);
   view.status.className = `review-decision-status ${validation.valid ? "decided" : "pending"}`;
-  view.status.textContent = validation.valid ? "Decided" : "Needs decision";
+  view.status.textContent = validation.valid
+    ? "Decision ready"
+    : conflict
+      ? "Duplicate product selection"
+      : "Review required";
   view.validation.classList.toggle("error", draft.action !== null && !validation.valid);
   view.validation.textContent = validation.message;
+}
+
+function currentCanonicalProductConflicts() {
+  return canonicalProductSelectionConflicts(
+    Array.from(state.drafts.values()).map((draft) => ({
+      aspectId: draft.aspect?.id,
+      productId: draft.action === "use_verified_product"
+        ? positiveInteger(draft.catalogProduct?.id)
+        : null,
+      quantity: draft.correction?.quantity,
+    })),
+  );
+}
+
+function currentReviewPresentation() {
+  const conflictAspectIds = new Set(
+    currentCanonicalProductConflicts().flatMap((conflict) => (
+      conflict.aspectIds.map(aspectKey)
+    )),
+  );
+  const decisionStates = Array.from(state.drafts.values()).map((draft) => ({
+    aspectId: draft.aspect?.id,
+    valid: validateDraft(draft).valid
+      && !conflictAspectIds.has(aspectKey(draft.aspect?.id)),
+    dirty: draft.correction?.dirty === true || draft.correction?.saving === true,
+  }));
+  return reviewPresentationSummary(state.currentReview, decisionStates);
 }
 
 function validateDraft(draft) {
@@ -3402,17 +3450,13 @@ function validDraftResult(draft, message) {
 
 function updateProgress() {
   const drafts = Array.from(state.drafts.values());
-  const decided = drafts.filter((draft) => validateDraft(draft).valid).length;
-  const total = drafts.length;
-  const aircraftVerified = aircraftIdentityIsVerified(
-    state.currentReview?.aircraft_identity,
-  );
+  const presentation = currentReviewPresentation();
+  const { decided, total, remaining } = presentation.avionics;
+  const aircraftVerified = presentation.aircraft.verified;
+  elements.reviewWorkspaceSubtitle.textContent = presentation.subtitle;
   elements.reviewProgress.max = Math.max(total, 1);
   elements.reviewProgress.value = decided;
-  elements.reviewProgressLabel.textContent = [
-    `${decided} of ${total} avionics decided`,
-    ...(!aircraftVerified ? ["aircraft curation required"] : []),
-  ].join(" · ");
+  elements.reviewProgressLabel.textContent = presentation.progress;
   elements.reviewAircraftTabCount.textContent = aircraftVerified ? "0" : "1";
   elements.reviewAircraftTab.setAttribute(
     "aria-label",
@@ -3424,18 +3468,13 @@ function updateProgress() {
   elements.reviewAvionicsTab.setAttribute(
     "aria-label",
     `Avionics, ${total} ${pluralize(total, "decision")}, `
-      + `${decided} decided, ${total - decided} remaining`,
+      + `${decided} decided, ${remaining} remaining`,
   );
-  const hashesPresent = nonBlank(state.currentReview?.review_payload_sha256)
-    && nonBlank(state.currentReview?.catalog_revision_sha256);
   elements.verifyListing.disabled = state.resolving
     || state.automating
     || state.stale
     || !state.currentReview
-    || decided !== total
-    || drafts.some((draft) => draft.correction.dirty || draft.correction.saving)
-    || !hashesPresent
-    || !aircraftVerified;
+    || !presentation.manualReviewEligibility.eligible;
   elements.rebuildAvionicsReview.disabled = state.resolving
     || state.automating
     || state.stale
@@ -3604,8 +3643,24 @@ async function resolveReview() {
     return;
   }
   const drafts = Array.from(state.drafts.values());
+  const productConflicts = currentCanonicalProductConflicts();
+  if (productConflicts.length > 0) {
+    const firstConflictKey = aspectKey(productConflicts[0].aspectIds[0]);
+    setWorkspaceMessage(
+      "Two retained occurrences select the same canonical avionics product. Keep one occurrence with the exact source-supported quantity, discard a duplicate observation, or select the genuinely different product variant.",
+      true,
+    );
+    setActiveReviewArea("avionics", { updateLocation: true });
+    state.aspectViews.get(firstConflictKey)?.article.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+    syncAllAspectViews();
+    updateProgress();
+    return;
+  }
   if (drafts.some((draft) => !validateDraft(draft).valid)) {
-    setWorkspaceMessage("Resolve every pending check before verifying the listing.", true);
+    setWorkspaceMessage("Resolve every residual avionics occurrence before completing the manual review.", true);
     setActiveReviewArea("avionics", { updateLocation: true });
     const firstInvalid = drafts.find((draft) => !validateDraft(draft).valid);
     state.aspectViews.get(aspectKey(firstInvalid?.aspect?.id))?.article.scrollIntoView({
@@ -3626,7 +3681,7 @@ async function resolveReview() {
   const resolvedListingId = review.listing_id;
   state.resolving = true;
   updateProgress();
-  setWorkspaceMessage("Saving review decisions and completing final enrichment…");
+  setWorkspaceMessage("Saving the manual review and completing final enrichment…");
   setButtonBusy(elements.verifyListing, true);
   try {
     const payload = await api(`/api/review/listings/${resolvedListingId}/resolve`, {

@@ -1243,6 +1243,10 @@ label span,
   min-height: 32px;
 }
 
+.review-mode-switch {
+  flex-wrap: wrap;
+}
+
 .review-mode-switch .button.is-active {
   border-color: var(--accent);
   background: var(--accent);
@@ -1740,23 +1744,36 @@ label span,
 }
 
 .review-product-association-table {
-  min-width: 760px;
+  min-width: 1040px;
 }
 
 .review-product-association-table th:nth-child(1) {
-  width: 22%;
+  width: 17%;
 }
 
 .review-product-association-table th:nth-child(2) {
-  width: 24%;
+  width: 20%;
 }
 
 .review-product-association-table th:nth-child(3) {
-  width: 34%;
+  width: 8%;
 }
 
 .review-product-association-table th:nth-child(4) {
-  width: 20%;
+  width: 12%;
+}
+
+.review-product-association-table th:nth-child(5) {
+  width: 27%;
+}
+
+.review-product-association-table th:nth-child(6) {
+  width: 16%;
+}
+
+.review-product-association-table td:nth-child(3),
+.review-product-association-table td:nth-child(4) {
+  white-space: nowrap;
 }
 
 .review-association-source {
@@ -1955,6 +1972,41 @@ label span,
   display: none;
 }
 
+.review-avionics-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 0 14px 12px;
+}
+
+.review-avionics-tools p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.review-occurrence-method {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0 14px 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line));
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 6%, var(--panel));
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.review-occurrence-method strong {
+  flex: 0 0 auto;
+  color: var(--text);
+}
+
 .review-aircraft-summary {
   min-height: 220px;
   padding: 0 14px 14px;
@@ -2109,6 +2161,11 @@ label span,
 .review-aspect-card.is-decided {
   border-color: #98d3ca;
   box-shadow: 0 0 0 1px rgba(15, 118, 110, 0.08);
+}
+
+.review-aspect-card.has-product-conflict {
+  border-color: rgba(177, 77, 48, 0.5);
+  box-shadow: inset 4px 0 0 rgba(177, 77, 48, 0.72);
 }
 
 .review-aspect-header {
@@ -2844,6 +2901,16 @@ label span,
   .review-workspace-actions {
     align-items: stretch;
     flex-direction: column;
+    width: 100%;
+  }
+
+  .review-avionics-tools,
+  .review-occurrence-method {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .review-avionics-tools .button {
     width: 100%;
   }
 
