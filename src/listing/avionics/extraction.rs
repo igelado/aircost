@@ -356,7 +356,7 @@ impl AvionicsValidationRule {
                 "occurrence duplicates an earlier normalized manufacturer/model identity"
             }
             Self::QuantityEvidenceIncomplete => {
-                "source_evidence_text does not cover the complete bounded Controller quantity ambiguity"
+                "source_evidence_text cannot be bounded to one Controller item or does not cover the complete bounded Controller quantity ambiguity"
             }
             Self::ExplicitlyInoperativeInstallation => {
                 "installed occurrence is explicitly marked inoperative and cannot represent working current-configuration avionics"
@@ -1416,13 +1416,21 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
             .as_deref()
             .expect("the canonical parser requires occurrence evidence")
             .trim();
-        let Some(signal) = controller_quantity_ambiguity_signal(
+        let signal = match controller_quantity_ambiguity_signal(
             &installed_equipment,
             observation.manufacturer.as_deref().unwrap_or_default(),
             &observation.model,
             evidence,
-        ) else {
-            continue;
+        ) {
+            QuantityAmbiguity::Bounded(signal) => signal,
+            QuantityAmbiguity::Absent => continue,
+            QuantityAmbiguity::Unbounded => {
+                return Err(AvionicsValidationFailure::occurrence(
+                    AvionicsValidationRule::QuantityEvidenceIncomplete,
+                    index,
+                    AvionicsValidationField::SourceEvidenceText,
+                ));
+            }
         };
         if observation.source_confidence.as_deref() == Some("high") {
             return Err(AvionicsValidationFailure::occurrence(
@@ -1431,7 +1439,14 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
                 AvionicsValidationField::SourceConfidence,
             ));
         }
-        if !evidence.contains(&installed_equipment[signal.start..signal.end]) {
+        let Some(ambiguity) = installed_equipment.get(signal.start..signal.end) else {
+            return Err(AvionicsValidationFailure::occurrence(
+                AvionicsValidationRule::QuantityEvidenceIncomplete,
+                index,
+                AvionicsValidationField::SourceEvidenceText,
+            ));
+        };
+        if !evidence.contains(ambiguity) {
             return Err(AvionicsValidationFailure::occurrence(
                 AvionicsValidationRule::QuantityEvidenceIncomplete,
                 index,
@@ -1469,12 +1484,18 @@ struct IdentityRange {
     end: usize,
 }
 
+enum QuantityAmbiguity {
+    Absent,
+    Bounded(IdentityRange),
+    Unbounded,
+}
+
 fn controller_quantity_ambiguity_signal(
     source: &str,
     manufacturer: &str,
     model: &str,
     evidence: &str,
-) -> Option<IdentityRange> {
+) -> QuantityAmbiguity {
     let ranges = normalized_identity_occurrence_ranges(source, model);
     let mut ambiguity = (ranges.len() > 1).then(|| IdentityRange {
         start: ranges.first().expect("two ranges have a first").start,
@@ -1484,11 +1505,15 @@ fn controller_quantity_ambiguity_signal(
         include_ambiguity_range(&mut ambiguity, run_on_dual);
     }
     for range in &ranges {
-        if let Some(marker) = quantity_marker_in_identity_item(source, *range, manufacturer) {
-            include_ambiguity_range(&mut ambiguity, marker);
+        match quantity_marker_in_identity_item(source, *range, manufacturer) {
+            QuantityAmbiguity::Bounded(marker) => {
+                include_ambiguity_range(&mut ambiguity, marker);
+            }
+            QuantityAmbiguity::Absent => {}
+            QuantityAmbiguity::Unbounded => return QuantityAmbiguity::Unbounded,
         }
     }
-    ambiguity
+    ambiguity.map_or(QuantityAmbiguity::Absent, QuantityAmbiguity::Bounded)
 }
 
 fn include_ambiguity_range(ambiguity: &mut Option<IdentityRange>, range: IdentityRange) {
@@ -1615,10 +1640,11 @@ struct SourceWord {
     end: usize,
 }
 
-fn source_words(source: &str, start: usize, end: usize) -> Vec<SourceWord> {
+fn source_words(source: &str, start: usize, end: usize) -> Option<Vec<SourceWord>> {
+    let source_range = source.get(start..end)?;
     let mut words = Vec::new();
     let mut word_start = None;
-    for (relative, character) in source[start..end].char_indices() {
+    for (relative, character) in source_range.char_indices() {
         let offset = start + relative;
         if character.is_ascii_alphanumeric() {
             word_start.get_or_insert(offset);
@@ -1637,16 +1663,26 @@ fn source_words(source: &str, start: usize, end: usize) -> Vec<SourceWord> {
             end,
         });
     }
-    words
+    Some(words)
 }
 
 fn quantity_marker_in_identity_item(
     source: &str,
     identity: IdentityRange,
     manufacturer: &str,
-) -> Option<IdentityRange> {
-    let (item_start, item_end) = item_bounds(source, identity.start);
-    let item_words = source_words(source, item_start, item_end);
+) -> QuantityAmbiguity {
+    let Some((item_start, item_end)) = item_bounds(source, identity.start) else {
+        return QuantityAmbiguity::Unbounded;
+    };
+    if identity.start < item_start || identity.end > item_end || identity.start > identity.end {
+        return QuantityAmbiguity::Unbounded;
+    }
+    let Some(item_source) = source.get(item_start..item_end) else {
+        return QuantityAmbiguity::Unbounded;
+    };
+    let Some(item_words) = source_words(source, item_start, item_end) else {
+        return QuantityAmbiguity::Unbounded;
+    };
     let item_range = || {
         let start = item_words.first().map_or(identity.start, |word| word.start);
         let end = item_words.last().map_or(identity.end, |word| word.end);
@@ -1659,20 +1695,24 @@ fn quantity_marker_in_identity_item(
         || item_words
             .iter()
             .any(|word| decimal_quantity_is_multiplier(&word.value))
-        || source[item_start..item_end]
-            .match_indices('#')
-            .any(|(offset, _)| {
-                source[item_start + offset + 1..item_end]
-                    .bytes()
-                    .next()
-                    .is_some_and(|byte| byte.is_ascii_digit())
-            })
+        || item_source.match_indices('#').any(|(offset, _)| {
+            source
+                .get(item_start + offset + 1..item_end)
+                .unwrap_or_default()
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_digit())
+        })
     {
-        return Some(item_range());
+        return QuantityAmbiguity::Bounded(item_range());
     }
 
-    let words = source_words(source, item_start, identity.start);
-    let manufacturer_words = source_words(manufacturer, 0, manufacturer.len());
+    let Some(words) = source_words(source, item_start, identity.start) else {
+        return QuantityAmbiguity::Unbounded;
+    };
+    let Some(manufacturer_words) = source_words(manufacturer, 0, manufacturer.len()) else {
+        return QuantityAmbiguity::Unbounded;
+    };
     let mut end = words.len();
     if !manufacturer_words.is_empty()
         && words
@@ -1687,7 +1727,10 @@ fn quantity_marker_in_identity_item(
     }
     let plain_decimal_prefix = end.checked_sub(1).is_some_and(|last_word| {
         let word = &words[last_word];
-        let prefix = source[item_start..word.start].trim_end();
+        let Some(prefix) = source.get(item_start..word.start) else {
+            return false;
+        };
+        let prefix = prefix.trim_end();
         decimal_quantity_word(&word.value)
             && !prefix.ends_with('#')
             && prefix
@@ -1695,14 +1738,20 @@ fn quantity_marker_in_identity_item(
                 .next_back()
                 .is_none_or(|character| matches!(character, ':' | '('))
     });
-    let after_words = source_words(source, identity.end, item_end);
+    let Some(after_words) = source_words(source, identity.end, item_end) else {
+        return QuantityAmbiguity::Unbounded;
+    };
     let labeled_decimal_suffix = after_words
         .first()
         .is_some_and(|word| decimal_quantity_word(&word.value))
         && after_words
             .get(1)
             .is_some_and(|word| matches!(word.value.as_str(), "unit" | "units" | "each" | "ea"));
-    (plain_decimal_prefix || labeled_decimal_suffix).then(item_range)
+    if plain_decimal_prefix || labeled_decimal_suffix {
+        QuantityAmbiguity::Bounded(item_range())
+    } else {
+        QuantityAmbiguity::Absent
+    }
 }
 
 fn decimal_quantity_word(value: &str) -> bool {
@@ -1717,14 +1766,42 @@ fn decimal_quantity_is_multiplier(value: &str) -> bool {
     (value.starts_with('x') || value.ends_with('x')) && decimal_quantity_word(value)
 }
 
-fn item_bounds(source: &str, offset: usize) -> (usize, usize) {
-    let start = source[..offset]
-        .rfind([',', ';', '\r', '\n'])
-        .map_or(0, |index| index + 1);
-    let end = source[offset..]
-        .find([',', ';', '\r', '\n'])
-        .map_or(source.len(), |index| offset + index);
-    (start, end)
+fn item_bounds(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let before = source.get(..offset)?;
+    let after = source.get(offset..)?;
+    let start = before
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            controller_item_delimiter(source, index, character).then_some(index + 1)
+        })
+        .unwrap_or(0);
+    let end = after
+        .char_indices()
+        .find_map(|(relative, character)| {
+            let index = offset + relative;
+            controller_item_delimiter(source, index, character).then_some(index)
+        })
+        .unwrap_or(source.len());
+    Some((start, end))
+}
+
+fn controller_item_delimiter(source: &str, index: usize, character: char) -> bool {
+    match character {
+        ';' | '\r' | '\n' => true,
+        ',' => {
+            let preceding_is_digit = source
+                .get(..index)
+                .and_then(|prefix| prefix.chars().next_back())
+                .is_some_and(|character| character.is_ascii_digit());
+            let following_is_digit = source
+                .get(index + character.len_utf8()..)
+                .and_then(|suffix| suffix.chars().next())
+                .is_some_and(|character| character.is_ascii_digit());
+            !(preceding_is_digit && following_is_digit)
+        }
+        _ => false,
+    }
 }
 
 fn validate_current_avionics_identity_evidence_occurrence(
@@ -3568,6 +3645,41 @@ mod tests {
                 error.contains("complete bounded Controller quantity ambiguity"),
                 "{field:?}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn numeric_model_punctuation_does_not_split_a_controller_item() {
+        let field = "EDM-900 Engine Management System\n\
+GTX-345 Transpoder\n\
+Centry 2,000 Autopilot\n\
+Bendix King KN 64 DME\n\
+Garmin 430W GPS\n\
+TKM Mx-170B NAV/COM\n\
+Aspen EFD 1000 Pilot Pro PFD w/Synthetic Vision";
+        let evidence = "Centry 2,000 Autopilot";
+
+        for confidence in ["high", "medium", "low"] {
+            let mut payload = installed("Centry", "2000", evidence);
+            payload["avionics"][0]["source_confidence"] = serde_json::json!(confidence);
+            let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+            validate_current_avionics_quantity_completeness(
+                &observations,
+                CONTROLLER_URL,
+                &controller_html(field),
+            )
+            .expect("a comma inside a numeric product model is not an item delimiter");
+        }
+    }
+
+    #[test]
+    fn every_controller_item_delimiter_bounds_normalized_identities() {
+        for delimiter in [",", ";", "\r", "\n"] {
+            let source = format!("Garmin GTN{delimiter}750 installed");
+            assert!(matches!(
+                controller_quantity_ambiguity_signal(&source, "Garmin", "GTN 750", source.as_str(),),
+                QuantityAmbiguity::Unbounded
+            ));
         }
     }
 
