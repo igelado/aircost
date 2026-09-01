@@ -6778,11 +6778,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_reextraction_rejects_an_unresolved_repeated_identity_after_one_correction() {
+    async fn durable_reextraction_checkpoints_a_bounded_uncertain_candidate_after_correction() {
         let html = trusted_controller_role_html(
             "Garmin G5 attitude, Garmin G5 HSI, Garmin GTX 345 transponder, Garmin G5 standby display",
         );
-        let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
+        let candidate = json!([{
             "manufacturer": "Garmin",
             "model": "G5",
             "types": ["Flight Display", "AHRS"],
@@ -6791,12 +6791,13 @@ mod tests {
             "replaces": null,
             "source_evidence_text": "Garmin G5 attitude",
             "source_confidence": "high"
-        }]))
-        .await;
+        }]);
+        let (endpoint, request_count, server) =
+            spawn_listing_extraction_sequence_endpoint(vec![candidate.clone(), candidate]).await;
         let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
         let prior = retained_legacy_listing_extraction().to_string();
 
-        let error = reextract_avionics(
+        let reextracted = reextract_avionics(
             &extractor,
             &clean_listing_html(&html),
             &ListingEvidenceContext::from_listing_capture(
@@ -6808,11 +6809,20 @@ mod tests {
             Some(&prior),
         )
         .await
-        .unwrap_err();
+        .unwrap();
         server.abort();
 
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
-        assert!(error.contains("ambiguous Controller quantity evidence"));
+        assert_eq!(reextracted.avionics.len(), 1);
+        assert_eq!(reextracted.avionics[0].quantity, 1);
+        assert_eq!(
+            reextracted.avionics[0].source_confidence.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            reextracted.avionics[0].source_evidence_text.as_deref(),
+            Some("G5 attitude, Garmin G5 HSI, Garmin GTX 345 transponder, Garmin G5")
+        );
     }
 
     #[test]

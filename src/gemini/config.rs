@@ -23,6 +23,7 @@ const DEFAULT_GROUNDED_MODEL: &str = "gemini-3.5-flash";
 const DEFAULT_CURATION_MODEL: &str = "gemini-3.5-flash-lite";
 const DEFAULT_VISUAL_MODEL: &str = "gemini-3.1-flash-lite";
 const DEFAULT_GENERATE_CONTENT_MAX_OUTPUT_TOKENS: u64 = 4_096;
+const DEFAULT_LISTING_EXTRACTION_MAX_OUTPUT_TOKENS: u64 = 12_000;
 const DEFAULT_CURATION_MAX_OUTPUT_TOKENS: u64 = 12_000;
 const DEFAULT_BENCHMARK_SAMPLE_SIZE: usize = 10;
 const DEFAULT_BENCHMARK_SEED: u64 = 20_260_721;
@@ -295,7 +296,7 @@ impl Default for GeminiRuntimeConfig {
         let mut listing_extraction = TaskRoute::new(
             DEFAULT_LISTING_MODEL,
             ThinkingLevel::Low,
-            DEFAULT_GENERATE_CONTENT_MAX_OUTPUT_TOKENS,
+            DEFAULT_LISTING_EXTRACTION_MAX_OUTPUT_TOKENS,
         );
         listing_extraction.fallback_model = Some(DEFAULT_GROUNDED_MODEL.to_string());
         listing_extraction.fallback_thinking_level = Some(ThinkingLevel::Low);
@@ -964,7 +965,7 @@ mod tests {
         assert_eq!(route.thinking_level, ThinkingLevel::Low);
         assert_eq!(route.fallback_model.as_deref(), Some("gemini-3.5-flash"));
         assert_eq!(route.fallback_thinking_level, Some(ThinkingLevel::Low));
-        assert_eq!(route.max_output_tokens, 4_096);
+        assert_eq!(route.max_output_tokens, 12_000);
     }
 
     fn assert_lite_only_avionics_curation_routes(config: &GeminiRuntimeConfig) {

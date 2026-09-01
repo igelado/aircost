@@ -12,7 +12,9 @@ model = "gemini-3.5-flash-lite"
 fallback_model = "gemini-3.5-flash"
 thinking_level = "low"
 fallback_thinking_level = "low"
-max_output_tokens = 4096
+# Includes model thinking tokens. Leave enough headroom for a complete bounded
+# correction array on listings with many installed avionics.
+max_output_tokens = 12000
 # service_tier = "flex"
 
 [tasks.grounded_metadata]
