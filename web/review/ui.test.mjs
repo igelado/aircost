@@ -143,3 +143,17 @@ test("prevents selecting an explicitly non-reusable approved catalog product", (
   assert.match(reviewJs, /Known avionics products before selection/);
   assert.match(appCss, /\.review-catalog-result\.not-reusable/);
 });
+
+test("brings the product review workspace into view from a queue row action", () => {
+  assert.match(
+    indexHtml,
+    /id="review-product-workspace"[^>]*tabindex="-1"/,
+  );
+  const openProductReview = reviewJs.match(
+    /async function openProductReview\(productId\) \{[\s\S]*?\n\}/,
+  )?.[0] ?? "";
+  assert.match(openProductReview, /classList\.remove\("is-hidden"\)/);
+  assert.match(openProductReview, /focus\(\{ preventScroll: true \}\)/);
+  assert.match(openProductReview, /scrollIntoView\(\{/);
+  assert.match(openProductReview, /behavior: "smooth"/);
+});

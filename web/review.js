@@ -1493,6 +1493,11 @@ async function openProductReview(productId) {
   const sequence = ++state.productDetailRequestSequence;
   elements.reviewProductWorkspace.classList.remove("is-hidden");
   elements.reviewProductActionMessage.textContent = "Loading product associations…";
+  elements.reviewProductWorkspace.focus({ preventScroll: true });
+  elements.reviewProductWorkspace.scrollIntoView({
+    behavior: "smooth",
+    block: "start",
+  });
   try {
     const detail = await loadAllProductAssociations(productId, sequence);
     if (!productDetailRequestMayCommit(productId, sequence, state)) {
