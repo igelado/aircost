@@ -1168,8 +1168,8 @@ function readAvionicsRows() {
     const manufacturer = row.querySelector('[name="avionics_manufacturer"]').value.trim();
     const model = row.querySelector('[name="avionics_model"]').value.trim();
     const types = Array.from(
-      row.querySelector('[name="avionics_types"]').selectedOptions,
-      (option) => option.value,
+      row.querySelectorAll('[name="avionics_types"]:checked'),
+      (checkbox) => checkbox.value,
     );
     const quantity = Number.parseInt(row.querySelector('[name="avionics_quantity"]').value, 10) || 1;
     const hasAnyValue = manufacturer || model;
@@ -1198,7 +1198,7 @@ function addAvionicsRow(item = {}) {
   row.append(
     avionicsInput("avionics_manufacturer", "Manufacturer", item.manufacturer),
     avionicsInput("avionics_model", "Model", item.model),
-    avionicsTypeSelect(item.types || item.avionics_types),
+    avionicsTypeDropdown(item.types || item.avionics_types),
     avionicsInput("avionics_quantity", "Qty", item.quantity || 1, "number"),
     removeAvionicsButton(row),
   );
@@ -1218,22 +1218,57 @@ function avionicsInput(name, placeholder, value = "", type = "text") {
   return input;
 }
 
-function avionicsTypeSelect(values = []) {
-  const select = document.createElement("select");
-  select.name = "avionics_types";
-  select.multiple = true;
-  select.size = 3;
-  select.title = "Select one or more avionics capabilities";
-  select.setAttribute("aria-label", "Avionics capabilities");
+function avionicsTypeDropdown(values = []) {
+  const dropdown = document.createElement("details");
+  dropdown.className = "avionics-type-dropdown";
+
+  const summary = document.createElement("summary");
+  summary.setAttribute("aria-label", "Choose avionics capabilities");
+
+  const menu = document.createElement("div");
+  menu.className = "avionics-type-menu";
+  menu.setAttribute("role", "group");
+  menu.setAttribute("aria-label", "Avionics capabilities");
+
   const selectedTypes = new Set(Array.isArray(values) ? values : []);
   for (const type of AVIONICS_TYPES) {
-    const option = document.createElement("option");
-    option.value = type;
-    option.textContent = type;
-    option.selected = selectedTypes.has(type);
-    select.append(option);
+    const label = document.createElement("label");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.name = "avionics_types";
+    checkbox.value = type;
+    checkbox.checked = selectedTypes.has(type);
+    label.append(checkbox, document.createTextNode(type));
+    menu.append(label);
   }
-  return select;
+
+  const updateSummary = () => {
+    const selected = Array.from(
+      menu.querySelectorAll('[name="avionics_types"]:checked'),
+      (checkbox) => checkbox.value,
+    );
+    summary.textContent = selected.length === 0
+      ? "Capabilities"
+      : selected.length === 1
+        ? selected[0]
+        : `${selected.length} capabilities`;
+    summary.title = selected.length ? selected.join(", ") : "Choose avionics capabilities";
+  };
+  menu.addEventListener("change", updateSummary);
+  dropdown.addEventListener("toggle", () => {
+    if (!dropdown.open) {
+      return;
+    }
+    for (const other of elements.avionicsList.querySelectorAll(".avionics-type-dropdown[open]")) {
+      if (other !== dropdown) {
+        other.open = false;
+      }
+    }
+  });
+
+  dropdown.append(summary, menu);
+  updateSummary();
+  return dropdown;
 }
 
 function removeAvionicsButton(row) {
