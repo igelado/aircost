@@ -675,6 +675,84 @@ label span,
   margin-top: 0;
 }
 
+.avionics-type-dropdown {
+  position: relative;
+  min-width: 0;
+}
+
+.avionics-type-dropdown > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 7px 9px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.avionics-type-dropdown > summary::-webkit-details-marker {
+  display: none;
+}
+
+.avionics-type-dropdown > summary::after {
+  flex: 0 0 auto;
+  content: "▾";
+  color: var(--muted);
+}
+
+.avionics-type-dropdown[open] > summary,
+.avionics-type-dropdown > summary:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.14);
+}
+
+.avionics-type-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  left: 0;
+  display: grid;
+  width: max(240px, 100%);
+  max-height: 260px;
+  padding: 6px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: var(--shadow);
+}
+
+.avionics-type-menu label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.avionics-type-menu label:hover {
+  background: var(--panel-soft);
+}
+
+.avionics-type-menu input {
+  width: auto;
+  min-height: 0;
+  margin: 0;
+}
+
 .form-actions {
   display: flex;
   justify-content: flex-end;

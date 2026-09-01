@@ -3,7 +3,18 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const indexHtml = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+const appCss = readFileSync(new URL("../app.css", import.meta.url), "utf8");
+const appJs = readFileSync(new URL("../app.js", import.meta.url), "utf8");
 const reviewJs = readFileSync(new URL("../review.js", import.meta.url), "utf8");
+
+test("uses a compact multi-capability dropdown in listing avionics rows", () => {
+  assert.match(appJs, /function avionicsTypeDropdown\(values = \[\]\)/);
+  assert.match(appJs, /querySelectorAll\('\[name="avionics_types"\]:checked'\)/);
+  assert.match(appJs, /checkbox\.type = "checkbox"/);
+  assert.doesNotMatch(appJs, /select\.multiple = true/);
+  assert.match(appCss, /\.avionics-type-dropdown > summary/);
+  assert.match(appCss, /\.avionics-type-menu/);
+});
 
 test("provides an accessible render target for pipeline backlog categories", () => {
   assert.match(
