@@ -365,7 +365,7 @@ pub async fn replay_captures(
                         match inspect_plugin_replay_capture_state(db, owner.id, submission_id).await
                         {
                             Ok(state)
-                                if reconcile_materialization_domain_state(
+                                if Box::pin(reconcile_materialization_domain_state(
                                     db,
                                     run.id,
                                     submission_id,
@@ -374,7 +374,7 @@ pub async fn replay_captures(
                                     state.materialization_receipt_listing_id,
                                     expected_capture,
                                     expected_rendered_html,
-                                )
+                                ))
                                 .await? =>
                             {
                                 continue;
@@ -847,6 +847,22 @@ async fn reconcile_exact_checkpoint(
              AND run.status = 'running' AND run.active_phase = 'materialization'
              AND run.owner_token = ?"#,
     );
+    let exact_rejected_sql = db.sql(
+        r#"SELECT 1
+           FROM listing_replay_run_items item
+           JOIN listing_replay_runs run ON run.id = item.run_id
+           WHERE item.run_id = ? AND item.plugin_submission_id = ?
+             AND item.extraction_state = 'succeeded'
+             AND item.extracted_listing_sha256 = ?
+             AND item.extracted_listing_json = ?
+             AND item.materialization_state = 'rejected'
+             AND item.resulting_listing_id IS NULL
+             AND item.terminal_rejection_phase = 'materialization'
+             AND item.terminal_rejection_stage = 'faa_aircraft_admission'
+             AND item.terminal_rejection_reason_code IS NOT NULL
+             AND run.status = 'running' AND run.active_phase = 'materialization'
+             AND run.owner_token = ?"#,
+    );
     macro_rules! reconcile_transaction {
         ($pool:expr) => {{
             let capture = &checkpoint.exact_capture;
@@ -908,6 +924,19 @@ async fn reconcile_exact_checkpoint(
                     .fetch_optional(&mut *transaction)
                     .await?;
                 if already_complete == Some(1) {
+                    transaction.commit().await?;
+                    return Ok::<(), ReplayRunError>(());
+                }
+            } else {
+                let already_rejected = sqlx::query_scalar::<_, i64>(&exact_rejected_sql)
+                    .bind(run_id)
+                    .bind(submission_id)
+                    .bind(&checkpoint.extracted_listing_sha256)
+                    .bind(&checkpoint.exact_extracted_listing_json)
+                    .bind(owner_token)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                if already_rejected == Some(1) {
                     transaction.commit().await?;
                     return Ok::<(), ReplayRunError>(());
                 }
@@ -5084,6 +5113,103 @@ mod tests {
                 (first_submission_id, "succeeded".to_string(), 0),
                 (second_submission_id, "succeeded".to_string(), 0),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_materialization_rejection_is_an_exact_reconciliation_noop() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, user) = signed_checkpoint(&db).await;
+        let exact_html = validate_target_captures(&db, &manifest).await.unwrap();
+        let expected = &manifest.captures[0];
+        let run = ensure_run(&db, &manifest).await.unwrap();
+        let owner_token = "terminal-reconciliation-owner";
+        acquire_run(
+            &db,
+            run.id,
+            &manifest,
+            ReplayPhase::Materialization,
+            owner_token,
+            false,
+        )
+        .await
+        .unwrap();
+        let state = inspect_plugin_replay_capture_state(&db, user.id, submission_id)
+            .await
+            .unwrap();
+        assert!(!reconcile_materialization_domain_state(
+            &db,
+            run.id,
+            submission_id,
+            owner_token,
+            state.checkpoint.as_ref(),
+            None,
+            expected,
+            exact_html.get(&submission_id).unwrap(),
+        )
+        .await
+        .unwrap());
+        let claimed = claim_item(
+            &db,
+            run.id,
+            submission_id,
+            ReplayPhase::Materialization,
+            owner_token,
+            expected,
+            exact_html.get(&submission_id).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("queued materialization must be claimable");
+        finish_rejected(
+            &db,
+            run.id,
+            claimed,
+            ReplayPhase::Materialization,
+            owner_token,
+            expected,
+            exact_html.get(&submission_id).unwrap(),
+            "faa_aircraft_admission",
+            "serial_conflict",
+        )
+        .await
+        .unwrap();
+
+        assert!(!reconcile_materialization_domain_state(
+            &db,
+            run.id,
+            submission_id,
+            owner_token,
+            state.checkpoint.as_ref(),
+            None,
+            expected,
+            exact_html.get(&submission_id).unwrap(),
+        )
+        .await
+        .expect("an exact terminal rejection must already be reconciled"));
+        release_run(&db, run.id, owner_token).await.unwrap();
+
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let stored: (String, Option<String>, i64) = sqlx::query_as(
+            r#"SELECT materialization_state, terminal_rejection_reason_code,
+                      materialization_attempt_count
+               FROM listing_replay_run_items
+               WHERE run_id = ? AND plugin_submission_id = ?"#,
+        )
+        .bind(run.id)
+        .bind(submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored,
+            (
+                "rejected".to_string(),
+                Some("serial_conflict".to_string()),
+                1
+            )
         );
     }
 
