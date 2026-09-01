@@ -2507,6 +2507,17 @@ label span,
   margin-bottom: 0;
 }
 
+.review-product-reuse-warning {
+  margin: 8px 0 0;
+  padding: 7px 8px;
+  border: 1px solid rgba(177, 77, 48, 0.3);
+  border-radius: 6px;
+  background: #fff7f2;
+  color: var(--danger);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 .review-decision-fieldset {
   min-width: 0;
   margin: 0;
@@ -2628,6 +2639,14 @@ label span,
   background: #f0faf8;
 }
 
+.review-catalog-result.not-reusable,
+.review-catalog-result.not-reusable:hover {
+  border-color: rgba(177, 77, 48, 0.28);
+  background: #fff7f2;
+  cursor: not-allowed;
+  opacity: 0.78;
+}
+
 .review-catalog-result strong,
 .review-catalog-result span {
   display: block;
@@ -2674,6 +2693,30 @@ label span,
   margin: 8px 0 0;
   color: var(--muted);
   font-size: 10px;
+}
+
+.review-aspect-save-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.review-aspect-save-result {
+  flex: 1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+  text-align: right;
+}
+
+.review-aspect-save-result.error {
+  color: var(--danger);
+  font-weight: 700;
 }
 
 .review-workspace-footer {
@@ -2983,13 +3026,22 @@ label span,
   }
 
   .review-avionics-tools,
-  .review-occurrence-method {
+  .review-occurrence-method,
+  .review-aspect-save-controls {
     align-items: stretch;
     flex-direction: column;
   }
 
   .review-avionics-tools .button {
     width: 100%;
+  }
+
+  .review-aspect-save-controls .button {
+    width: 100%;
+  }
+
+  .review-aspect-save-result {
+    text-align: left;
   }
 
   .review-workspace-heading {

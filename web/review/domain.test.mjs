@@ -37,6 +37,7 @@ import {
   runProductAssociationWorkers,
   summarizeProductAssociations,
   summarizeProductReviewGroups,
+  useExistingProductRequest,
   validateAvionicsObservationCorrection,
 } from "./domain.mjs";
 
@@ -142,6 +143,23 @@ test("builds one canonical source-free request for every existing-product aspect
     "catalog_revision_sha256",
     "review_payload_sha256",
   ]);
+});
+
+test("builds one hash-bound request for an independently saved product decision", () => {
+  assert.deepEqual(
+    useExistingProductRequest(
+      "a".repeat(64),
+      "b".repeat(64),
+      "observation-17",
+      28,
+    ),
+    {
+      review_payload_sha256: "a".repeat(64),
+      catalog_revision_sha256: "b".repeat(64),
+      aspect_id: "observation-17",
+      avionics_model_id: 28,
+    },
+  );
 });
 
 test("builds a hash-bound avionics correction without replacing source evidence", () => {

@@ -107,3 +107,39 @@ test("blocks duplicate canonical selections before submitting manual review", ()
   );
   assert.doesNotMatch(reviewJs, /review\.aspects\.length === 0/);
 });
+
+test("saves a verified product decision on its own aspect card", () => {
+  assert.match(reviewJs, /Save verified product for this entry/);
+  assert.match(
+    reviewJs,
+    /\/api\/review\/listings\/\$\{review\.listing_id\}\/avionics\/use-existing/,
+  );
+  assert.match(reviewJs, /useExistingProductRequest/);
+  assert.match(reviewJs, /const preservedDrafts = new Map\(state\.drafts\)/);
+  assert.match(reviewJs, /Could not save this entry: \$\{draft\.decisionError\}/);
+  assert.match(appCss, /\.review-aspect-save-controls/);
+  assert.match(appCss, /\.review-aspect-save-result\.error/);
+});
+
+test("reports card-by-card completion only after final listing verification", () => {
+  assert.match(reviewJs, /outcome\?\.listing_ready === true/);
+  assert.match(reviewJs, /outcome\?\.listing_verified === true/);
+  assert.match(reviewJs, /outcome\?\.finalization_error/);
+  assert.match(reviewJs, /final avionics decision[^]*was saved, but the listing could not be verified/);
+  assert.match(reviewJs, /state\.savingAspectKey !== null/);
+});
+
+test("routes aspect-scoped whole-review failures back to the affected card", () => {
+  assert.match(reviewJs, /function showAspectResolutionError\(error\)/);
+  assert.match(reviewJs, /draft\.decisionError = detail/);
+  assert.match(reviewJs, /The exact error is shown on that card/);
+  assert.match(reviewJs, /showAspectResolutionError\(error\)/);
+});
+
+test("prevents selecting an explicitly non-reusable approved catalog product", () => {
+  assert.match(reviewJs, /value\.catalog\?\.reuse_eligible \?\? value\.reuse_eligible/);
+  assert.match(reviewJs, /product\.reuseEligible === false/);
+  assert.match(reviewJs, /Reusable source verification required/);
+  assert.match(reviewJs, /Known avionics products before selection/);
+  assert.match(appCss, /\.review-catalog-result\.not-reusable/);
+});

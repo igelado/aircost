@@ -457,6 +457,16 @@ model collisions, global references, and exact cross-listing coverage are
 rechecked under lock. A corrected manufacturer/model creates a separate
 approved identity and leaves the old candidate and unrelated links untouched.
 
+An independent ordinary installed aspect may commit its existing-product
+decision before the rest of the review. The aspect-scoped transaction preserves
+unrelated link IDs, removes only the resolved aspect, rewrites the pending
+payload and hash for the residual work, and returns the refreshed review. If no
+aspect remains, the server immediately runs the same canonical FAA, aircraft,
+avionics-graph, and listing-readiness finalizer used after complete review. Its
+response distinguishes a completed review from an actually `ready`, verified
+listing and returns the exact finalization error after a committed last-aspect
+decision, avoiding an unsafe retry of the already-applied association.
+
 Hash-bound approved-product aspects use a product-centric workflow. One current
 OEM attestation is shared by every pending occurrence of that product. The
 deterministic source proof is bound to the complete manufacturer-scoped
@@ -487,6 +497,15 @@ current reuse attestation, approved-catalog revision, active
 identity-collision closure, exact covered-link ownership, and listing action
 graph. Coupled replacement aspects, ambiguous identities, implicit merges,
 and stale collision decisions remain pending.
+
+The explicit product-queue preparation pass also inspects independent ordinary
+aspects whose still-current approved suggestion lacks a reuse attestation. It
+may annotate the exact suggestion as a hash-bound attestation target only when
+manufacturer/model typography, capability subset, optional stable identifier,
+and independent installed-occurrence shape still match the live approved
+catalog. This changes neither the listing link nor the occurrence decision; it
+only makes the missing global product-source prerequisite visible to the Known
+avionics products workflow.
 
 `source_evidence_text` and `source_confidence` are one paired occurrence-proof
 value: neither is retained without the other, and `observed_text` is never an
