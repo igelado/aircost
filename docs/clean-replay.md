@@ -158,8 +158,10 @@ All operational commands are dry-run unless `--apply` is supplied.
    narrow FAA serial correction, listing insertion and checkpoint binding are
    one transaction.
    A later failure retains that private receipt-gated pair, and an exact retry
-   deterministically resumes child projections, writes one correction receipt,
-   and finalizes the same listing. Before binding, any listing-creation failure
+   deterministically resumes child projections and stages any pending review
+   without releasing the gate. It then writes one correction receipt and
+   finalizes the same listing, moving it to review only after the receipt is
+   durable. Before binding, any listing-creation failure
    rolls back the insert and exact capture CAS in their shared transaction; no
    replay path scans for or deletes listings as compensation.
    Install revocation does not invalidate an older signed capture: replay and

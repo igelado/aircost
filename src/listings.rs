@@ -65,8 +65,9 @@ use crate::listing::avionics::{
 use crate::listing::evidence::MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES;
 use crate::listing::review::{
     association_observation_sha256_from_values, clear_pending_review, replace_pending_review,
-    ListingAssociationRole, PendingReviewAspect, ReviewAction, ReviewAspectId, ReviewProduct,
-    StableIdentifier, POSTGRES_LISTING_CHILD_LOCK_SQL, POSTGRES_RESTAGE_CATALOG_LOCK_SQL,
+    replace_pending_review_preserving_source_identity_receipt_gate, ListingAssociationRole,
+    PendingReviewAspect, ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier,
+    POSTGRES_LISTING_CHILD_LOCK_SQL, POSTGRES_RESTAGE_CATALOG_LOCK_SQL,
 };
 use crate::models::{
     is_plausible_asking_price_usd, is_top_overhaul_time_evidence, AircraftSummary, ListingPreview,
@@ -5980,7 +5981,15 @@ async fn replace_listing_pending_review(
     aspects: &[PendingReviewAspect],
     preserve_source_identity_receipt_gate: bool,
 ) -> StoreResult<()> {
-    match replace_pending_review(db, listing_id, None, aspects).await {
+    let replacement = if preserve_source_identity_receipt_gate {
+        replace_pending_review_preserving_source_identity_receipt_gate(
+            db, listing_id, None, aspects,
+        )
+        .await
+    } else {
+        replace_pending_review(db, listing_id, None, aspects).await
+    };
+    match replacement {
         Ok(_) => Ok(()),
         Err(error) => {
             // Listing links have already been replaced by the caller. A prior
@@ -8486,6 +8495,26 @@ mod tests {
             resumed.listing.ingestion_error.as_deref(),
             Some(super::SOURCE_IDENTITY_RECEIPT_PENDING)
         );
+        let review_aspect = PendingReviewAspect::avionics(
+            "avionics:0:primary",
+            "avionics",
+            "Garmin G5",
+            "Garmin G5 · Flight Display · quantity 1 · installed",
+            "automated verification could not complete",
+            1,
+            "installed",
+            Some("Garmin G5".to_string()),
+            Some("high".to_string()),
+        );
+        super::replace_listing_pending_review(&db, listing_id, &[review_aspect], true)
+            .await
+            .expect("review evidence must stage without releasing the correction receipt gate");
+        let gated = super::get_listing(&db, user.id, listing_id).await.unwrap();
+        assert_eq!(gated.ingestion_state, "quarantined");
+        assert_eq!(
+            gated.ingestion_error.as_deref(),
+            Some(super::SOURCE_IDENTITY_RECEIPT_PENDING)
+        );
 
         let outcome = record_bound_source_visual_correction(
             &db,
@@ -8510,6 +8539,17 @@ mod tests {
         assert_ne!(
             finalized.ingestion_error.as_deref(),
             Some(super::SOURCE_IDENTITY_RECEIPT_PENDING)
+        );
+        assert_eq!(finalized.ingestion_state, "pending_review");
+        assert_eq!(
+            query_scalar_one!(
+                &db,
+                i64,
+                "SELECT pending_aspect_count FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+                listing_id
+            )
+            .unwrap(),
+            1
         );
         assert_eq!(correction.grounding.snapshot.id, 1);
     }
