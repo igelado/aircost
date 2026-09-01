@@ -350,10 +350,13 @@ optional, and contextual wording such as `Not Dual`, `Optional Dual`, or
 left-bounded model, slash-delimited alphanumeric suffix, and terminal `(Dual)`
 in one evidence line. A high-confidence occurrence with any other such
 ambiguity fails into the single avionics correction request. A corrected
-medium- or low-confidence candidate may checkpoint only when its exact
-`source_evidence_text` covers the complete bounded ambiguity, including count
-qualifiers such as `units` or `each`; downstream reuse and valuation continue
-to require high source confidence, so it normally remains pending. One narrow
+medium- or low-confidence candidate may checkpoint with one exact local
+identity span. When every mention fits one short trusted span, the extraction
+repair widens evidence to cover the complete bounded ambiguity, including count
+qualifiers such as `units` or `each`. Distant role or feature cross-references
+keep the exact local span rather than forcing an oversized evidence value;
+downstream reuse and valuation continue to require high source confidence, so
+the candidate remains pending. One narrow
 provider-free exception exists for a complete Controller `Avionics/Radios`
 line beginning with exact `Dual <manufacturer> <model>` identity text. A
 manufacturer-absent observation has one narrower admitted form: exact

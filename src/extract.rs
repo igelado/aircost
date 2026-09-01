@@ -2281,7 +2281,7 @@ const LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE: &str = "\
 
 const LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE: &str = "\
 - Emit each normalized manufacturer/model product exactly once. Repeated exact product mentions and Dual, #N, or decimal quantity wording are quantity ambiguity, not proof of a physical count.\n\
-- For any such ambiguity, return one explicit candidate quantity with source_confidence medium or low, never high. Copy one exact contiguous source_evidence_text span covering every repeated identity and every count-context token, including qualifiers such as units or each. Omit the occurrence if one bounded exact span cannot support the candidate.\n\
+- For any such ambiguity, return one explicit candidate quantity with source_confidence medium or low, never high. When all repeated identity and count-context tokens fit one short exact contiguous source_evidence_text span, copy that complete span, including qualifiers such as units or each. When distant role or feature cross-references do not fit one short span, copy the one exact local occurrence that best supports the product identity and candidate; do not omit the product solely because another cross-reference is distant.\n\
 - For example, when one line names King KX-170B and the next contiguous line names King KX-170B #2, never return two KX-170B rows. Return one KX-170B occurrence with candidate quantity 2, medium or low confidence, and evidence covering both lines; otherwise omit it.\n\
 - Without quantity ambiguity, high source confidence is allowed only for one exact product identity with quantity one.\n";
 
@@ -5117,7 +5117,9 @@ mod tests {
         let prompt = build_extraction_prompt("Dual KX-170B NAV/COM radios installed.");
         assert!(prompt.contains("quantity ambiguity, not proof of a physical count"));
         assert!(prompt.contains("source_confidence medium or low, never high"));
-        assert!(prompt.contains("every repeated identity and every count-context token"));
+        assert!(prompt.contains("all repeated identity and count-context tokens fit one short"));
+        assert!(prompt.contains("distant role or feature cross-references"));
+        assert!(prompt.contains("do not omit the product solely"));
         assert!(prompt.contains("King KX-170B #2"));
         assert!(prompt.contains("never return two KX-170B rows"));
         assert!(prompt.contains("high source confidence is allowed only"));

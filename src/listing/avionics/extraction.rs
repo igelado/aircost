@@ -356,7 +356,7 @@ impl AvionicsValidationRule {
                 "occurrence duplicates an earlier normalized manufacturer/model identity"
             }
             Self::QuantityEvidenceIncomplete => {
-                "source_evidence_text cannot be bounded to one Controller item or does not cover the complete bounded Controller quantity ambiguity"
+                "Controller quantity evidence cannot be bounded to one trusted equipment item"
             }
             Self::ExplicitlyInoperativeInstallation => {
                 "installed occurrence is explicitly marked inoperative and cannot represent working current-configuration avionics"
@@ -680,7 +680,7 @@ fn evidence_ends_with_explicit_inoperative_marker(evidence: &str) -> bool {
 ///
 /// Repairs may discard an unsupported manufacturer assertion, copy exact
 /// Controller evidence typography, or bind a model-produced quantity candidate
-/// to the complete exact Controller ambiguity span at non-high confidence.
+/// to exact Controller ambiguity evidence at non-high confidence.
 /// Product models, quantities, capabilities, and actions remain model-produced.
 pub(crate) fn repair_listing_avionics_extraction(
     extracted_listing: &mut Value,
@@ -692,8 +692,8 @@ pub(crate) fn repair_listing_avionics_extraction(
 
 /// Apply the same evidence-backed repairs after the one bounded semantic
 /// correction. At this stage a quantity-one response is an explicit corrected
-/// candidate, so it may be retained at medium confidence with its complete
-/// exact ambiguity span instead of discarding the whole extraction.
+/// candidate, so it may be retained at medium confidence with exact local
+/// identity evidence instead of discarding the whole extraction.
 pub(crate) fn repair_corrected_listing_avionics_extraction(
     extracted_listing: &mut Value,
     source_url: &str,
@@ -851,10 +851,11 @@ fn raw_identity_has_unsupported_manufacturer(
             && normalized_identity_occurrence_ranges(evidence, manufacturer).is_empty())
 }
 
-/// Bind a model-produced quantity candidate to the complete bounded Controller
-/// ambiguity already detected by the admission contract. This repair can only
-/// widen evidence to an exact trusted source span and lower high confidence to
-/// medium. It never changes identity, quantity, capability, or action fields.
+/// Bind a model-produced quantity candidate to bounded Controller ambiguity.
+/// This repair can only widen evidence when the complete ambiguity fits one
+/// short exact trusted span and lower high confidence to medium. A longer
+/// cross-reference keeps its exact local identity evidence. Identity, quantity,
+/// capability, and action fields are never changed.
 fn bind_controller_quantity_ambiguity(
     extracted_listing: &mut Value,
     source_url: &str,
@@ -887,15 +888,16 @@ fn bind_controller_quantity_ambiguity(
             ) else {
                 return None;
             };
-            let ambiguity = controller_field.get(signal.start..signal.end)?.trim();
-            if ambiguity.is_empty()
-                || ambiguity.len() > MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES
-                || !evidence_units.contains_exact_span(ambiguity)
-            {
-                return None;
-            }
-            let replacement_evidence =
-                (!evidence.contains(ambiguity)).then(|| ambiguity.to_string());
+            let replacement_evidence = controller_field
+                .get(signal.start..signal.end)
+                .map(str::trim)
+                .filter(|ambiguity| {
+                    !ambiguity.is_empty()
+                        && ambiguity.len() <= MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES
+                        && evidence_units.contains_exact_span(ambiguity)
+                        && !evidence.contains(*ambiguity)
+                })
+                .map(str::to_string);
             let replacement_confidence = observation.source_confidence.as_deref() == Some("high");
             (replacement_evidence.is_some() || replacement_confidence)
                 .then_some((replacement_evidence, replacement_confidence))
@@ -1470,13 +1472,13 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
             .as_deref()
             .expect("the canonical parser requires occurrence evidence")
             .trim();
-        let signal = match controller_quantity_ambiguity_signal(
+        match controller_quantity_ambiguity_signal(
             &installed_equipment,
             observation.manufacturer.as_deref().unwrap_or_default(),
             &observation.model,
             evidence,
         ) {
-            QuantityAmbiguity::Bounded(signal) => signal,
+            QuantityAmbiguity::Bounded(_) => {}
             QuantityAmbiguity::Absent => continue,
             QuantityAmbiguity::Unbounded => {
                 return Err(AvionicsValidationFailure::occurrence(
@@ -1485,26 +1487,12 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
                     AvionicsValidationField::SourceEvidenceText,
                 ));
             }
-        };
+        }
         if observation.source_confidence.as_deref() == Some("high") {
             return Err(AvionicsValidationFailure::occurrence(
                 AvionicsValidationRule::QuantityProofAmbiguous,
                 index,
                 AvionicsValidationField::SourceConfidence,
-            ));
-        }
-        let Some(ambiguity) = installed_equipment.get(signal.start..signal.end) else {
-            return Err(AvionicsValidationFailure::occurrence(
-                AvionicsValidationRule::QuantityEvidenceIncomplete,
-                index,
-                AvionicsValidationField::SourceEvidenceText,
-            ));
-        };
-        if !evidence.contains(ambiguity) {
-            return Err(AvionicsValidationFailure::occurrence(
-                AvionicsValidationRule::QuantityEvidenceIncomplete,
-                index,
-                AvionicsValidationField::SourceEvidenceText,
             ));
         }
     }
@@ -3804,7 +3792,7 @@ mod tests {
     }
 
     #[test]
-    fn controller_quantity_ambiguity_requires_complete_exact_evidence() {
+    fn bounded_controller_quantity_ambiguity_accepts_exact_local_evidence_below_high() {
         for (field, evidence) in [
             ("Garmin G1000 PFD\nGarmin G1000 MFD", "Garmin G1000 PFD"),
             ("Optional Dual Garmin G5", "Dual Garmin G5"),
@@ -3825,13 +3813,8 @@ mod tests {
                 &controller_html(field),
             );
             assert!(
-                result.is_err(),
-                "{field:?} admitted incomplete evidence {evidence:?}"
-            );
-            let error = result.unwrap_err();
-            assert!(
-                error.contains("complete bounded Controller quantity ambiguity"),
-                "{field:?}: {error}"
+                result.is_ok(),
+                "{field:?} rejected local evidence {evidence:?}"
             );
         }
     }
@@ -3982,6 +3965,46 @@ Aspen EFD 1000 Pilot Pro PFD w/Synthetic Vision";
             payload["avionics"][0]["source_evidence_text"],
             "G5 HSI\nGarmin 430W GPS/NAV/COM\nGarmin G5"
         );
+        validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
+            .unwrap();
+    }
+
+    #[test]
+    fn distant_cross_reference_keeps_local_evidence_as_a_pending_candidate() {
+        let field = format!(
+            "Garmin GFC 500 digital autopilot\n{}Autopilot disconnect switches via Garmin GFC 500",
+            "unrelated equipment detail\n".repeat(20),
+        );
+        assert!(field.len() > MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES);
+        let html = controller_html(&field);
+        let evidence = "Garmin GFC 500 digital autopilot";
+        let mut payload = installed("Garmin", "GFC 500", evidence);
+        let product_fields = (
+            payload["avionics"][0]["manufacturer"].clone(),
+            payload["avionics"][0]["model"].clone(),
+            payload["avionics"][0]["types"].clone(),
+            payload["avionics"][0]["quantity"].clone(),
+            payload["avionics"][0]["configuration_action"].clone(),
+            payload["avionics"][0]["source_evidence_text"].clone(),
+        );
+
+        assert!(!repair_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap());
+        assert!(
+            repair_corrected_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html)
+                .unwrap()
+        );
+        assert_eq!(
+            (
+                payload["avionics"][0]["manufacturer"].clone(),
+                payload["avionics"][0]["model"].clone(),
+                payload["avionics"][0]["types"].clone(),
+                payload["avionics"][0]["quantity"].clone(),
+                payload["avionics"][0]["configuration_action"].clone(),
+                payload["avionics"][0]["source_evidence_text"].clone(),
+            ),
+            product_fields
+        );
+        assert_eq!(payload["avionics"][0]["source_confidence"], "medium");
         validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
             .unwrap();
     }
