@@ -593,6 +593,40 @@ pub(crate) fn independent_current_avionics_validation_failures(
     failures
 }
 
+/// Enumerate every duplicate normalized identity in one parseable transient
+/// extraction. Quantity admission remains fail-fast, but correction needs the
+/// complete duplicate set so one bounded model call can repair all groups.
+pub(crate) fn current_avionics_duplicate_identity_failures(
+    extracted_listing: &Value,
+) -> Vec<AvionicsValidationFailure> {
+    let Ok(observations) = parse_current_avionics_extraction_value(extracted_listing) else {
+        return Vec::new();
+    };
+    observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, _)| duplicate_identity_failure(&observations, index))
+        .collect()
+}
+
+fn duplicate_identity_failure(
+    observations: &[ParsedAvionics],
+    index: usize,
+) -> Option<AvionicsValidationFailure> {
+    let observation = observations.get(index)?;
+    observations[..index]
+        .iter()
+        .position(|candidate| same_product_identity(observation, candidate))
+        .map(|related_index| {
+            AvionicsValidationFailure::related(
+                AvionicsValidationRule::QuantityMismatch,
+                index,
+                AvionicsValidationField::Quantity,
+                related_index,
+            )
+        })
+}
+
 fn validate_current_avionics_operational_eligibility(
     observations: &[ParsedAvionics],
 ) -> Result<(), AvionicsValidationFailure> {
@@ -645,14 +679,34 @@ fn evidence_ends_with_explicit_inoperative_marker(evidence: &str) -> bool {
 /// Apply narrow, evidence-backed repairs to transient model output atomically.
 ///
 /// Repairs may discard an unsupported manufacturer assertion, copy exact
-/// Controller evidence typography, or lower an exact Controller `Dual`
-/// quantity candidate from high to medium confidence. Product models,
-/// quantities, capabilities, actions, and evidence content remain
-/// model-produced.
+/// Controller evidence typography, or bind a model-produced quantity candidate
+/// to the complete exact Controller ambiguity span at non-high confidence.
+/// Product models, quantities, capabilities, and actions remain model-produced.
 pub(crate) fn repair_listing_avionics_extraction(
     extracted_listing: &mut Value,
     source_url: &str,
     rendered_html: &str,
+) -> Result<bool, AvionicsValidationFailure> {
+    repair_listing_avionics_extraction_inner(extracted_listing, source_url, rendered_html, false)
+}
+
+/// Apply the same evidence-backed repairs after the one bounded semantic
+/// correction. At this stage a quantity-one response is an explicit corrected
+/// candidate, so it may be retained at medium confidence with its complete
+/// exact ambiguity span instead of discarding the whole extraction.
+pub(crate) fn repair_corrected_listing_avionics_extraction(
+    extracted_listing: &mut Value,
+    source_url: &str,
+    rendered_html: &str,
+) -> Result<bool, AvionicsValidationFailure> {
+    repair_listing_avionics_extraction_inner(extracted_listing, source_url, rendered_html, true)
+}
+
+fn repair_listing_avionics_extraction_inner(
+    extracted_listing: &mut Value,
+    source_url: &str,
+    rendered_html: &str,
+    allow_single_quantity_candidate: bool,
 ) -> Result<bool, AvionicsValidationFailure> {
     let original = extracted_listing.clone();
     let repair = (|| {
@@ -663,12 +717,13 @@ pub(crate) fn repair_listing_avionics_extraction(
             source_url,
             rendered_html,
         )?;
-        let quantity_confidence_repaired = lower_exact_controller_dual_quantity_confidence(
+        let quantity_ambiguity_repaired = bind_controller_quantity_ambiguity(
             extracted_listing,
             source_url,
             rendered_html,
+            allow_single_quantity_candidate,
         )?;
-        let repaired = manufacturer_repaired || evidence_recovered || quantity_confidence_repaired;
+        let repaired = manufacturer_repaired || evidence_recovered || quantity_ambiguity_repaired;
         if repaired {
             validate_unbound_current_avionics_extraction(
                 &extracted_listing.to_string(),
@@ -796,14 +851,15 @@ fn raw_identity_has_unsupported_manufacturer(
             && normalized_identity_occurrence_ranges(evidence, manufacturer).is_empty())
 }
 
-/// Lower, but never raise, confidence for the one exact Controller count
-/// grammar that is safe to recognize mechanically. `Dual` must immediately
-/// scope the literal product identity and the model must already have returned
-/// quantity two. The quantity itself is never inferred or changed here.
-fn lower_exact_controller_dual_quantity_confidence(
+/// Bind a model-produced quantity candidate to the complete bounded Controller
+/// ambiguity already detected by the admission contract. This repair can only
+/// widen evidence to an exact trusted source span and lower high confidence to
+/// medium. It never changes identity, quantity, capability, or action fields.
+fn bind_controller_quantity_ambiguity(
     extracted_listing: &mut Value,
     source_url: &str,
     rendered_html: &str,
+    allow_single_quantity_candidate: bool,
 ) -> Result<bool, AvionicsValidationFailure> {
     let observations = parse_current_avionics_extraction_value(extracted_listing)?;
     let Some(controller_field) = controller_avionics_evidence(source_url, rendered_html) else {
@@ -815,23 +871,37 @@ fn lower_exact_controller_dual_quantity_confidence(
     let repairs = observations
         .iter()
         .map(|observation| {
+            if observation.quantity == 1 && !allow_single_quantity_candidate {
+                return None;
+            }
             let evidence = observation
                 .source_evidence_text
                 .as_deref()
                 .expect("the canonical parser requires occurrence evidence")
                 .trim();
-            observation.quantity == 2
-                && observation.source_confidence.as_deref() == Some("high")
-                && evidence_units.contains_exact_span(evidence)
-                && controller_field_has_exact_evidence_line(&controller_field, evidence)
-                && exact_leading_dual_identity(
-                    evidence,
-                    observation.manufacturer.as_deref(),
-                    &observation.model,
-                )
+            let QuantityAmbiguity::Bounded(signal) = controller_quantity_ambiguity_signal(
+                &controller_field,
+                observation.manufacturer.as_deref().unwrap_or_default(),
+                &observation.model,
+                evidence,
+            ) else {
+                return None;
+            };
+            let ambiguity = controller_field.get(signal.start..signal.end)?.trim();
+            if ambiguity.is_empty()
+                || ambiguity.len() > MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES
+                || !evidence_units.contains_exact_span(ambiguity)
+            {
+                return None;
+            }
+            let replacement_evidence =
+                (!evidence.contains(ambiguity)).then(|| ambiguity.to_string());
+            let replacement_confidence = observation.source_confidence.as_deref() == Some("high");
+            (replacement_evidence.is_some() || replacement_confidence)
+                .then_some((replacement_evidence, replacement_confidence))
         })
         .collect::<Vec<_>>();
-    if !repairs.iter().any(|repair| *repair) {
+    if !repairs.iter().any(Option::is_some) {
         return Ok(false);
     }
 
@@ -840,31 +910,23 @@ fn lower_exact_controller_dual_quantity_confidence(
         .and_then(Value::as_array_mut)
         .expect("the canonical parser requires a top-level avionics array");
     for (occurrence, repair) in avionics.iter_mut().zip(repairs) {
-        if repair {
-            occurrence
-                .as_object_mut()
-                .expect("the canonical parser requires avionics objects")
-                .insert(
-                    "source_confidence".to_string(),
-                    Value::String("medium".to_string()),
-                );
+        let Some((replacement_evidence, replacement_confidence)) = repair else {
+            continue;
+        };
+        let object = occurrence
+            .as_object_mut()
+            .expect("the canonical parser requires avionics objects");
+        if let Some(evidence) = replacement_evidence {
+            object.insert("source_evidence_text".to_string(), Value::String(evidence));
+        }
+        if replacement_confidence {
+            object.insert(
+                "source_confidence".to_string(),
+                Value::String("medium".to_string()),
+            );
         }
     }
     Ok(true)
-}
-
-fn exact_leading_dual_identity(evidence: &str, manufacturer: Option<&str>, model: &str) -> bool {
-    let Some(after_dual) =
-        strip_ascii_case_prefix(evidence.trim(), "Dual").and_then(strip_required_whitespace_prefix)
-    else {
-        return false;
-    };
-    match manufacturer {
-        Some(manufacturer) => {
-            exact_normalized_identity_prefix_end(after_dual, manufacturer, model).is_some()
-        }
-        None => exact_normalized_identity_prefix_end(after_dual, "", model).is_some(),
-    }
 }
 
 /// Replace only typography-drifted occurrence evidence with an exact visible
@@ -1388,16 +1450,8 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
     rendered_html: &str,
 ) -> Result<(), AvionicsValidationFailure> {
     for (index, observation) in observations.iter().enumerate() {
-        if let Some(related_index) = observations[..index]
-            .iter()
-            .position(|candidate| same_product_identity(observation, candidate))
-        {
-            return Err(AvionicsValidationFailure::related(
-                AvionicsValidationRule::QuantityMismatch,
-                index,
-                AvionicsValidationField::Quantity,
-                related_index,
-            ));
+        if let Some(failure) = duplicate_identity_failure(observations, index) {
+            return Err(failure);
         }
         if observation.quantity > 1 && observation.source_confidence.as_deref() == Some("high") {
             return Err(AvionicsValidationFailure::occurrence(
@@ -1496,7 +1550,7 @@ fn controller_quantity_ambiguity_signal(
     model: &str,
     evidence: &str,
 ) -> QuantityAmbiguity {
-    let ranges = normalized_identity_occurrence_ranges(source, model);
+    let ranges = controller_product_occurrence_ranges(source, manufacturer, model);
     let mut ambiguity = (ranges.len() > 1).then(|| IdentityRange {
         start: ranges.first().expect("two ranges have a first").start,
         end: ranges.last().expect("two ranges have a last").end,
@@ -1514,6 +1568,42 @@ fn controller_quantity_ambiguity_signal(
         }
     }
     ambiguity.map_or(QuantityAmbiguity::Absent, QuantityAmbiguity::Bounded)
+}
+
+/// A leading-numeric model such as `345` is otherwise indistinguishable from
+/// the numeric suffix of another product such as `GMA 345`. When the listing
+/// supplies a manufacturer, keep only occurrences in items that also name it.
+/// Non-numeric-leading product codes retain the conservative all-occurrence
+/// behavior.
+fn controller_product_occurrence_ranges(
+    source: &str,
+    manufacturer: &str,
+    model: &str,
+) -> Vec<IdentityRange> {
+    let ranges = normalized_identity_occurrence_ranges(source, model);
+    if manufacturer.trim().is_empty()
+        || !model
+            .trim_start()
+            .starts_with(|character: char| character.is_ascii_digit())
+    {
+        return ranges;
+    }
+    let scoped = ranges
+        .iter()
+        .copied()
+        .filter(|range| {
+            item_bounds(source, range.start)
+                .and_then(|(start, end)| source.get(start..end))
+                .is_some_and(|item| {
+                    !normalized_identity_occurrence_ranges(item, manufacturer).is_empty()
+                })
+        })
+        .collect::<Vec<_>>();
+    if scoped.is_empty() {
+        ranges
+    } else {
+        scoped
+    }
 }
 
 fn include_ambiguity_range(ambiguity: &mut Option<IdentityRange>, range: IdentityRange) {
@@ -3454,7 +3544,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_lowers_exact_dual_quantity_but_not_dual_axis_autopilot() {
+    fn repair_binds_exact_dual_quantity_but_not_dual_axis_autopilot() {
         let gdu_evidence = "Dual GDU-1040 PFD/MFD";
         let kap_evidence = "KAP 140 Autopilot Dual Axis Autopilot coupled to the NAV/GPS";
         let html = controller_html(&format!("{gdu_evidence}\n{kap_evidence}"));
@@ -3673,6 +3763,21 @@ Aspen EFD 1000 Pilot Pro PFD w/Synthetic Vision";
     }
 
     #[test]
+    fn leading_numeric_model_does_not_match_another_manufacturers_product_code() {
+        let field = "GMA 345 Audio Panel w/Bluetooth\nGarmin 345 Transponder ADS-B In/Out";
+        let evidence = "Garmin 345 Transponder ADS-B In/Out";
+        let payload = installed("Garmin", "345", evidence);
+        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+
+        validate_current_avionics_quantity_completeness(
+            &observations,
+            CONTROLLER_URL,
+            &controller_html(field),
+        )
+        .expect("GMA 345 is not another occurrence of manufacturer-scoped Garmin model 345");
+    }
+
+    #[test]
     fn every_controller_item_delimiter_bounds_normalized_identities() {
         for delimiter in [",", ";", "\r", "\n"] {
             let source = format!("Garmin GTN{delimiter}750 installed");
@@ -3755,21 +3860,32 @@ Aspen EFD 1000 Pilot Pro PFD w/Synthetic Vision";
     }
 
     #[test]
-    fn nonadjacent_repeated_identity_is_rejected_without_mutating_model_output() {
+    fn nonadjacent_repeated_identity_is_bound_without_changing_product_fields() {
         let field = "Garmin G5 HSI\nGarmin 430W GPS/NAV/COM\nGarmin G5 attitude";
         let html = controller_html(field);
         let mut payload = installed("Garmin", "G5", "Garmin G5 HSI");
-        let original = payload.clone();
+        let identity = payload["avionics"][0]["manufacturer"].clone();
+        let model = payload["avionics"][0]["model"].clone();
+        let types = payload["avionics"][0]["types"].clone();
+        let quantity = payload["avionics"][0]["quantity"].clone();
+        let action = payload["avionics"][0]["configuration_action"].clone();
 
-        assert!(!repair_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap());
-        assert_eq!(payload, original);
-        assert!(validate_unbound_current_avionics_extraction(
-            &payload.to_string(),
-            CONTROLLER_URL,
-            &html,
-        )
-        .is_err());
-        assert_eq!(payload, original);
+        assert!(
+            repair_corrected_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html)
+                .unwrap()
+        );
+        assert_eq!(payload["avionics"][0]["manufacturer"], identity);
+        assert_eq!(payload["avionics"][0]["model"], model);
+        assert_eq!(payload["avionics"][0]["types"], types);
+        assert_eq!(payload["avionics"][0]["quantity"], quantity);
+        assert_eq!(payload["avionics"][0]["configuration_action"], action);
+        assert_eq!(payload["avionics"][0]["source_confidence"], "medium");
+        assert_eq!(
+            payload["avionics"][0]["source_evidence_text"],
+            "G5 HSI\nGarmin 430W GPS/NAV/COM\nGarmin G5"
+        );
+        validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
+            .unwrap();
     }
 
     #[test]
@@ -4551,7 +4667,7 @@ Advisory System)";
     }
 
     #[test]
-    fn controller_evidence_recovery_rolls_back_when_quantity_remains_ambiguous() {
+    fn controller_evidence_and_quantity_repairs_compose_atomically() {
         let flattened = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W NAV/COM/GPS/WAAS with GS #2";
         let exact = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W\nNAV/COM/GPS/WAAS with GS #2";
         let html = controller_html(&format!("Garmin G5 attitude\nGarmin G5 HSI\n{exact}"));
@@ -4566,16 +4682,45 @@ Advisory System)";
             "serial": "unchanged",
             "nested": [1, 2, 3]
         });
-        let original = payload.clone();
-
-        let error =
-            repair_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap_err();
+        let product_fields = payload["avionics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|occurrence| {
+                (
+                    occurrence["manufacturer"].clone(),
+                    occurrence["model"].clone(),
+                    occurrence["types"].clone(),
+                    occurrence["quantity"].clone(),
+                    occurrence["configuration_action"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
 
         assert!(
-            error.contains("ambiguous Controller quantity evidence"),
-            "{error}"
+            repair_corrected_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html)
+                .unwrap()
         );
-        assert_eq!(payload, original);
+        assert_eq!(
+            payload["avionics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|occurrence| {
+                    (
+                        occurrence["manufacturer"].clone(),
+                        occurrence["model"].clone(),
+                        occurrence["types"].clone(),
+                        occurrence["quantity"].clone(),
+                        occurrence["configuration_action"].clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            product_fields
+        );
+        assert_eq!(payload["aircraft_marker"]["serial"], "unchanged");
+        validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
+            .unwrap();
     }
 
     #[test]

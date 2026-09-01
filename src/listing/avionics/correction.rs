@@ -6,7 +6,8 @@ use std::fmt;
 
 use crate::extract::{GeminiListingExtractor, ListingAvionicsCorrectionToken};
 use crate::listing::avionics::extraction::{
-    independent_current_avionics_validation_failures, repair_listing_avionics_extraction,
+    current_avionics_duplicate_identity_failures, independent_current_avionics_validation_failures,
+    repair_corrected_listing_avionics_extraction, repair_listing_avionics_extraction,
     validate_unbound_current_avionics_extraction, AvionicsValidationFailure,
 };
 use crate::models::ParsedAvionics;
@@ -123,7 +124,8 @@ pub(crate) async fn validate_or_correct_listing_avionics(
             })?;
             object.insert("avionics".to_string(), corrected_avionics);
 
-            match validate_listing_avionics(source_url, rendered_html, extracted_listing) {
+            match validate_corrected_listing_avionics(source_url, rendered_html, extracted_listing)
+            {
                 Ok(occurrences) => Ok(occurrences),
                 Err(correction_error) => {
                     *extracted_listing = original;
@@ -159,6 +161,14 @@ fn complete_correction_feedback(
             ));
         }
     }
+    for failure in current_avionics_duplicate_identity_failures(extracted_listing) {
+        let diagnostic = failure.to_string();
+        if diagnostic != primary && !feedback.iter().any(|entry| entry.ends_with(&diagnostic)) {
+            feedback.push(format!(
+                "additional independent deterministic defect: {diagnostic}"
+            ));
+        }
+    }
     feedback.join("\n")
 }
 
@@ -174,6 +184,19 @@ fn validate_listing_avionics(
         rendered_html,
     )?;
     Ok(occurrences)
+}
+
+fn validate_corrected_listing_avionics(
+    source_url: &str,
+    rendered_html: &str,
+    extracted_listing: &mut Value,
+) -> Result<Vec<ParsedAvionics>, AvionicsValidationFailure> {
+    repair_corrected_listing_avionics_extraction(extracted_listing, source_url, rendered_html)?;
+    validate_unbound_current_avionics_extraction(
+        &extracted_listing.to_string(),
+        source_url,
+        rendered_html,
+    )
 }
 
 #[cfg(test)]
@@ -247,6 +270,52 @@ Century I Wingleveler Autopilot (INOP)";
         );
         assert!(
             feedback.contains("avionics[3].source_evidence_text"),
+            "{feedback}"
+        );
+    }
+
+    #[test]
+    fn correction_feedback_enumerates_every_duplicate_identity_group() {
+        let field =
+            "Garmin G5 PFD\nGarmin G5 HSI\nGarmin GSA 28 roll servo\nGarmin GSA 28 pitch servo";
+        let html = controller_html(field);
+        let payload = json!({
+            "avionics": [
+                {
+                    "manufacturer": "Garmin", "model": "G5", "types": ["Flight Display"],
+                    "quantity": 1, "configuration_action": "installed", "replaces": null,
+                    "source_evidence_text": "Garmin G5 PFD", "source_confidence": "high"
+                },
+                {
+                    "manufacturer": "Garmin", "model": "G5", "types": ["Navigation Indicator"],
+                    "quantity": 1, "configuration_action": "installed", "replaces": null,
+                    "source_evidence_text": "Garmin G5 HSI", "source_confidence": "high"
+                },
+                {
+                    "manufacturer": "Garmin", "model": "GSA 28", "types": ["Unknown"],
+                    "quantity": 1, "configuration_action": "installed", "replaces": null,
+                    "source_evidence_text": "Garmin GSA 28 roll servo", "source_confidence": "high"
+                },
+                {
+                    "manufacturer": "Garmin", "model": "GSA 28", "types": ["Unknown"],
+                    "quantity": 1, "configuration_action": "installed", "replaces": null,
+                    "source_evidence_text": "Garmin GSA 28 pitch servo", "source_confidence": "high"
+                }
+            ]
+        });
+        let mut validating_payload = payload.clone();
+        let primary = validate_listing_avionics(CONTROLLER_URL, &html, &mut validating_payload)
+            .expect_err("both normalized identity groups are duplicated");
+        let feedback = complete_correction_feedback(&payload, CONTROLLER_URL, &html, &primary);
+
+        assert!(feedback.contains("avionics[1].quantity"), "{feedback}");
+        assert!(
+            feedback.contains("related occurrence avionics[0]"),
+            "{feedback}"
+        );
+        assert!(feedback.contains("avionics[3].quantity"), "{feedback}");
+        assert!(
+            feedback.contains("related occurrence avionics[2]"),
             "{feedback}"
         );
     }
