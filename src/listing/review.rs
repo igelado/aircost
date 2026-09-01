@@ -2485,11 +2485,17 @@ async fn restage_pending_review_if_current_with_commit(
                     }
                 }
                 validate_independent_ordinary_aspect(&aspect, &payload.aspects)?;
-                if !approved.contains_key(&commit.avionics_model_id)
-                    || !reuse_attested_ids.contains(&commit.avionics_model_id)
-                {
+                if !approved.contains_key(&commit.avionics_model_id) {
                     return Err(ReviewError::Conflict(format!(
-                        "avionics catalog id {} is not an approved current-policy reusable product",
+                        "review aspect {} references avionics catalog id {}, which is not an approved product with a complete verified identity and capability assignment",
+                        commit.aspect_id,
+                        commit.avionics_model_id
+                    )));
+                }
+                if !reuse_attested_ids.contains(&commit.avionics_model_id) {
+                    return Err(ReviewError::Conflict(format!(
+                        "review aspect {} references approved avionics catalog id {}, but that product has no current reuse attestation; verify its authoritative manufacturer source in Known avionics products, then retry this entry",
+                        commit.aspect_id,
                         commit.avionics_model_id
                     )));
                 }
@@ -2921,6 +2927,11 @@ async fn restage_pending_review_if_current_with_commit(
                 &approved,
                 &authorized_associations,
             )?;
+            let added_suggested_reuse_targets = add_unattested_suggested_product_targets(
+                &mut payload.aspects,
+                &approved,
+                &reuse_attested_ids,
+            )?;
             repaired_evidence |= apply_exact_association_evidence(
                 &mut payload.aspects,
                 &exact_association_evidence,
@@ -2968,6 +2979,7 @@ async fn restage_pending_review_if_current_with_commit(
             let (review_payload_sha256, pending_aspect_count) =
                 if removed_authorized
                     || added_unauthorized
+                    || added_suggested_reuse_targets
                     || repaired_evidence
                     || ordinary_aspect_used
                 {
@@ -4895,6 +4907,93 @@ fn proposed_observation_matches_approved_product(
         })
 }
 
+fn staged_suggestion_matches_approved_product(
+    suggested: &ReviewProduct,
+    approved: &ReviewProduct,
+) -> bool {
+    if suggested.id != approved.id
+        || !avionics_identities_are_typography_exact(
+            &suggested.manufacturer,
+            &suggested.model,
+            &approved.manufacturer,
+            &approved.model,
+        )
+        || suggested.capabilities.is_empty()
+    {
+        return false;
+    }
+    let approved_capabilities = approved
+        .capabilities
+        .iter()
+        .map(|capability| normalize_name(capability))
+        .filter(|capability| !capability.is_empty())
+        .collect::<HashSet<_>>();
+    if approved_capabilities.is_empty()
+        || !suggested.capabilities.iter().all(|capability| {
+            let capability = normalize_name(capability);
+            !capability.is_empty() && approved_capabilities.contains(&capability)
+        })
+    {
+        return false;
+    }
+    suggested
+        .stable_identifier
+        .as_ref()
+        .is_none_or(|suggested| {
+            approved.stable_identifier.as_ref().is_some_and(|approved| {
+                suggested.kind == approved.kind
+                    && normalize_avionics_identifier(&suggested.value)
+                        == normalize_avionics_identifier(&approved.value)
+            })
+        })
+}
+
+/// Turn an approved suggestion into an explicit product-attestation target
+/// without deciding the listing association.
+///
+/// Only independent, unlinked ordinary observations qualify. Covered links
+/// and replacement graphs continue through their existing collision- and
+/// relationship-aware review paths, while stale catalog IDs or identities are
+/// left for manual review instead of being rebound to a changed product.
+fn add_unattested_suggested_product_targets(
+    aspects: &mut Vec<PendingReviewAspect>,
+    approved: &HashMap<i64, ReviewProduct>,
+    reuse_attested_ids: &HashSet<i64>,
+) -> ReviewResult<bool> {
+    let eligible_targets = aspects
+        .iter()
+        .filter_map(|aspect| {
+            if aspect.reuse_attestation_target_id.is_some()
+                || !aspect.covered_associations.is_empty()
+                || aspect
+                    .proposed_product
+                    .as_ref()
+                    .and_then(|product| product.id)
+                    .is_some()
+                || validate_independent_ordinary_aspect(aspect, aspects).is_err()
+            {
+                return None;
+            }
+            let suggested = aspect.suggested_product.as_ref()?;
+            let product_id = suggested.id?;
+            let current = approved.get(&product_id)?;
+            (!reuse_attested_ids.contains(&product_id)
+                && staged_suggestion_matches_approved_product(suggested, current))
+            .then_some((aspect.id.clone(), product_id))
+        })
+        .collect::<HashMap<_, _>>();
+    if eligible_targets.is_empty() {
+        return Ok(false);
+    }
+    for aspect in aspects.iter_mut() {
+        if let Some(product_id) = eligible_targets.get(&aspect.id) {
+            aspect.reuse_attestation_target_id = Some(*product_id);
+        }
+    }
+    *aspects = validated_aspects(aspects)?;
+    Ok(true)
+}
+
 fn projected_suggested_product_id(
     aspect: &PendingReviewAspect,
     aspects: &[PendingReviewAspect],
@@ -6520,7 +6619,7 @@ pub async fn prepare_pending_product_reviews(
 
     for row in rows {
         let assignments = load_existing_assignments(db, row.listing_id).await?;
-        let needs_product_source = assignments.iter().any(|assignment| {
+        let assignment_needs_product_source = assignments.iter().any(|assignment| {
             let installed_needs_source = approved.contains_key(&assignment.avionics_model_id)
                 && !reuse_attested_ids.contains(&assignment.avionics_model_id);
             let replacement_needs_source =
@@ -6532,7 +6631,18 @@ pub async fn prepare_pending_product_reviews(
                     });
             installed_needs_source || replacement_needs_source
         });
-        if !needs_product_source {
+        let payload = parse_payload(
+            &row.review_payload_json,
+            Some(&row.review_payload_sha256),
+            row.pending_aspect_count,
+        )?;
+        let mut prospective_aspects = payload.aspects;
+        let suggestion_needs_product_source = add_unattested_suggested_product_targets(
+            &mut prospective_aspects,
+            &approved,
+            &reuse_attested_ids,
+        )?;
+        if !assignment_needs_product_source && !suggestion_needs_product_source {
             continue;
         }
 
@@ -7864,46 +7974,108 @@ fn preflight_decisions(
     Ok((referenced_products, create_products))
 }
 
-pub(crate) async fn approved_product_is_selectable(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApprovedProductSelectionStatus {
+    Selectable,
+    Missing,
+    NotApproved,
+    IncompleteProductGraph,
+    MissingCurrentReuseAttestation,
+}
+
+#[derive(Debug, FromRow)]
+struct ApprovedProductSelectionRow {
+    catalog_status: String,
+    has_graph_identity: bool,
+    has_capability: bool,
+}
+
+async fn approved_product_selection_status(
     db: &AppDb,
     avionics_model_id: i64,
-) -> ReviewResult<bool> {
-    if !current_reuse_attested_product_ids(db)
-        .await?
-        .contains(&avionics_model_id)
-    {
-        return Ok(false);
-    }
+) -> ReviewResult<ApprovedProductSelectionStatus> {
     let sql = db.sql(
         r#"
-        SELECT model.id
-        FROM avionics_models model
-        JOIN avionics_approved_product_graph_identities identity
-          ON identity.avionics_model_id = model.id
-        WHERE model.id = ?
-          AND model.catalog_status = 'approved'
-          AND EXISTS (
+        SELECT
+          model.catalog_status,
+          EXISTS (
+            SELECT 1
+            FROM avionics_approved_product_graph_identities identity
+            WHERE identity.avionics_model_id = model.id
+          ) AS has_graph_identity,
+          EXISTS (
             SELECT 1
             FROM avionics_model_types membership
             WHERE membership.avionics_model_id = model.id
-          )
+          ) AS has_capability
+        FROM avionics_models model
+        WHERE model.id = ?
         "#,
     );
-    let selected = match db.backend() {
+    let row = match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
-            sqlx::query_scalar::<_, i64>(&sql)
+            sqlx::query_as::<_, ApprovedProductSelectionRow>(&sql)
                 .bind(avionics_model_id)
                 .fetch_optional(pool)
                 .await?
         }
         DatabaseBackend::Postgres(pool) => {
-            sqlx::query_scalar::<_, i64>(&sql)
+            sqlx::query_as::<_, ApprovedProductSelectionRow>(&sql)
                 .bind(avionics_model_id)
                 .fetch_optional(pool)
                 .await?
         }
     };
-    Ok(selected.is_some())
+    let Some(row) = row else {
+        return Ok(ApprovedProductSelectionStatus::Missing);
+    };
+    if row.catalog_status != "approved" {
+        return Ok(ApprovedProductSelectionStatus::NotApproved);
+    }
+    if !row.has_graph_identity || !row.has_capability {
+        return Ok(ApprovedProductSelectionStatus::IncompleteProductGraph);
+    }
+    if !current_reuse_attested_product_ids(db)
+        .await?
+        .contains(&avionics_model_id)
+    {
+        return Ok(ApprovedProductSelectionStatus::MissingCurrentReuseAttestation);
+    }
+    Ok(ApprovedProductSelectionStatus::Selectable)
+}
+
+fn product_selection_rejection(
+    aspect_id: &ReviewAspectId,
+    avionics_model_id: i64,
+    status: ApprovedProductSelectionStatus,
+) -> String {
+    match status {
+        ApprovedProductSelectionStatus::Selectable => {
+            unreachable!("selectable products have no rejection reason")
+        }
+        ApprovedProductSelectionStatus::Missing => format!(
+            "review aspect {aspect_id} references missing avionics catalog id {avionics_model_id}"
+        ),
+        ApprovedProductSelectionStatus::NotApproved => format!(
+            "review aspect {aspect_id} references avionics catalog id {avionics_model_id}, which is not an approved catalog product"
+        ),
+        ApprovedProductSelectionStatus::IncompleteProductGraph => format!(
+            "review aspect {aspect_id} references approved avionics catalog id {avionics_model_id}, but that product lacks a complete verified identity and capability assignment"
+        ),
+        ApprovedProductSelectionStatus::MissingCurrentReuseAttestation => format!(
+            "review aspect {aspect_id} references approved avionics catalog id {avionics_model_id}, but that product has no current reuse attestation; verify its authoritative manufacturer source in Known avionics products, then retry this entry"
+        ),
+    }
+}
+
+pub(crate) async fn approved_product_is_selectable(
+    db: &AppDb,
+    avionics_model_id: i64,
+) -> ReviewResult<bool> {
+    Ok(
+        approved_product_selection_status(db, avionics_model_id).await?
+            == ApprovedProductSelectionStatus::Selectable,
+    )
 }
 
 async fn load_catalog_identity(
@@ -8291,12 +8463,15 @@ pub async fn preflight_listing_review_resolution(
     let (referenced_products, create_products) = preflight_decisions(review, &request.decisions)?;
     let mut checked_product_ids = HashSet::new();
     for (aspect_id, avionics_model_id) in referenced_products {
-        if checked_product_ids.insert(avionics_model_id)
-            && !approved_product_is_selectable(db, avionics_model_id).await?
-        {
-            return Err(ReviewError::Validation(format!(
-                "review aspect {aspect_id} references avionics catalog id {avionics_model_id}, which is not an approved verified product"
-            )));
+        if checked_product_ids.insert(avionics_model_id) {
+            let selection_status = approved_product_selection_status(db, avionics_model_id).await?;
+            if selection_status != ApprovedProductSelectionStatus::Selectable {
+                return Err(ReviewError::Validation(product_selection_rejection(
+                    &aspect_id,
+                    avionics_model_id,
+                    selection_status,
+                )));
+            }
         }
     }
     let mut batch_product_keys = HashMap::<(String, String), ReviewAspectId>::new();
@@ -11105,6 +11280,78 @@ mod tests {
     }
 
     #[test]
+    fn unattested_ordinary_suggestion_becomes_a_hash_bound_product_target_only() {
+        let product = ReviewProduct::verified(
+            11,
+            "Garmin",
+            "GTX 345",
+            vec!["Transponder".to_string(), "Datalink".to_string()],
+        )
+        .with_stable_identifier("manufacturer_part_number", "010-01214-01");
+        let mut aspect = pending_aspect("ordinary", 11);
+        aspect.suggested_product = Some(
+            ReviewProduct::verified(11, "Garmin", "GTX-345", vec!["Transponder".to_string()])
+                .with_stable_identifier("manufacturer_part_number", "0100121401"),
+        );
+        let mut aspects = vec![aspect];
+
+        assert!(add_unattested_suggested_product_targets(
+            &mut aspects,
+            &HashMap::from([(11, product)]),
+            &HashSet::new(),
+        )
+        .unwrap());
+        assert_eq!(aspects[0].reuse_attestation_target_id, Some(11));
+        assert_eq!(
+            aspects[0]
+                .suggested_product
+                .as_ref()
+                .and_then(|product| product.id),
+            Some(11),
+            "the staged suggestion remains review context rather than becoming a listing link"
+        );
+        assert!(aspects[0].covered_associations.is_empty());
+        assert_eq!(aspects[0].allowed_actions, vec![ReviewAction::Discard]);
+        assert!(!add_unattested_suggested_product_targets(
+            &mut aspects,
+            &HashMap::from([(
+                11,
+                ReviewProduct::verified(11, "Garmin", "GTX 345", vec!["Transponder".to_string()])
+            )]),
+            &HashSet::new(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn suggestion_target_annotation_rejects_stale_identity_and_relationship_graphs() {
+        let current =
+            ReviewProduct::verified(11, "Garmin", "GTX 345R", vec!["Transponder".to_string()]);
+        let mut stale_identity = vec![pending_aspect("stale", 11)];
+        assert!(!add_unattested_suggested_product_targets(
+            &mut stale_identity,
+            &HashMap::from([(11, current)]),
+            &HashSet::new(),
+        )
+        .unwrap());
+        assert_eq!(stale_identity[0].reuse_attestation_target_id, None);
+
+        let current =
+            ReviewProduct::verified(11, "Garmin", "GTX 345", vec!["Transponder".to_string()]);
+        let mut replacement = pending_aspect("replacement", 11);
+        replacement.configuration_action = "replaces".to_string();
+        replacement.replaces_product_id = Some(12);
+        let mut replacement_graph = vec![replacement];
+        assert!(!add_unattested_suggested_product_targets(
+            &mut replacement_graph,
+            &HashMap::from([(11, current)]),
+            &HashSet::new(),
+        )
+        .unwrap());
+        assert_eq!(replacement_graph[0].reuse_attestation_target_id, None);
+    }
+
+    #[test]
     fn restaging_existing_synthetic_aspect_normalizes_legacy_reason() {
         let assignment = existing_assignment(7, 11, 1, "installed", None);
         let approved = approved_review_products(&[11]);
@@ -13275,6 +13522,75 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             .await
             .unwrap();
         assert_eq!(gemini_usage_after, gemini_usage_before);
+    }
+
+    #[tokio::test]
+    async fn product_queue_prepare_exposes_unlinked_unattested_suggestion_without_accepting_it() {
+        let db = test_db().await;
+        let (owner_user_id, listing_id) = insert_listing(&db).await;
+        let product_id = insert_approved_product(&db, "GTX 345", "GTX345", "Transponder").await;
+        let original = stage_pending_review(
+            &db,
+            listing_id,
+            None,
+            &[pending_aspect("ordinary-suggestion", product_id)],
+        )
+        .await
+        .unwrap();
+
+        let first = prepare_pending_product_reviews(&db, owner_user_id)
+            .await
+            .unwrap();
+        assert_eq!(first.inspected_listing_count, 1);
+        assert_eq!(first.restaged_listing_count, 1);
+        let detail = get_listing_review(&db, owner_user_id, listing_id)
+            .await
+            .unwrap()
+            .review;
+        assert_ne!(detail.review_payload_sha256, original.review_payload_sha256);
+        let aspect = detail
+            .aspects
+            .iter()
+            .find(|aspect| aspect.id == ReviewAspectId::from("ordinary-suggestion"))
+            .unwrap();
+        assert_eq!(
+            aspect
+                .reuse_attestation_target
+                .as_ref()
+                .and_then(|product| product.id),
+            Some(product_id)
+        );
+        assert_eq!(
+            aspect.reuse_attestation_status,
+            Some(ProductAttestationStatus::Required)
+        );
+        assert_eq!(aspect.allowed_actions, vec![ReviewAction::Discard]);
+
+        let queue =
+            list_pending_product_reviews(&db, owner_user_id, ProductReviewPageQuery::default())
+                .await
+                .unwrap();
+        assert!(queue
+            .items
+            .iter()
+            .any(|group| group.product.id == Some(product_id)
+                && group.attestation_status == ProductAttestationStatus::Required));
+        let listing_link_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            listing_link_count, 0,
+            "prepare must not accept the association"
+        );
+
+        let second = prepare_pending_product_reviews(&db, owner_user_id)
+            .await
+            .unwrap();
+        assert_eq!(second.restaged_listing_count, 0);
     }
 
     #[tokio::test]
@@ -15984,7 +16300,33 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         assert!(matches!(
             preflight_listing_review_resolution(&db, &review, &unapproved).await,
             Err(ReviewError::Validation(message))
-                if message.contains("not an approved verified product")
+                if message.contains("not an approved catalog product")
+        ));
+
+        let approved_without_attestation = resolve_request(
+            &review,
+            vec![
+                ReviewDecision::UseVerifiedProduct {
+                    aspect_id: "first".into(),
+                    avionics_model_id: approved_id,
+                },
+                ReviewDecision::Discard {
+                    aspect_id: "second".into(),
+                    reason: "not installed".to_string(),
+                },
+            ],
+        );
+        assert!(matches!(
+            preflight_listing_review_resolution(
+                &db,
+                &review,
+                &approved_without_attestation
+            )
+            .await,
+            Err(ReviewError::Validation(message))
+                if message.contains("approved avionics catalog id")
+                    && message.contains("no current reuse attestation")
+                    && message.contains("Known avionics products")
         ));
     }
 

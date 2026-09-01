@@ -45,6 +45,7 @@ import {
   runProductAssociationWorkers,
   summarizeProductAssociations,
   summarizeProductReviewGroups,
+  useExistingProductRequest,
   validateAvionicsObservationCorrection,
 } from "/review/domain.mjs";
 
@@ -112,6 +113,7 @@ const state = {
   activeArea: "avionics",
   stale: false,
   resolving: false,
+  savingAspectKey: null,
   automating: false,
   automationControlStates: new Map(),
 };
@@ -2166,6 +2168,7 @@ async function openReview(
   state.correctionViews.clear();
   state.stale = false;
   state.resolving = false;
+  state.savingAspectKey = null;
   showWorkspace();
   updateReviewLocation(listingId, historyMode);
   setWorkspaceLoading(listingId);
@@ -2221,12 +2224,13 @@ function isReviewDetail(review, listingId) {
     ));
 }
 
-function initializeDrafts(review) {
+function initializeDrafts(review, preservedDrafts = null) {
+  state.drafts.clear();
   for (const aspect of review.aspects) {
     const key = aspectKey(aspect.id);
     const sourceProduct = aspect.reuse_attestation_target ?? aspect.proposed_product;
     const proposed = normalizedProduct(sourceProduct);
-    state.drafts.set(key, {
+    const draft = {
       aspect,
       // This is only a local draft default. Resolution still requires the
       // reviewer to submit the complete decision set to the server.
@@ -2250,7 +2254,27 @@ function initializeDrafts(review) {
         identityEvidenceText: optionalText(sourceProduct?.identity_evidence_text),
       },
       discardReason: "",
-    });
+      savingDecision: false,
+      decisionError: "",
+    };
+    const preserved = preservedDrafts?.get(key);
+    if (preserved) {
+      draft.action = allowedActions(aspect).includes(preserved.action)
+        ? preserved.action
+        : draft.action;
+      draft.catalogProduct = preserved.catalogProduct;
+      draft.create = {
+        ...preserved.create,
+        capabilities: [...preserved.create.capabilities],
+      };
+      draft.discardReason = preserved.discardReason;
+      draft.decisionError = preserved.decisionError;
+      draft.correction = {
+        ...preserved.correction,
+        saving: false,
+      };
+    }
+    state.drafts.set(key, draft);
   }
 }
 
@@ -2777,13 +2801,36 @@ function renderAspect(aspect, index, total) {
   validation.textContent = "Choose how this observation should be resolved.";
   decision.append(validation);
 
+  const saveControls = document.createElement("div");
+  saveControls.className = "review-aspect-save-controls is-hidden";
+  const saveDecision = document.createElement("button");
+  saveDecision.type = "button";
+  saveDecision.className = "button button-primary";
+  saveDecision.textContent = "Save verified product for this entry";
+  saveDecision.addEventListener("click", () => {
+    saveUseExistingProduct(key);
+  });
+  const saveResult = document.createElement("p");
+  saveResult.className = "review-aspect-save-result";
+  saveResult.setAttribute("aria-live", "polite");
+  saveControls.append(saveDecision, saveResult);
+  decision.append(saveControls);
+
   if (!allowedActions(aspect).length) {
     validation.classList.add("error");
     validation.textContent = "The server did not provide an allowed review action for this aspect.";
   }
 
   article.append(header, context, decision);
-  state.aspectViews.set(key, { article, status, panels, validation });
+  state.aspectViews.set(key, {
+    article,
+    status,
+    panels,
+    validation,
+    saveControls,
+    saveDecision,
+    saveResult,
+  });
   syncAspectView(key);
   return article;
 }
@@ -3055,11 +3102,12 @@ async function saveObservationCorrection(key, button) {
     if (!isReviewDetail(refreshed, review.listing_id)) {
       throw new Error("The server returned an invalid refreshed listing review.");
     }
+    const preservedDrafts = new Map(state.drafts);
+    preservedDrafts.delete(key);
     state.currentReview = refreshed;
-    state.drafts.clear();
     state.aspectViews.clear();
     state.correctionViews.clear();
-    initializeDrafts(refreshed);
+    initializeDrafts(refreshed, preservedDrafts);
     renderReview();
     setWorkspaceMessage(
       "Corrected values saved. Select or verify the product using the refreshed review.",
@@ -3089,6 +3137,7 @@ function actionOption(aspect, action, key) {
     }
     const draft = state.drafts.get(key);
     draft.action = action;
+    draft.decisionError = "";
     syncAllAspectViews();
     updateProgress();
   });
@@ -3322,6 +3371,32 @@ function syncAspectView(key) {
       : "Review required";
   view.validation.classList.toggle("error", draft.action !== null && !validation.valid);
   view.validation.textContent = validation.message;
+  const canSaveIndividually = draft.action === "use_verified_product";
+  view.saveControls.classList.toggle(
+    "is-hidden",
+    !canSaveIndividually && !nonBlank(draft.decisionError),
+  );
+  view.saveDecision.classList.toggle("is-hidden", !canSaveIndividually);
+  view.saveDecision.disabled = !canSaveIndividually
+    || !validation.valid
+    || draft.correction.dirty
+    || draft.correction.saving
+    || state.savingAspectKey !== null
+    || state.stale
+    || state.resolving
+    || state.automating;
+  view.saveDecision.textContent = draft.savingDecision
+    ? "Saving this entry…"
+    : "Save verified product for this entry";
+  view.saveResult.classList.toggle("error", nonBlank(draft.decisionError));
+  view.saveResult.setAttribute("role", nonBlank(draft.decisionError) ? "alert" : "status");
+  view.saveResult.textContent = draft.decisionError
+    ? `Could not save this entry: ${draft.decisionError}`
+    : draft.savingDecision
+      ? "Saving only this avionics entry. Other decisions remain unchanged."
+      : canSaveIndividually
+        ? "Save this match now; the listing review will retain every other unresolved entry."
+        : "";
 }
 
 function currentCanonicalProductConflicts() {
@@ -3361,6 +3436,12 @@ function validateDraft(draft) {
   if (draft.action === "use_verified_product") {
     if (positiveInteger(draft.catalogProduct?.id) === null) {
       return { valid: false, message: "Select one approved avionics catalog product." };
+    }
+    if (draft.catalogProduct.reuseEligible === false) {
+      return {
+        valid: false,
+        message: "This approved product is not reusable under the current policy. Verify its reusable manufacturer source in Known avionics products first.",
+      };
     }
     return validDraftResult(draft, "Verified catalog product selected.");
   }
@@ -3471,17 +3552,20 @@ function updateProgress() {
       + `${decided} decided, ${remaining} remaining`,
   );
   elements.verifyListing.disabled = state.resolving
+    || state.savingAspectKey !== null
     || state.automating
     || state.stale
     || !state.currentReview
     || !presentation.manualReviewEligibility.eligible;
   elements.rebuildAvionicsReview.disabled = state.resolving
+    || state.savingAspectKey !== null
     || state.automating
     || state.stale
     || !state.currentReview
     || drafts.some((draft) => draft.correction.dirty || draft.correction.saving)
     || !nonBlank(state.currentReview?.review_payload_sha256);
   elements.automaticallyVerifyListing.disabled = state.resolving
+    || state.savingAspectKey !== null
     || state.automating
     || state.stale
     || !state.currentReview
@@ -3498,7 +3582,13 @@ function updateProgress() {
 
 async function automaticallyVerifyListing() {
   const review = state.currentReview;
-  if (!review || state.stale || state.resolving || state.automating) {
+  if (
+    !review
+    || state.stale
+    || state.resolving
+    || state.savingAspectKey !== null
+    || state.automating
+  ) {
     return;
   }
   await startVerificationRun([review.listing_id], { openedListing: true });
@@ -3506,7 +3596,13 @@ async function automaticallyVerifyListing() {
 
 async function rebuildAvionicsReview() {
   const review = state.currentReview;
-  if (!review || state.stale || state.resolving || state.automating) {
+  if (
+    !review
+    || state.stale
+    || state.resolving
+    || state.savingAspectKey !== null
+    || state.automating
+  ) {
     return;
   }
   if (!confirm(
@@ -3630,7 +3726,13 @@ function setAutomaticVerificationBusy(busy) {
 
 async function resolveReview() {
   const review = state.currentReview;
-  if (!review || state.stale || state.resolving || state.automating) {
+  if (
+    !review
+    || state.stale
+    || state.resolving
+    || state.savingAspectKey !== null
+    || state.automating
+  ) {
     return;
   }
   if (!aircraftIdentityIsVerified(review.aircraft_identity)) {
@@ -3759,14 +3861,127 @@ async function resolveReview() {
           `Review decisions were saved, but the response was interrupted. Inspect listing ${resolvedListingId} to confirm its final enrichment state.`,
         );
       } else {
-        setWorkspaceMessage(`Could not verify listing: ${error.message}`, true);
+        showAspectResolutionError(error);
       }
     } else {
-      setWorkspaceMessage(`Could not verify listing: ${error.message}`, true);
+      showAspectResolutionError(error);
     }
   } finally {
     state.resolving = false;
     setButtonBusy(elements.verifyListing, false);
+    syncAllAspectViews();
+    updateProgress();
+  }
+}
+
+function showAspectResolutionError(error) {
+  const detail = error?.message || "The server rejected the listing review.";
+  const matchingKey = Array.from(state.drafts.keys())
+    .sort((left, right) => right.length - left.length)
+    .find((key) => {
+      const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(
+        `(?:review\\s+)?aspect\\s+${escapedKey}(?=\\s|[,:;.()\\[\\]-]|$)`,
+        "i",
+      ).test(detail);
+    });
+  if (matchingKey === undefined) {
+    setWorkspaceMessage(`Could not verify listing: ${detail}`, true);
+    return;
+  }
+  const draft = state.drafts.get(matchingKey);
+  draft.decisionError = detail;
+  syncAspectView(matchingKey);
+  const label = draft.aspect?.label || `aspect ${matchingKey}`;
+  setWorkspaceMessage(
+    `Could not verify the listing because ${label} failed. The exact error is shown on that card.`,
+    true,
+  );
+  state.aspectViews.get(matchingKey)?.article.scrollIntoView({
+    behavior: "smooth",
+    block: "start",
+  });
+}
+
+async function saveUseExistingProduct(key) {
+  const review = state.currentReview;
+  const draft = state.drafts.get(key);
+  const productId = positiveInteger(draft?.catalogProduct?.id);
+  const validation = draft ? validateDraft(draft) : { valid: false };
+  if (
+    !review
+    || !draft
+    || productId === null
+    || draft.action !== "use_verified_product"
+    || !validation.valid
+    || draft.correction.dirty
+    || draft.correction.saving
+    || state.savingAspectKey !== null
+    || state.stale
+    || state.resolving
+    || state.automating
+  ) {
+    syncAspectView(key);
+    return;
+  }
+
+  state.savingAspectKey = key;
+  draft.savingDecision = true;
+  draft.decisionError = "";
+  syncAllAspectViews();
+  updateProgress();
+  setWorkspaceMessage(`Saving only this avionics entry as catalog product ${productId}…`);
+  try {
+    const payload = await api(
+      `/api/review/listings/${review.listing_id}/avionics/use-existing`,
+      {
+        method: "POST",
+        body: JSON.stringify(useExistingProductRequest(
+          review.review_payload_sha256,
+          review.catalog_revision_sha256,
+          draft.aspect.id,
+          productId,
+        )),
+      },
+    );
+    if (state.currentReview !== review || state.savingAspectKey !== key) {
+      return;
+    }
+    if (isCompletedReviewMaintenanceResponse(payload)) {
+      state.savingAspectKey = null;
+      await leaveCompletedOneByOneReview(review.listing_id, payload);
+      return;
+    }
+    const refreshed = payload?.review;
+    if (!isReviewDetail(refreshed, review.listing_id)) {
+      throw new Error("The server returned an invalid refreshed listing review.");
+    }
+    const preservedDrafts = new Map(state.drafts);
+    state.currentReview = refreshed;
+    state.savingAspectKey = null;
+    state.aspectViews.clear();
+    state.correctionViews.clear();
+    initializeDrafts(refreshed, preservedDrafts);
+    renderReview();
+    setWorkspaceMessage(
+      `Saved ${draft.catalogProduct.displayName} for this entry. Review the remaining avionics entries.`,
+    );
+  } catch (error) {
+    if (state.currentReview !== review || state.savingAspectKey !== key) {
+      return;
+    }
+    state.savingAspectKey = null;
+    draft.savingDecision = false;
+    draft.decisionError = error?.message || "The server rejected this avionics decision.";
+    if (isStaleError(error)) {
+      markStale(error.message);
+    } else {
+      setWorkspaceMessage(
+        "This avionics entry was not saved. The exact error is shown on its card.",
+        true,
+      );
+    }
+    syncAllAspectViews();
     updateProgress();
   }
 }
@@ -3800,17 +4015,17 @@ async function validateExistingAssociation(key, button) {
     );
     const refreshed = payload?.review;
     if (isCompletedReviewMaintenanceResponse(payload)) {
-      await leaveCompletedOneByOneReview(review.listing_id);
+      await leaveCompletedOneByOneReview(review.listing_id, payload);
       return;
     }
     if (!isReviewDetail(refreshed, review.listing_id)) {
       throw new Error("The server returned an invalid refreshed listing review.");
     }
+    const preservedDrafts = new Map(state.drafts);
     state.currentReview = refreshed;
-    state.drafts.clear();
     state.aspectViews.clear();
     state.correctionViews.clear();
-    initializeDrafts(refreshed);
+    initializeDrafts(refreshed, preservedDrafts);
     renderReview();
     setWorkspaceMessage(
       `The listing text matched catalog product ${targetId}. Review the remaining aspects.`,
@@ -3826,7 +4041,7 @@ async function validateExistingAssociation(key, button) {
   }
 }
 
-async function leaveCompletedOneByOneReview(listingId) {
+async function leaveCompletedOneByOneReview(listingId, outcome) {
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
@@ -3842,10 +4057,27 @@ async function leaveCompletedOneByOneReview(listingId) {
     Promise.resolve(refreshAvionics?.()),
   ]);
   showQueue({ historyMode: "replace", discardDraft: true });
+  const listingReady = outcome?.listing_ready === true;
+  const listingVerified = outcome?.listing_verified === true;
+  const finalizationError = optionalText(outcome?.finalization_error);
+  if (listingReady && listingVerified) {
+    setQueueMessage(
+      state.total === 0
+        ? `Listing ${listingId} is verified and ready. The review queue is clear.`
+        : `Listing ${listingId} is verified and ready.`,
+    );
+    return;
+  }
+  if (nonBlank(finalizationError)) {
+    setQueueMessage(
+      `The final avionics decision for listing ${listingId} was saved, but the listing could not be verified: ${finalizationError}`,
+      true,
+    );
+    return;
+  }
   setQueueMessage(
-    state.total === 0
-      ? `Listing ${listingId} review completed. The review queue is clear.`
-      : `Listing ${listingId} review completed.`,
+    `The review decisions for listing ${listingId} were saved, but the server did not confirm that the listing is verified and ready.`,
+    true,
   );
 }
 
@@ -3960,6 +4192,9 @@ async function searchCatalog(searchKey, key, query, results, selected, message, 
       return;
     }
     const items = Array.isArray(payload?.catalog?.items) ? payload.catalog.items : [];
+    const unavailableCount = items.filter(
+      (item) => normalizedProduct(item)?.reuseEligible === false,
+    ).length;
     results.replaceChildren(
       ...items.map((item) => catalogResult(item, () => {
         if (typeof onSelect === "function") {
@@ -3971,6 +4206,7 @@ async function searchCatalog(searchKey, key, query, results, selected, message, 
           return;
         }
         draft.catalogProduct = normalizedProduct(item);
+        draft.decisionError = "";
         renderSelectedCatalogProduct(selected, draft.catalogProduct);
         message.textContent = `${draft.catalogProduct.displayName} selected.`;
         message.classList.remove("error");
@@ -3981,7 +4217,9 @@ async function searchCatalog(searchKey, key, query, results, selected, message, 
     );
     message.classList.remove("error");
     message.textContent = items.length
-      ? `${items.length} approved ${pluralize(items.length, "match")} found.`
+      ? unavailableCount > 0
+        ? `${items.length} approved ${pluralize(items.length, "match")} found; ${unavailableCount} ${pluralize(unavailableCount, "product")} must have its reusable source verified in Known avionics products before selection.`
+        : `${items.length} approved ${pluralize(items.length, "match")} found.`
       : "No approved avionics matched this search.";
   } catch (error) {
     if (state.catalogSearchSequences.get(searchKey) === sequence) {
@@ -4001,14 +4239,23 @@ function catalogResult(item, onSelect) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "review-catalog-result";
-  button.disabled = !product || positiveInteger(product.id) === null;
+  button.disabled = !product
+    || positiveInteger(product.id) === null
+    || product.reuseEligible === false;
+  button.classList.toggle("not-reusable", product?.reuseEligible === false);
   const title = document.createElement("strong");
   title.textContent = product?.displayName || "Unknown catalog product";
   const metadata = document.createElement("span");
   metadata.textContent = [
     product?.stableIdentifier,
     product?.capabilities.join(", "),
+    product?.reuseEligible === false
+      ? "Reusable source verification required"
+      : "",
   ].filter(nonBlank).join(" · ") || "Approved catalog entry";
+  if (product?.reuseEligible === false) {
+    button.title = "Verify this product under Known avionics products before assigning it to a listing.";
+  }
   button.append(title, metadata);
   button.addEventListener("click", onSelect);
   return button;
@@ -4034,6 +4281,12 @@ function renderSelectedCatalogProduct(container, product) {
     product.stableIdentifier,
   ].filter(nonBlank).join(" · ");
   container.append(eyebrow, title, metadata, renderAvionicsChips(product.capabilities));
+  if (product.reuseEligible === false) {
+    const warning = document.createElement("p");
+    warning.className = "review-product-reuse-warning";
+    warning.textContent = "This approved product still needs reusable manufacturer-source verification in Known avionics products.";
+    container.append(warning);
+  }
   appendProductIdentityEvidence(container, product);
 }
 
@@ -4064,10 +4317,15 @@ async function loadSelectedProductEvidence(key, productId, selected, message) {
     const hasAuthoritativeEvidence = authoritativeIdentityUrl(
       draft.catalogProduct.identitySourceUrl,
     ) && nonBlank(draft.catalogProduct.identityEvidenceText);
-    message.classList.toggle("error", !hasAuthoritativeEvidence);
-    message.textContent = hasAuthoritativeEvidence
-      ? `${draft.catalogProduct.displayName} selected with authoritative identity evidence.`
-      : `${draft.catalogProduct.displayName} selected, but its catalog identity evidence is incomplete.`;
+    const reusable = draft.catalogProduct.reuseEligible !== false;
+    message.classList.toggle("error", !hasAuthoritativeEvidence || !reusable);
+    message.textContent = !reusable
+      ? `${draft.catalogProduct.displayName} is approved, but its reusable manufacturer source must be verified in Known avionics products before selection.`
+      : hasAuthoritativeEvidence
+        ? `${draft.catalogProduct.displayName} selected with authoritative identity evidence.`
+        : `${draft.catalogProduct.displayName} selected, but its catalog identity evidence is incomplete.`;
+    syncAllAspectViews();
+    updateProgress();
   } catch (error) {
     const draft = state.drafts.get(key);
     if (positiveInteger(draft?.catalogProduct?.id) !== productId) {
@@ -4151,6 +4409,7 @@ function normalizedProduct(value) {
   const stableIdentifier = nonBlank(stableIdentifierValue)
     ? [displayLabel(stableIdentifierKind), stableIdentifierValue].filter(nonBlank).join(" ")
     : "";
+  const reuseEligibleValue = value.catalog?.reuse_eligible ?? value.reuse_eligible;
   return {
     id,
     manufacturer,
@@ -4161,6 +4420,7 @@ function normalizedProduct(value) {
     capabilities,
     stableIdentifier,
     catalogStatus: value.catalog?.status ?? value.catalog_status,
+    reuseEligible: typeof reuseEligibleValue === "boolean" ? reuseEligibleValue : null,
     identitySourceUrl: optionalText(value.identity_source_url),
     identitySourceTitle: optionalText(value.identity_source_title),
     identityEvidenceText: optionalText(value.identity_evidence_text),
@@ -4355,6 +4615,7 @@ function showQueue({ historyMode = "push", discardDraft = false } = {}) {
   state.correctionViews.clear();
   state.stale = false;
   state.resolving = false;
+  state.savingAspectKey = null;
   state.automating = false;
   state.automationControlStates.clear();
   elements.reviewWorkspace.setAttribute("aria-busy", "false");

@@ -412,8 +412,7 @@ reviewer corrects the extraction to one source-supported occurrence and explicit
 quantity, discards a duplicate observation, or selects the genuinely different
 product variant.
 
-Ordinary extracted avionics aspects offer three decisions. The reviewer chooses
-exactly one before **Complete manual review** is enabled:
+Ordinary extracted avionics aspects offer three decisions:
 
 - **Use verified product** searches and selects one existing approved catalog
   identity.
@@ -422,6 +421,25 @@ exactly one before **Complete manual review** is enabled:
   and authoritative identity source URL, title, and evidence text.
 - **Discard observation** requires a reason and creates neither a catalog row
   nor a listing association.
+
+An existing-product match can be committed immediately with **Save verified
+product for this entry**. The server updates only that occurrence, removes its
+card from the hash-bound review, and returns a fresh revision for the remaining
+cards; unsaved browser drafts for those cards are preserved. The final saved
+card runs the ordinary canonical listing finalizer automatically. The UI reports
+completion only when the returned listing is both `ready` and verified, and
+keeps any exact association or finalization failure on the affected card or in
+the terminal result instead of replacing it with a listing-wide generic error.
+Create and discard decisions continue to participate in the atomic complete
+review action when they remain.
+
+Catalog search results expose `catalog.reuse_eligible`. An approved product that
+lacks a current reusable manufacturer-source attestation remains visible for
+diagnosis but cannot be selected. Preparing the Known avionics products queue
+also promotes a still-current approved suggestion on an independent ordinary
+occurrence into an explicit product-attestation target. This lets the reviewer
+verify the OEM source once, validate each retained listing occurrence locally,
+and then return to manual review without recreating the catalog product.
 
 Each avionics card also allows the reviewer to correct the extracted
 manufacturer, model, canonical capabilities, and quantity. A fresh unlinked
@@ -695,7 +713,13 @@ coverage, implicit association merges, quantity changes, and invalid action
 graphs. The ordinary single-aspect `use-existing` route continues to reject
 both sides of a replacement relationship.
 
-The resolve request includes `review_payload_sha256`,
+The aspect-scoped `use-existing`, `verify-existing`, and replacement responses
+include the refreshed `review`, current `listing`, `review_complete`,
+`listing_ready`, `listing_verified`, `finalization_attempted`, and an exact
+`finalization_error` when the last-card finalizer fails. A non-terminal response
+contains the next review revision and never finalizes the listing.
+
+The complete resolve request includes `review_payload_sha256`,
 `catalog_revision_sha256`, one decision for every returned aspect, and an
 optional `finalize_listing` boolean. Both hashes are optimistic concurrency
 controls. `finalize_listing` defaults to `false`, so API and batch reviewers

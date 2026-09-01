@@ -1602,19 +1602,34 @@ async fn review_maintenance_response(
     listing_id: i64,
     staged: Option<StagedPendingReview>,
 ) -> Result<Json<Value>, ApiError> {
-    match staged {
+    let review = match staged {
         Some(_) => {
             let detail = get_listing_review(db, owner_user_id, listing_id).await?;
-            Ok(Json(json!({
-                "review": detail.review,
-                "review_complete": false
-            })))
+            Some(detail.review)
         }
-        None => Ok(Json(json!({
-            "review": Value::Null,
-            "review_complete": true
-        }))),
-    }
+        None => None,
+    };
+    let review_complete = review.is_none();
+    let finalization_error = if review_complete {
+        finalize_reviewed_listing_ingestion(db, listing_id)
+            .await
+            .err()
+            .map(|error| error.to_string())
+    } else {
+        None
+    };
+    let listing = get_listing(db, owner_user_id, listing_id).await?;
+    let listing_ready = listing.ingestion_state == "ready";
+    let listing_verified = listing.is_verified;
+    Ok(Json(json!({
+        "review": review,
+        "review_complete": review_complete,
+        "listing": listing,
+        "listing_ready": listing_ready,
+        "listing_verified": listing_verified,
+        "finalization_attempted": review_complete,
+        "finalization_error": finalization_error,
+    })))
 }
 
 /// Apply one ordinary `use_verified_product` decision without resolving,
@@ -2599,6 +2614,7 @@ mod tests {
         UseExistingReviewAvionicsRequest, VerificationRunItemsHttpQuery,
         VerifyExistingReviewAvionicsRequest, REVIEW_AUTOMATION_JS,
     };
+    use crate::aircraft::faa::require_listing_faa_admission;
     use crate::avionics::catalog::{ApprovedAvionicsIdentity, ReviewDirectSourceVerification};
     use crate::avionics::inspection::AvionicsCatalogQuery;
     use crate::avionics::manufacturer::{
@@ -4388,6 +4404,170 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn aspect_scoped_use_existing_reports_missing_reuse_attestation_actionably() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let product_id = insert_approved_garmin_product(&db).await;
+        let aspect = PendingReviewAspect::avionics(
+            "selected-observation",
+            "avionics_identity",
+            "Garmin GNS 430W",
+            "Garmin GNS 430W navigator",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some("Garmin GNS 430W navigator".to_string()),
+            Some("high".to_string()),
+        );
+        let staged = stage_pending_review(&db, listing_id, None, &[aspect])
+            .await
+            .unwrap();
+
+        let error = use_existing_review_avionics_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(UseExistingReviewAvionicsRequest {
+                expected_review_payload_sha256: staged.review_payload_sha256.clone(),
+                expected_catalog_revision_sha256: staged.catalog_revision_sha256,
+                aspect_id: "selected-observation".into(),
+                avionics_model_id: product_id,
+            }),
+        )
+        .await
+        .expect_err("an approved product still requires current reuse attestation");
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, Some("review_conflict"));
+        assert!(error.message.contains("approved avionics catalog id"));
+        assert!(error.message.contains("no current reuse attestation"));
+        assert!(error.message.contains("Known avionics products"));
+        let current = get_listing_review(&db, owner_user_id, listing_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            current.review.review_payload_sha256,
+            staged.review_payload_sha256
+        );
+    }
+
+    #[tokio::test]
+    async fn final_aspect_scoped_use_existing_attempts_canonical_finalization() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlite_pool(&db);
+        let (_owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let product_id = insert_approved_garmin_product(&db).await;
+        attest_approved_garmin_product(&db, product_id).await;
+        let aspect = PendingReviewAspect::avionics(
+            "selected-observation",
+            "avionics_identity",
+            "Garmin GNS 430W",
+            "Garmin GNS 430W navigator",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some("Garmin GNS 430W navigator".to_string()),
+            Some("high".to_string()),
+        );
+        let staged = stage_pending_review(&db, listing_id, None, &[aspect])
+            .await
+            .unwrap();
+
+        let response = use_existing_review_avionics_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(UseExistingReviewAvionicsRequest {
+                expected_review_payload_sha256: staged.review_payload_sha256,
+                expected_catalog_revision_sha256: staged.catalog_revision_sha256,
+                aspect_id: "selected-observation".into(),
+                avionics_model_id: product_id,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response["review"].is_null());
+        assert_eq!(response["review_complete"], true);
+        assert_eq!(response["finalization_attempted"], true);
+        assert_eq!(response["listing_ready"], false);
+        assert_eq!(response["listing_verified"], false);
+        assert_eq!(response["listing"]["ingestion_state"], "quarantined");
+        let finalization_error = response["finalization_error"]
+            .as_str()
+            .expect("the exact canonical aircraft blocker should be returned");
+        assert!(finalization_error.contains("FAA aircraft admission rejected"));
+        assert_eq!(
+            response["listing"]["ingestion_error"].as_str(),
+            Some(finalization_error)
+        );
+        let pending_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(pending_count, 0);
+    }
+
+    #[tokio::test]
+    async fn final_aspect_scoped_use_existing_returns_ready_verified_listing() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (_owner_user_id, listing_id) = insert_review_listing(&db).await;
+        insert_server_faa_admission(&db, listing_id).await;
+        let grounding = require_listing_faa_admission(&db, listing_id)
+            .await
+            .expect("the server FAA fixture should admit");
+        crate::aircraft::identity::seed_test_curated_identity_assignment(
+            &db, listing_id, &grounding,
+        )
+        .await
+        .expect("the fixture should receive its exact canonical hierarchy");
+        let product_id = insert_approved_garmin_product(&db).await;
+        attest_approved_garmin_product(&db, product_id).await;
+        let aspect = PendingReviewAspect::avionics(
+            "selected-observation",
+            "avionics_identity",
+            "Garmin GNS 430W",
+            "Garmin GNS 430W navigator",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some("Garmin GNS 430W navigator".to_string()),
+            Some("high".to_string()),
+        );
+        let staged = stage_pending_review(&db, listing_id, None, &[aspect])
+            .await
+            .unwrap();
+
+        let response = use_existing_review_avionics_handler(
+            State(test_state(db)),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(UseExistingReviewAvionicsRequest {
+                expected_review_payload_sha256: staged.review_payload_sha256,
+                expected_catalog_revision_sha256: staged.catalog_revision_sha256,
+                aspect_id: "selected-observation".into(),
+                avionics_model_id: product_id,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response["review"].is_null());
+        assert_eq!(response["review_complete"], true);
+        assert_eq!(response["finalization_attempted"], true);
+        assert!(response["finalization_error"].is_null());
+        assert_eq!(response["listing_ready"], true);
+        assert_eq!(response["listing_verified"], true);
+        assert_eq!(response["listing"]["ingestion_state"], "ready");
+        assert_eq!(response["listing"]["is_verified"], true);
     }
 
     #[tokio::test]

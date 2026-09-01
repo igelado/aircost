@@ -14,6 +14,7 @@ use sqlx::FromRow;
 use crate::avionics::authorization::{
     listing_authorization_state_postgres, listing_authorization_state_sqlite,
 };
+use crate::avionics::reuse::current_reuse_attested_product_ids;
 use crate::db::{AppDb, DatabaseBackend};
 use crate::normalize::{
     normalize_avionics_identifier, normalize_avionics_manufacturer_name,
@@ -84,6 +85,9 @@ pub struct AvionicsCatalogState {
     pub status: String,
     pub identity_confidence: Option<String>,
     pub reviewed_at: Option<String>,
+    /// Whether this exact approved identity may be selected for a listing
+    /// without running product grounding again.
+    pub reuse_eligible: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -840,6 +844,7 @@ fn completeness_blockers(row: &RawSummary) -> Vec<String> {
 fn summary_from_raw(
     row: RawSummary,
     capabilities: Vec<AvionicsCapability>,
+    reuse_eligible: bool,
 ) -> AvionicsCatalogSummary {
     let blockers = completeness_blockers(&row);
     AvionicsCatalogSummary {
@@ -859,6 +864,7 @@ fn summary_from_raw(
             status: row.catalog_status,
             identity_confidence: row.identity_confidence,
             reviewed_at: row.catalog_reviewed_at,
+            reuse_eligible,
         },
         introduced_year: row.introduced_year,
         discontinued_year: row.discontinued_year,
@@ -899,12 +905,14 @@ pub async fn list_avionics_catalog(
     if let Some(search) = query.search.as_ref() {
         raw.sort_by_key(|row| search.rank(row));
     }
+    let reuse_eligible_ids = current_reuse_attested_product_ids(db).await?;
     let mut capabilities = load_capabilities(db, None).await?;
     let mut items = raw
         .into_iter()
         .map(|row| {
             let row_capabilities = capabilities.remove(&row.id).unwrap_or_default();
-            summary_from_raw(row, row_capabilities)
+            let reuse_eligible = reuse_eligible_ids.contains(&row.id);
+            summary_from_raw(row, row_capabilities, reuse_eligible)
         })
         .filter(|item| {
             query
@@ -1368,7 +1376,14 @@ pub async fn get_avionics_catalog_detail(
         reviewed_at: row.catalog_reviewed_at.clone(),
     };
     let mut capabilities = load_capabilities(db, Some(model_id)).await?;
-    let summary = summary_from_raw(row, capabilities.remove(&model_id).unwrap_or_default());
+    let reuse_eligible = current_reuse_attested_product_ids(db)
+        .await?
+        .contains(&model_id);
+    let summary = summary_from_raw(
+        row,
+        capabilities.remove(&model_id).unwrap_or_default(),
+        reuse_eligible,
+    );
     let (suite_components, suite_memberships, listing_occurrences, references) = tokio::try_join!(
         load_suite_relationships(db, model_id, true),
         load_suite_relationships(db, model_id, false),
@@ -1877,6 +1892,35 @@ mod tests {
 
     async fn fixture() -> (AppDb, i64, i64, i64) {
         fixture_with_ready_listing(true).await
+    }
+
+    #[tokio::test]
+    async fn catalog_reports_approved_products_that_are_not_reuse_eligible() {
+        let (db, current_user_id, _, avionics_id) = fixture().await;
+        execute(
+            &db,
+            &format!(
+                "DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = {avionics_id}"
+            ),
+        )
+        .await;
+
+        let page = list_avionics_catalog(
+            &db,
+            current_user_id,
+            AvionicsCatalogQuery {
+                search: Some("VISIBLE-1".to_string()),
+                status: Some("approved".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, avionics_id);
+        assert_eq!(page.items[0].catalog.status, "approved");
+        assert!(!page.items[0].catalog.reuse_eligible);
     }
 
     #[tokio::test]

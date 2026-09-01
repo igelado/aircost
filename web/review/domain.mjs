@@ -25,8 +25,7 @@ export function avionicsRebuildBlockMessage(reasonCode) {
   return "The avionics cards could not be rebuilt safely. No review state was changed.";
 }
 
-// Build the single source-free request contract used for both preserved
-// associations and ordinary hash-bound extraction aspects.
+// Build the source-free corroboration request for a preserved association.
 export function existingProductVerificationRequest(
   reviewPayloadSha256,
   catalogRevisionSha256,
@@ -36,6 +35,20 @@ export function existingProductVerificationRequest(
     review_payload_sha256: reviewPayloadSha256,
     catalog_revision_sha256: catalogRevisionSha256,
     aspect_id: aspectId,
+  };
+}
+
+export function useExistingProductRequest(
+  reviewPayloadSha256,
+  catalogRevisionSha256,
+  aspectId,
+  avionicsModelId,
+) {
+  return {
+    review_payload_sha256: reviewPayloadSha256,
+    catalog_revision_sha256: catalogRevisionSha256,
+    aspect_id: aspectId,
+    avionics_model_id: avionicsModelId,
   };
 }
 
