@@ -1913,6 +1913,19 @@ fn validate_current_avionics_identity_evidence_occurrence(
         Some(exact_visible_evidence_locator),
     );
     let evidence_context = ListingEvidenceContext::from_cleaned_text(evidence);
+    let controller_interposed_dual_identity = controller_field.is_some_and(|field| {
+        controller_field_has_exact_evidence_line(field, evidence)
+            && observation
+                .manufacturer
+                .as_deref()
+                .is_some_and(|manufacturer| {
+                    exact_controller_interposed_dual_identity_annotation(
+                        evidence,
+                        manufacturer,
+                        &observation.model,
+                    )
+                })
+    });
     let controller_annotation_identity = controller_field.is_some_and(|field| {
         controller_field_has_exact_evidence_line(field, evidence)
             && (exact_controller_run_on_capability_annotation(
@@ -1928,7 +1941,7 @@ fn validate_current_avionics_identity_evidence_occurrence(
                     &observation.avionics_types,
                     Some(observation.quantity),
                 ))
-    });
+    }) || controller_interposed_dual_identity;
     let candidate_identity_present = extraction_occurrence_has_exact_identity(
         &evidence_context,
         observation.manufacturer.as_deref(),
@@ -1949,12 +1962,13 @@ fn validate_current_avionics_identity_evidence_occurrence(
         .manufacturer
         .as_deref()
         .is_some_and(|manufacturer| {
-            !manufacturer_has_separate_source_token(
-                evidence,
-                manufacturer,
-                &observation.model,
-                controller_annotation_identity,
-            )
+            !controller_interposed_dual_identity
+                && !manufacturer_has_separate_source_token(
+                    evidence,
+                    manufacturer,
+                    &observation.model,
+                    controller_annotation_identity,
+                )
         })
     {
         return Err(AvionicsValidationFailure::occurrence(
@@ -2330,6 +2344,45 @@ fn exact_controller_dual_plural_waas_annotation(
         return false;
     };
     exact_declared_slash_capabilities(capabilities, avionics_types, true)
+}
+
+/// Admit the exact Controller quantity grammar where `Dual` separates a
+/// literal manufacturer from its model and the remaining words are only the
+/// source-authored AI/ADI and HSI role pair. The role labels may establish
+/// capabilities, but they can never become part of the returned model.
+fn exact_controller_interposed_dual_identity_annotation(
+    evidence: &str,
+    manufacturer: &str,
+    model: &str,
+) -> bool {
+    if evidence_identity_tokens(model)
+        .iter()
+        .any(|token| matches!(token.value.as_str(), "ai" | "adi" | "hsi" | "pfd" | "mfd"))
+    {
+        return false;
+    }
+    let evidence = evidence.trim();
+    let Some(manufacturer_end) = exact_normalized_identity_prefix_end(evidence, "", manufacturer)
+    else {
+        return false;
+    };
+    let Some(after_manufacturer) = strip_required_whitespace_prefix(&evidence[manufacturer_end..])
+    else {
+        return false;
+    };
+    let Some(after_dual) = strip_ascii_case_prefix(after_manufacturer, "Dual")
+        .and_then(strip_required_whitespace_prefix)
+    else {
+        return false;
+    };
+    let Some(model_end) = exact_normalized_identity_prefix_end(after_dual, "", model) else {
+        return false;
+    };
+    let suffix = normalize_source_evidence_span(&after_dual[model_end..]);
+    matches!(
+        suffix.as_str(),
+        "ai hsi" | "ai and hsi" | "adi hsi" | "adi and hsi"
+    )
 }
 
 fn exact_normalized_identity_prefix_end(
@@ -2973,6 +3026,51 @@ mod tests {
                 confidence,
                 safe,
             ));
+        }
+    }
+
+    #[test]
+    fn controller_interposed_dual_admits_only_the_literal_model_before_role_labels() {
+        let evidence = "Garmin Dual GI 275 AI & HSI";
+        let html = controller_html(evidence);
+        let mut payload = installed("Garmin", "GI 275", evidence);
+        payload["avionics"][0]["types"] =
+            serde_json::json!(["Flight Display", "Navigation Indicator"]);
+        payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
+
+        validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
+            .expect("Dual between manufacturer and model is a bounded quantity annotation");
+
+        for invalid_model in ["GI 275 AI", "GI 275 AI & HSI"] {
+            payload["avionics"][0]["model"] = serde_json::json!(invalid_model);
+            let failure = validate_unbound_current_avionics_extraction(
+                &payload.to_string(),
+                CONTROLLER_URL,
+                &html,
+            )
+            .expect_err("role labels must not become part of the model identity");
+            assert_eq!(
+                failure.rule(),
+                AvionicsValidationRule::CandidateIdentityNotInEvidence
+            );
+        }
+    }
+
+    #[test]
+    fn controller_interposed_dual_identity_grammar_rejects_near_matches() {
+        for evidence in [
+            "Garmin Optional Dual GI 275 AI & HSI",
+            "Garmin Not Dual GI 275 AI & HSI",
+            "Garmin-Dual GI 275 AI & HSI",
+            "Garmin Dual Axis GI 275 AI & HSI",
+            "Garmin Dual GI 275 AI only",
+            "Garmin Dual GI 275 AI & HSI & MFD",
+        ] {
+            assert!(
+                !exact_controller_interposed_dual_identity_annotation(evidence, "Garmin", "GI 275"),
+                "near-match was admitted: {evidence}"
+            );
         }
     }
 
