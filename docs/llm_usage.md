@@ -372,6 +372,11 @@ collision, and authorization guards for that source. Manufacturer-complete
 lines recognize empty identity suffixes and the two already admitted exact
 Controller WAAS capability annotations. The model-only display form recognizes
 no other annotation; arbitrary suffixes and second-product lines fail closed.
+Extraction identity also recognizes the exact Controller line grammar
+`<manufacturer> Dual <model> AI/ADI & HSI`: `Dual` remains quantity ambiguity,
+while the role pair is capability evidence and is forbidden from becoming part
+of the literal model. Optional, negated, joined, axis, and extended-role near
+matches fail closed.
 Other publishers rely on the extraction prompt until they have an equally
 explicit authoritative equipment-field adapter.
 
