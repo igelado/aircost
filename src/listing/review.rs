@@ -1543,6 +1543,38 @@ pub async fn replace_pending_review(
         .map(Some)
 }
 
+/// Atomically creates or replaces a review bundle without releasing the
+/// database-enforced source-identity correction receipt gate. Only an exact
+/// receipt-gated listing may use this path. The caller records the immutable
+/// correction decision before ordinary listing finalization moves the row to
+/// `pending_review`.
+pub(crate) async fn replace_pending_review_preserving_source_identity_receipt_gate(
+    db: &AppDb,
+    listing_id: i64,
+    plugin_submission_id: Option<i64>,
+    aspects: &[PendingReviewAspect],
+) -> ReviewResult<Option<StagedPendingReview>> {
+    if aspects.is_empty() {
+        clear_pending_review_preserving_source_identity_receipt_gate(db, listing_id).await?;
+        return Ok(None);
+    }
+    stage_pending_review_with_transition(
+        db,
+        listing_id,
+        plugin_submission_id,
+        aspects,
+        PendingReviewListingTransition::PreserveSourceIdentityReceiptGate,
+    )
+    .await
+    .map(Some)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingReviewListingTransition {
+    MarkPendingReview,
+    PreserveSourceIdentityReceiptGate,
+}
+
 /// Stages a hash-addressed review bundle and moves the listing into the
 /// `pending_review` ingestion state. `plugin_submission_id` is optional so the
 /// same workflow can handle manual/update ingestion while still retaining the
@@ -1552,6 +1584,23 @@ pub async fn stage_pending_review(
     listing_id: i64,
     plugin_submission_id: Option<i64>,
     aspects: &[PendingReviewAspect],
+) -> ReviewResult<StagedPendingReview> {
+    stage_pending_review_with_transition(
+        db,
+        listing_id,
+        plugin_submission_id,
+        aspects,
+        PendingReviewListingTransition::MarkPendingReview,
+    )
+    .await
+}
+
+async fn stage_pending_review_with_transition(
+    db: &AppDb,
+    listing_id: i64,
+    plugin_submission_id: Option<i64>,
+    aspects: &[PendingReviewAspect],
+    listing_transition: PendingReviewListingTransition,
 ) -> ReviewResult<StagedPendingReview> {
     if listing_id <= 0 {
         return Err(ReviewError::Validation(
@@ -1609,6 +1658,16 @@ pub async fn stage_pending_review(
         WHERE id = ?
         "#,
     );
+    let receipt_gate_is_current = db.sql(
+        r#"
+        SELECT COUNT(*)
+        FROM aircraft_sale_listings
+        WHERE id = ?
+          AND ingestion_state = 'quarantined'
+          AND ingestion_error = 'source_identity_correction_receipt_pending'
+          AND is_verified = FALSE
+        "#,
+    );
 
     macro_rules! stage_in_transaction {
         ($pool:expr) => {{
@@ -1640,6 +1699,20 @@ pub async fn stage_pending_review(
                 }
             }
 
+            if listing_transition
+                == PendingReviewListingTransition::PreserveSourceIdentityReceiptGate
+            {
+                let gate_count: i64 = sqlx::query_scalar(&receipt_gate_is_current)
+                    .bind(listing_id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                if gate_count != 1 {
+                    return Err(ReviewError::Conflict(format!(
+                        "listing {listing_id} is not waiting for its source identity correction receipt"
+                    )));
+                }
+            }
+
             sqlx::query(&lock_catalog)
                 .execute(&mut *transaction)
                 .await?;
@@ -1658,15 +1731,17 @@ pub async fn stage_pending_review(
                 .bind(serialized.review_payload_sha256.as_str())
                 .execute(&mut *transaction)
                 .await?;
-            let changed = sqlx::query(&mark_pending)
-                .bind(listing_id)
-                .execute(&mut *transaction)
-                .await?
-                .rows_affected();
-            if changed != 1 {
-                return Err(ReviewError::Conflict(format!(
-                    "listing {listing_id} changed while its review was being staged"
-                )));
+            if listing_transition == PendingReviewListingTransition::MarkPendingReview {
+                let changed = sqlx::query(&mark_pending)
+                    .bind(listing_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if changed != 1 {
+                    return Err(ReviewError::Conflict(format!(
+                        "listing {listing_id} changed while its review was being staged"
+                    )));
+                }
             }
             transaction.commit().await?;
             Ok::<String, ReviewError>(catalog_revision_sha256)
@@ -1683,6 +1758,71 @@ pub async fn stage_pending_review(
         catalog_revision_sha256,
         pending_aspect_count: serialized.pending_aspect_count,
     })
+}
+
+async fn clear_pending_review_preserving_source_identity_receipt_gate(
+    db: &AppDb,
+    listing_id: i64,
+) -> ReviewResult<()> {
+    if listing_id <= 0 {
+        return Err(ReviewError::Validation(
+            "listing_id must be positive".to_string(),
+        ));
+    }
+    let select_gate = match db.backend() {
+        DatabaseBackend::Sqlite(_) => db.sql(
+            r#"
+            SELECT id
+            FROM aircraft_sale_listings
+            WHERE id = ?
+              AND ingestion_state = 'quarantined'
+              AND ingestion_error = 'source_identity_correction_receipt_pending'
+              AND is_verified = FALSE
+            "#,
+        ),
+        DatabaseBackend::Postgres(_) => db.sql(
+            r#"
+            SELECT id
+            FROM aircraft_sale_listings
+            WHERE id = ?
+              AND ingestion_state = 'quarantined'
+              AND ingestion_error = 'source_identity_correction_receipt_pending'
+              AND is_verified = FALSE
+            FOR UPDATE
+            "#,
+        ),
+    };
+    let delete = db.sql(
+        r#"
+        DELETE FROM aircraft_sale_listing_pending_reviews
+        WHERE listing_id = ?
+        "#,
+    );
+    macro_rules! clear_in_transaction {
+        ($pool:expr) => {{
+            let mut transaction = $pool.begin().await?;
+            let gated_listing_id: Option<i64> = sqlx::query_scalar(&select_gate)
+                .bind(listing_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+            if gated_listing_id.is_none() {
+                return Err(ReviewError::Conflict(format!(
+                    "listing {listing_id} is not waiting for its source identity correction receipt"
+                )));
+            }
+            sqlx::query(&delete)
+                .bind(listing_id)
+                .execute(&mut *transaction)
+                .await?;
+            transaction.commit().await?;
+            Ok::<(), ReviewError>(())
+        }};
+    }
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => clear_in_transaction!(pool)?,
+        DatabaseBackend::Postgres(pool) => clear_in_transaction!(pool)?,
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -11554,6 +11694,114 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .await
         .unwrap();
         (user_id, listing_id)
+    }
+
+    #[tokio::test]
+    async fn receipt_gated_review_staging_preserves_quarantine_until_correction_receipt() {
+        let db = test_db().await;
+        let (_, listing_id) = insert_listing(&db).await;
+        let pool = sqlite_pool(&db);
+        sqlx::query(
+            r#"
+            UPDATE aircraft_sale_listings
+            SET ingestion_state = 'quarantined',
+                ingestion_error = 'source_identity_correction_receipt_pending',
+                is_verified = FALSE
+            WHERE id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let aspect = PendingReviewAspect::avionics(
+            "avionics:0:primary",
+            "avionics",
+            "Garmin G5",
+            "Garmin G5 · Flight Display · quantity 1 · installed",
+            "automated verification could not complete",
+            1,
+            "installed",
+            Some("Garmin G5".to_string()),
+            Some("high".to_string()),
+        );
+
+        let staged = replace_pending_review_preserving_source_identity_receipt_gate(
+            &db,
+            listing_id,
+            None,
+            std::slice::from_ref(&aspect),
+        )
+        .await
+        .unwrap()
+        .expect("receipt-gated review bundle");
+
+        assert_eq!(staged.pending_aspect_count, 1);
+        let state: (String, Option<String>, bool) = sqlx::query_as(
+            "SELECT ingestion_state, ingestion_error, is_verified FROM aircraft_sale_listings WHERE id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(state.0, "quarantined");
+        assert_eq!(
+            state.1.as_deref(),
+            Some("source_identity_correction_receipt_pending")
+        );
+        assert!(!state.2);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT pending_aspect_count FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+            )
+            .bind(listing_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            1
+        );
+
+        let (_, ordinary_listing_id) = insert_listing(&db).await;
+        let error = replace_pending_review_preserving_source_identity_receipt_gate(
+            &db,
+            ordinary_listing_id,
+            None,
+            std::slice::from_ref(&aspect),
+        )
+        .await
+        .expect_err("ordinary listings cannot use the correction receipt gate");
+        assert!(error
+            .to_string()
+            .contains("is not waiting for its source identity correction receipt"));
+        replace_pending_review(
+            &db,
+            ordinary_listing_id,
+            None,
+            std::slice::from_ref(&aspect),
+        )
+        .await
+        .expect("ordinary review bundle should stage");
+        let clear_error = replace_pending_review_preserving_source_identity_receipt_gate(
+            &db,
+            ordinary_listing_id,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("the gated clear path must reject an ordinary listing");
+        assert!(clear_error
+            .to_string()
+            .contains("is not waiting for its source identity correction receipt"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+            )
+            .bind(ordinary_listing_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            1
+        );
     }
 
     async fn insert_review_bound_submission(
