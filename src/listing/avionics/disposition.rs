@@ -45,7 +45,7 @@ pub(crate) const INSERT_DISPOSITION_SQL: &str = r#"
     ) DO NOTHING
 "#;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum OccurrenceRole {
     Primary,
     Replacement,

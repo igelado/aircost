@@ -34,7 +34,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 1
         OR contract_fingerprint IS DISTINCT FROM
-          '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522'
+          '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819'
       )
   ) THEN
     RAISE EXCEPTION 'reference catalog cutover contract marker mismatch';
@@ -49,6 +49,8 @@ active_routines(name) AS (
     ('aircraft_serial_natural_sort_key'),
     ('validate_aircraft_serial_scheme_ordering'),
     ('prevent_referenced_avionics_catalog_downgrade'),
+    ('preserve_avionics_approved_product_identity'),
+    ('guard_approved_avionics_model_delete'),
     ('validate_aircraft_valuation_compatibility_projection'),
     ('require_aircraft_catalog_approval'),
     ('validate_aircraft_reference_version_insert'),
@@ -77,6 +79,7 @@ protected_relations(name) AS (
   VALUES
     ('plugin_submissions'),
     ('avionics_models'),
+    ('avionics_catalog_product_deletion_guards'),
     ('aircraft_engine_catalog_models'),
     ('aircraft_propeller_catalog_models'),
     ('aircraft_makes'),
@@ -279,8 +282,8 @@ BEGIN
     ))
     INTO actual_object_count, actual_definition_digest
     FROM pg_temp.reference_catalog_schema_owned_objects;
-    IF actual_object_count <> 792
-       OR actual_definition_digest <> '9fccaee88521d99c9b4cdffdb8af610e' THEN
+    IF actual_object_count <> 804
+       OR actual_definition_digest <> 'ba236136f4f31173a4a5d71c8d8a5be5' THEN
       RAISE EXCEPTION
         'reference catalog canonical schema owned-object mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
@@ -1011,6 +1014,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_avionics_models_manufacturer_identifier
 CREATE UNIQUE INDEX IF NOT EXISTS idx_avionics_models_approved_manufacturer_name
   ON avionics_models (avionics_manufacturer_id, normalized_name)
   WHERE catalog_status = 'approved';
+
+-- Transient authorization for one explicit administrative product deletion.
+-- The application inserts this guard in the same transaction that removes
+-- every dependent listing occurrence, then the model delete cascades it away.
+CREATE TABLE IF NOT EXISTS avionics_catalog_product_deletion_guards (
+  avionics_model_id BIGINT PRIMARY KEY
+    REFERENCES avionics_models(id) ON DELETE CASCADE
+    CHECK (avionics_model_id > 0),
+  requested_by_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
 -- Semantic aliases are review candidates, never implicit memberships.
 CREATE TABLE IF NOT EXISTS avionics_manufacturer_alias_candidates (
@@ -2520,19 +2534,25 @@ FOR EACH ROW EXECUTE FUNCTION validate_avionics_approved_product_identity();
 CREATE OR REPLACE FUNCTION preserve_avionics_approved_product_identity()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $function$
 BEGIN
   IF EXISTS (
-    SELECT 1 FROM avionics_models model
+    SELECT 1 FROM public.avionics_models model
     WHERE model.id = OLD.avionics_model_id AND model.catalog_status = 'approved'
   )
   AND NOT EXISTS (
     SELECT 1
-    FROM avionics_catalog_authorized_consolidations authorized_pair
-    JOIN avionics_models survivor
+    FROM public.avionics_catalog_authorized_consolidations authorized_pair
+    JOIN public.avionics_models survivor
       ON survivor.id = authorized_pair.survivor_model_id
     WHERE authorized_pair.duplicate_model_id = OLD.avionics_model_id
       AND survivor.catalog_status = 'approved'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM public.avionics_catalog_product_deletion_guards deletion_guard
+    WHERE deletion_guard.avionics_model_id = OLD.avionics_model_id
   ) THEN
     RAISE EXCEPTION 'approved avionics product must retain its canonical identity';
   END IF;
@@ -2544,7 +2564,7 @@ DROP TRIGGER IF EXISTS avionics_approved_identity_preserve_delete
   ON avionics_approved_product_identities;
 CREATE TRIGGER avionics_approved_identity_preserve_delete
 BEFORE DELETE ON avionics_approved_product_identities
-FOR EACH ROW EXECUTE FUNCTION preserve_avionics_approved_product_identity();
+FOR EACH ROW EXECUTE FUNCTION public.preserve_avionics_approved_product_identity();
 
 CREATE OR REPLACE FUNCTION validate_avionics_model_canonical_identity()
 RETURNS TRIGGER
@@ -2666,18 +2686,24 @@ FOR EACH ROW EXECUTE FUNCTION preserve_approved_avionics_identity();
 CREATE OR REPLACE FUNCTION guard_approved_avionics_model_delete()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $function$
 BEGIN
   IF OLD.catalog_status = 'approved'
   AND NOT EXISTS (
     SELECT 1
-    FROM avionics_catalog_authorized_consolidations authorized_pair
-    JOIN avionics_models survivor
+    FROM public.avionics_catalog_authorized_consolidations authorized_pair
+    JOIN public.avionics_models survivor
       ON survivor.id = authorized_pair.survivor_model_id
     WHERE authorized_pair.duplicate_model_id = OLD.id
       AND survivor.catalog_status = 'approved'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM public.avionics_catalog_product_deletion_guards deletion_guard
+    WHERE deletion_guard.avionics_model_id = OLD.id
   ) THEN
-    RAISE EXCEPTION 'approved avionics product deletion requires exact consolidation authorization';
+    RAISE EXCEPTION 'approved avionics product deletion requires exact consolidation or explicit deletion authorization';
   END IF;
   RETURN OLD;
 END;
@@ -2687,7 +2713,7 @@ DROP TRIGGER IF EXISTS avionics_models_approved_delete_guard
   ON avionics_models;
 CREATE TRIGGER avionics_models_approved_delete_guard
 BEFORE DELETE ON avionics_models
-FOR EACH ROW EXECUTE FUNCTION guard_approved_avionics_model_delete();
+FOR EACH ROW EXECUTE FUNCTION public.guard_approved_avionics_model_delete();
 
 CREATE TABLE IF NOT EXISTS avionics_model_types (
   avionics_model_id BIGINT NOT NULL
@@ -10940,8 +10966,8 @@ BEGIN
   ))
   INTO actual_object_count, actual_definition_digest
   FROM pg_temp.reference_catalog_schema_owned_objects;
-  IF actual_object_count <> 792
-     OR actual_definition_digest <> '9fccaee88521d99c9b4cdffdb8af610e' THEN
+  IF actual_object_count <> 804
+     OR actual_definition_digest <> 'ba236136f4f31173a4a5d71c8d8a5be5' THEN
     RAISE EXCEPTION
       'reference catalog canonical schema post-state mismatch (% objects, digest %)',
       actual_object_count, actual_definition_digest;
@@ -10986,7 +11012,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522',
+  '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

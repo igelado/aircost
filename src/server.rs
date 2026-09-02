@@ -41,6 +41,7 @@ use crate::avionics::consolidation::{
     preview_human_reviewed_avionics_model_consolidation, ConsolidationError,
     HumanReviewedAvionicsConsolidationRequest, HumanReviewedConsolidationProvenance,
 };
+use crate::avionics::deletion::{delete_avionics_product, AvionicsProductDeletionError};
 use crate::avionics::fingerprint::active_collision_closure_revision_sha256;
 use crate::avionics::inspection::{
     avionics_catalog_options, get_avionics_catalog_detail, list_avionics_catalog,
@@ -309,7 +310,10 @@ fn router(state: AppState) -> Router {
         .route("/api/aircraft/options", get(aircraft_options_handler))
         .route("/api/avionics", get(list_avionics_handler))
         .route("/api/avionics/options", get(avionics_options_handler))
-        .route("/api/avionics/{id}", get(avionics_detail_handler))
+        .route(
+            "/api/avionics/{id}",
+            get(avionics_detail_handler).delete(delete_avionics_handler),
+        )
         .route("/api/review/listings", get(list_listing_reviews_handler))
         .route(
             "/api/review/verification/preflight",
@@ -819,6 +823,27 @@ async fn avionics_detail_handler(
     Ok(Json(json!({"current_user": user, "avionics": avionics})))
 }
 
+async fn delete_avionics_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(avionics_id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let deletion = delete_avionics_product(&state.db, user.id, avionics_id).await?;
+    Ok(Json(json!({
+        "current_user": user,
+        "deleted_product_id": deletion.deleted_product_id,
+        "deleted_product_name": deletion.deleted_product_name,
+        "affected_listing_count": deletion.affected_listing_count,
+        "affected_listing_ids": deletion.affected_listing_ids,
+        "deleted_listing_association_count": deletion.deleted_listing_association_count,
+        "discarded_occurrence_count": deletion.discarded_occurrence_count,
+        "removed_pending_aspect_count": deletion.removed_pending_aspect_count,
+        "deleted_suite_membership_count": deletion.deleted_suite_membership_count,
+    })))
+}
+
 async fn list_listing_reviews_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -903,10 +928,14 @@ async fn attest_review_avionics_product_handler(
     )
     .await?;
     if target.already_reuse_attested {
+        let review = get_listing_review(&state.db, user.id, payload.listing_id)
+            .await?
+            .review;
         return Ok(Json(json!({
             "product_id": product_id,
             "attestation_status": "current",
-            "reused": true
+            "reused": true,
+            "review": review
         })));
     }
 
@@ -1021,10 +1050,14 @@ async fn attest_review_avionics_product_handler(
         )
         .with_code("avionics_reuse_attestation_failed"));
     }
+    let review = get_listing_review(&state.db, user.id, payload.listing_id)
+        .await?
+        .review;
     Ok(Json(json!({
         "product_id": product_id,
         "attestation_status": "current",
-        "reused": false
+        "reused": false,
+        "review": review
     })))
 }
 
@@ -2541,6 +2574,33 @@ impl From<ConsolidationError> for ApiError {
             ConsolidationError::Database(message) => {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
                     .with_code("avionics_consolidation_failed")
+            }
+        }
+    }
+}
+
+impl From<AvionicsProductDeletionError> for ApiError {
+    fn from(error: AvionicsProductDeletionError) -> Self {
+        match error {
+            AvionicsProductDeletionError::Validation(message) => {
+                ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+                    .with_code("avionics_product_deletion_invalid")
+            }
+            AvionicsProductDeletionError::NotFound(message) => {
+                ApiError::new(StatusCode::NOT_FOUND, message)
+                    .with_code("avionics_product_not_found")
+            }
+            AvionicsProductDeletionError::Conflict(message) => {
+                ApiError::new(StatusCode::CONFLICT, message)
+                    .with_code("avionics_product_deletion_conflict")
+            }
+            AvionicsProductDeletionError::Database(message) => {
+                eprintln!("avionics product deletion failed: {message}");
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The avionics product could not be deleted.",
+                )
+                .with_code("avionics_product_deletion_failed")
             }
         }
     }
@@ -4337,6 +4397,11 @@ mod tests {
         .0;
         assert_eq!(response["attestation_status"], "current");
         assert_eq!(response["reused"], true);
+        assert_eq!(response["review"]["listing_id"], listing_id);
+        assert_eq!(
+            response["review"]["review_payload_sha256"],
+            review.review_payload_sha256
+        );
         let usage_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
             .fetch_one(pool)
             .await

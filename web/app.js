@@ -70,6 +70,8 @@ document.addEventListener("DOMContentLoaded", () => {
     formatPercent,
     selectOption,
     setButtonBusy,
+    refreshListings: loadListings,
+    refreshReview: () => reviewWorkspace.refresh(),
   });
   reviewWorkspace = initializeReviewWorkspace({
     activatePanel,

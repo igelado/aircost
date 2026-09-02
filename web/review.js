@@ -2261,6 +2261,7 @@ function initializeDrafts(review, preservedDrafts = null) {
       discardReason: "",
       savingDecision: false,
       decisionError: "",
+      inlineAttestation: inlineAttestationDraft(normalizedProduct(aspect.suggested_product)),
     };
     const preserved = preservedDrafts?.get(key);
     if (preserved) {
@@ -2274,6 +2275,10 @@ function initializeDrafts(review, preservedDrafts = null) {
       };
       draft.discardReason = preserved.discardReason;
       draft.decisionError = preserved.decisionError;
+      draft.inlineAttestation = {
+        ...preserved.inlineAttestation,
+        saving: false,
+      };
       draft.correction = {
         ...preserved.correction,
         saving: false,
@@ -3173,7 +3178,7 @@ function actionPanel(aspect, draft, action, key) {
 function catalogSelectionControls(aspect, draft, key) {
   const selected = document.createElement("div");
   selected.className = "review-selected-product";
-  renderSelectedCatalogProduct(selected, draft.catalogProduct);
+  renderSelectedCatalogProduct(selected, draft.catalogProduct, key);
 
   const searchLabel = document.createElement("label");
   const searchCaption = document.createElement("span");
@@ -3445,7 +3450,7 @@ function validateDraft(draft) {
     if (draft.catalogProduct.reuseEligible === false) {
       return {
         valid: false,
-        message: "This approved product is not reusable under the current policy. Verify its reusable manufacturer source in Known avionics products first.",
+        message: "This approved product is not reusable under the current policy. Verify its reusable manufacturer source below first.",
       };
     }
     return validDraftResult(draft, "Verified catalog product selected.");
@@ -4211,19 +4216,20 @@ async function searchCatalog(searchKey, key, query, results, selected, message, 
           return;
         }
         draft.catalogProduct = normalizedProduct(item);
+        draft.inlineAttestation = inlineAttestationDraft(draft.catalogProduct);
         draft.decisionError = "";
-        renderSelectedCatalogProduct(selected, draft.catalogProduct);
+        renderSelectedCatalogProduct(selected, draft.catalogProduct, key);
         message.textContent = `${draft.catalogProduct.displayName} selected.`;
         message.classList.remove("error");
         syncAllAspectViews();
         updateProgress();
         loadSelectedProductEvidence(key, draft.catalogProduct.id, selected, message);
-      })),
+      }, { allowUnattested: typeof onSelect !== "function" })),
     );
     message.classList.remove("error");
     message.textContent = items.length
       ? unavailableCount > 0
-        ? `${items.length} approved ${pluralize(items.length, "match")} found; ${unavailableCount} ${pluralize(unavailableCount, "product")} must have its reusable source verified in Known avionics products before selection.`
+        ? `${items.length} approved ${pluralize(items.length, "match")} found; ${unavailableCount} ${pluralize(unavailableCount, "product")} need reusable source verification${typeof onSelect === "function" ? " before selection" : " and can be selected for inline verification"}.`
         : `${items.length} approved ${pluralize(items.length, "match")} found.`
       : "No approved avionics matched this search.";
   } catch (error) {
@@ -4239,14 +4245,14 @@ async function searchCatalog(searchKey, key, query, results, selected, message, 
   }
 }
 
-function catalogResult(item, onSelect) {
+function catalogResult(item, onSelect, { allowUnattested = false } = {}) {
   const product = normalizedProduct(item);
   const button = document.createElement("button");
   button.type = "button";
   button.className = "review-catalog-result";
   button.disabled = !product
     || positiveInteger(product.id) === null
-    || product.reuseEligible === false;
+    || product.reuseEligible === false && !allowUnattested;
   button.classList.toggle("not-reusable", product?.reuseEligible === false);
   const title = document.createElement("strong");
   title.textContent = product?.displayName || "Unknown catalog product";
@@ -4259,15 +4265,21 @@ function catalogResult(item, onSelect) {
       : "",
   ].filter(nonBlank).join(" · ") || "Approved catalog entry";
   if (product?.reuseEligible === false) {
-    button.title = "Verify this product under Known avionics products before assigning it to a listing.";
+    button.title = allowUnattested
+      ? "Select this product to verify its reusable manufacturer source here."
+      : "Verify this product before assigning it to this field.";
   }
   button.append(title, metadata);
   button.addEventListener("click", onSelect);
   return button;
 }
 
-function renderSelectedCatalogProduct(container, product) {
+function renderSelectedCatalogProduct(container, product, key = null) {
   container.replaceChildren();
+  container.classList.toggle(
+    "has-inline-attestation",
+    product?.reuseEligible === false && key !== null,
+  );
   if (!product || positiveInteger(product.id) === null) {
     const empty = document.createElement("p");
     empty.className = "review-selection-empty";
@@ -4277,7 +4289,7 @@ function renderSelectedCatalogProduct(container, product) {
   }
   const eyebrow = document.createElement("span");
   eyebrow.className = "review-eyebrow";
-  eyebrow.textContent = "Selected verified product";
+  eyebrow.textContent = "Selected approved catalog product";
   const title = document.createElement("strong");
   title.textContent = product.displayName;
   const metadata = document.createElement("span");
@@ -4289,10 +4301,263 @@ function renderSelectedCatalogProduct(container, product) {
   if (product.reuseEligible === false) {
     const warning = document.createElement("p");
     warning.className = "review-product-reuse-warning";
-    warning.textContent = "This approved product still needs reusable manufacturer-source verification in Known avionics products.";
+    warning.textContent = key === null
+      ? "This approved product still needs reusable manufacturer-source verification."
+      : "This approved product needs reusable manufacturer-source verification before it can be assigned. Verify it below without leaving this listing.";
     container.append(warning);
   }
   appendProductIdentityEvidence(container, product);
+  if (product.reuseEligible === false && key !== null) {
+    container.append(inlineProductAttestationControls(key, product));
+  }
+}
+
+function inlineAttestationDraft(product) {
+  const productId = positiveInteger(product?.id);
+  const suggested = productAttestationDraft({
+    identity_source_url: product?.identitySourceUrl,
+    identity_source_title: product?.identitySourceTitle,
+  });
+  return {
+    productId,
+    sourceUrl: suggested.sourceUrl,
+    sourceTitle: suggested.sourceTitle,
+    evidenceText: suggested.evidenceText,
+    dirty: false,
+    saving: false,
+    error: "",
+  };
+}
+
+function updateInlineAttestationSuggestions(draft, product) {
+  const productId = positiveInteger(product?.id);
+  if (draft.inlineAttestation?.productId !== productId) {
+    draft.inlineAttestation = inlineAttestationDraft(product);
+    return;
+  }
+  if (draft.inlineAttestation.dirty) {
+    return;
+  }
+  const suggested = inlineAttestationDraft(product);
+  draft.inlineAttestation.sourceUrl = suggested.sourceUrl;
+  draft.inlineAttestation.sourceTitle = suggested.sourceTitle;
+}
+
+function inlineProductAttestationControls(key, product) {
+  const draft = state.drafts.get(key);
+  const attestation = draft?.inlineAttestation;
+  const section = document.createElement("section");
+  section.className = "review-inline-attestation";
+  const heading = document.createElement("strong");
+  heading.textContent = "Verify reusable product source";
+  const intro = document.createElement("p");
+  const requiredIdentity = [product.model, product.stableIdentifier]
+    .filter(nonBlank)
+    .join(" and ");
+  intro.textContent = `Confirm one current OEM page and paste one exact excerpt containing ${requiredIdentity || "the complete model and manufacturer identifier"}. This verifies the catalog product only; it does not save or reset any listing decisions.`;
+  const form = document.createElement("form");
+  form.addEventListener("submit", (event) => {
+    attestInlineCatalogProduct(event, key);
+  });
+  form.append(
+    draftInput("OEM source URL", attestation?.sourceUrl, (value) => {
+      attestation.sourceUrl = value;
+      attestation.dirty = true;
+      attestation.error = "";
+      syncInlineAttestationView(key);
+    }, "url", true),
+    draftInput(
+      "OEM source title",
+      attestation?.sourceTitle,
+      (value) => {
+        attestation.sourceTitle = value;
+        attestation.dirty = true;
+        attestation.error = "";
+        syncInlineAttestationView(key);
+      },
+      "text",
+      true,
+      REVIEW_PRODUCT_IDENTITY_LIMITS.sourceTitle,
+    ),
+    draftTextarea(
+      "Exact model and manufacturer identifier excerpt",
+      attestation?.evidenceText,
+      (value) => {
+        attestation.evidenceText = value;
+        attestation.dirty = true;
+        attestation.error = "";
+        syncInlineAttestationView(key);
+      },
+      REVIEW_PRODUCT_IDENTITY_LIMITS.evidenceText,
+    ),
+  );
+  const actions = document.createElement("div");
+  actions.className = "review-inline-attestation-actions";
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "button primary";
+  submit.textContent = attestation?.saving
+    ? "Verifying source…"
+    : `Verify ${product.displayName}`;
+  const result = document.createElement("p");
+  result.className = "review-inline-attestation-result";
+  result.setAttribute("aria-live", "polite");
+  actions.append(submit, result);
+  form.append(actions);
+  section.append(heading, intro, form);
+  window.setTimeout(() => syncInlineAttestationView(key), 0);
+  return section;
+}
+
+function syncInlineAttestationView(key) {
+  const draft = state.drafts.get(key);
+  const section = state.aspectViews
+    .get(key)
+    ?.panels.get("use_verified_product")
+    ?.querySelector(".review-inline-attestation");
+  if (!draft || !section) {
+    return;
+  }
+  const attestation = draft.inlineAttestation;
+  const button = section.querySelector('button[type="submit"]');
+  const result = section.querySelector(".review-inline-attestation-result");
+  section.setAttribute("aria-busy", String(attestation.saving));
+  button.disabled = attestation.saving
+    || state.savingAspectKey !== null
+    || state.stale
+    || state.resolving
+    || state.automating;
+  button.textContent = attestation.saving
+    ? "Verifying source…"
+    : `Verify ${draft.catalogProduct.displayName}`;
+  result.classList.toggle("error", nonBlank(attestation.error));
+  result.setAttribute("role", nonBlank(attestation.error) ? "alert" : "status");
+  result.textContent = attestation.error
+    ? `Could not verify this product: ${attestation.error}`
+    : "Your other listing decisions remain in place while this source is checked.";
+}
+
+async function attestInlineCatalogProduct(event, key) {
+  event.preventDefault();
+  const review = state.currentReview;
+  const draft = state.drafts.get(key);
+  const productId = positiveInteger(draft?.catalogProduct?.id);
+  const attestation = draft?.inlineAttestation;
+  if (
+    !review
+    || !draft
+    || !attestation
+    || productId === null
+    || draft.catalogProduct.reuseEligible !== false
+    || state.savingAspectKey !== null
+    || state.stale
+    || state.resolving
+    || state.automating
+  ) {
+    return;
+  }
+  const sourceValidation = reviewProductIdentitySourceValidation(
+    attestation.sourceTitle,
+    attestation.evidenceText,
+  );
+  if (!authoritativeIdentityUrl(attestation.sourceUrl) || !sourceValidation.valid) {
+    attestation.error = !authoritativeIdentityUrl(attestation.sourceUrl)
+      ? "Provide an authoritative HTTPS OEM source URL."
+      : sourceValidation.message;
+    syncInlineAttestationView(key);
+    return;
+  }
+
+  state.savingAspectKey = key;
+  attestation.saving = true;
+  attestation.error = "";
+  syncInlineAttestationView(key);
+  syncAllAspectViews();
+  updateProgress();
+  try {
+    const result = await api(
+      `/api/review/avionics/products/${productId}/attest`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          listing_id: review.listing_id,
+          review_payload_sha256: review.review_payload_sha256,
+          aspect_id: draft.aspect.id,
+          catalog_revision_sha256: review.catalog_revision_sha256,
+          identity_source_url: attestation.sourceUrl,
+          identity_source_title: attestation.sourceTitle,
+          identity_evidence_text: attestation.evidenceText,
+        }),
+      },
+    );
+    if (state.currentReview !== review || state.savingAspectKey !== key) {
+      return;
+    }
+    if (
+      positiveInteger(result?.product_id) !== productId
+      || result?.attestation_status !== "current"
+    ) {
+      throw new Error("The server returned an invalid product verification result.");
+    }
+    const responseReview = result?.review;
+    const [productPayload, reviewPayload] = await Promise.all([
+      api(`/api/avionics/${productId}`),
+      responseReview === null || responseReview === undefined
+        ? api(`/api/review/listings/${review.listing_id}`)
+        : Promise.resolve({ review: responseReview }),
+    ]);
+    if (state.currentReview !== review || state.savingAspectKey !== key) {
+      return;
+    }
+    const refreshedReview = reviewPayload?.review;
+    const productDetail = productPayload?.avionics;
+    if (
+      !isReviewDetail(refreshedReview, review.listing_id)
+      || refreshedReview.review_payload_sha256 !== review.review_payload_sha256
+      || !productDetail?.summary
+      || positiveInteger(productDetail.summary.id) !== productId
+      || productDetail.summary.catalog?.reuse_eligible !== true
+    ) {
+      throw new Error("The product source was saved, but the refreshed catalog or listing review was inconsistent. Reload this review before continuing.");
+    }
+    const identity = productDetail.identity_evidence || {};
+    draft.catalogProduct = normalizedProduct({
+      ...productDetail.summary,
+      identity_source_url: identity.source_url,
+      identity_source_title: identity.source_title,
+      identity_evidence_text: identity.evidence_text,
+    });
+    state.currentReview.catalog_revision_sha256 = refreshedReview.catalog_revision_sha256;
+    state.savingAspectKey = null;
+    attestation.saving = false;
+    const selected = state.aspectViews
+      .get(key)
+      ?.panels.get("use_verified_product")
+      ?.querySelector(".review-selected-product");
+    if (selected) {
+      renderSelectedCatalogProduct(selected, draft.catalogProduct, key);
+    }
+    syncAspectView(key);
+    updateProgress();
+    await Promise.allSettled([Promise.resolve(refreshAvionics())]);
+    setWorkspaceMessage(
+      `${draft.catalogProduct.displayName} now has a current reusable source. Save this entry when the listing match is correct.`,
+    );
+  } catch (error) {
+    if (state.currentReview !== review || state.savingAspectKey !== key) {
+      return;
+    }
+    state.savingAspectKey = null;
+    attestation.saving = false;
+    attestation.error = error?.message || "The product source could not be verified.";
+    syncInlineAttestationView(key);
+    syncAllAspectViews();
+    updateProgress();
+    setWorkspaceMessage(
+      "The product source was not verified. The exact error is shown on this avionics card.",
+      true,
+    );
+  }
 }
 
 async function loadSelectedProductEvidence(key, productId, selected, message) {
@@ -4318,14 +4583,15 @@ async function loadSelectedProductEvidence(key, productId, selected, message) {
       identity_source_title: identity.source_title,
       identity_evidence_text: identity.evidence_text,
     });
-    renderSelectedCatalogProduct(selected, draft.catalogProduct);
+    updateInlineAttestationSuggestions(draft, draft.catalogProduct);
+    renderSelectedCatalogProduct(selected, draft.catalogProduct, key);
     const hasAuthoritativeEvidence = authoritativeIdentityUrl(
       draft.catalogProduct.identitySourceUrl,
     ) && nonBlank(draft.catalogProduct.identityEvidenceText);
     const reusable = draft.catalogProduct.reuseEligible !== false;
     message.classList.toggle("error", !hasAuthoritativeEvidence || !reusable);
     message.textContent = !reusable
-      ? `${draft.catalogProduct.displayName} is approved, but its reusable manufacturer source must be verified in Known avionics products before selection.`
+      ? `${draft.catalogProduct.displayName} is approved, but its reusable manufacturer source must be verified below before assignment.`
       : hasAuthoritativeEvidence
         ? `${draft.catalogProduct.displayName} selected with authoritative identity evidence.`
         : `${draft.catalogProduct.displayName} selected, but its catalog identity evidence is incomplete.`;

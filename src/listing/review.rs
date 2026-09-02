@@ -23,7 +23,8 @@ use sqlx::FromRow;
 use crate::aircraft::faa::{block_reason_code, require_listing_admission, AircraftAdmissionError};
 use crate::avionics::catalog::{
     exact_product_identity_signal_is_present, ApprovedProductAssociationRequest,
-    ApprovedProductAssociationResolver, PendingProductAttestationCommitGuard,
+    ApprovedProductAssociationResolver, PendingProductAttestationAuthorization,
+    PendingProductAttestationCommitGuard,
 };
 #[cfg(test)]
 use crate::avionics::fingerprint::{
@@ -6947,7 +6948,10 @@ fn validate_existing_product_verification_evidence(
 
 /// Read-only, cost-avoidance gate for one global product attestation.
 ///
-/// One exact hash-bound pending association is the authorization boundary. A
+/// One exact hash-bound review aspect is the authorization boundary. It may
+/// either already target the product or record an independent ordinary
+/// occurrence for which the reviewer explicitly selected this approved
+/// product. Product attestation never approves that listing association. A
 /// current attestation is returned before source validation or network access
 /// so retries remain both idempotent and free.
 pub(crate) async fn preflight_pending_product_attestation(
@@ -6995,27 +6999,37 @@ pub(crate) async fn preflight_pending_product_attestation(
     )?;
     let aspect = payload
         .aspects
-        .into_iter()
+        .iter()
         .find(|aspect| &aspect.id == aspect_id)
         .ok_or_else(|| {
             ReviewError::NotFound(format!(
                 "pending review aspect {aspect_id} was not found for listing {listing_id}"
             ))
         })?;
-    if aspect.reuse_attestation_target_id != Some(product_id) {
+    let authorization = if aspect.reuse_attestation_target_id == Some(product_id) {
+        PendingProductAttestationAuthorization::ExistingTarget
+    } else if aspect.reuse_attestation_target_id.is_none()
+        && aspect
+            .allowed_actions
+            .contains(&ReviewAction::UseVerifiedProduct)
+    {
+        validate_independent_ordinary_aspect(aspect, &payload.aspects)?;
+        PendingProductAttestationAuthorization::ReviewerSelection
+    } else {
         return Err(ReviewError::Conflict(format!(
-            "pending review aspect {aspect_id} for listing {listing_id} does not target approved catalog id {product_id}"
+            "pending review aspect {aspect_id} for listing {listing_id} cannot authorize source verification for approved catalog id {product_id}"
         )));
-    }
+    };
     let commit_guard = PendingProductAttestationCommitGuard {
         owner_user_id,
         listing_id,
         review_payload_sha256: row.review_payload_sha256,
-        aspect_id: serde_json::to_value(aspect.id).map_err(|error| {
+        aspect_id: serde_json::to_value(&aspect.id).map_err(|error| {
             ReviewError::Database(format!(
                 "could not bind pending product aspect authorization: {error}"
             ))
         })?,
+        authorization,
     };
 
     let current_catalog_revision = approved_catalog_revision_sha256(db).await?;
@@ -7029,7 +7043,7 @@ pub(crate) async fn preflight_pending_product_attestation(
         .remove(&product_id)
         .ok_or_else(|| {
             ReviewError::Conflict(format!(
-                "pending review targets catalog id {product_id}, which is not a current approved product"
+                "reviewer-selected catalog id {product_id} is not a current approved product"
             ))
         })?;
     let already_reuse_attested = current_reuse_attested_product_ids(db)
@@ -13342,6 +13356,50 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             .await,
             Err(ReviewError::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_aspect_authorizes_reviewer_selected_product_attestation() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let product_id =
+            insert_approved_product(&db, "G1000", "G1000", "Integrated Flight Deck").await;
+        attest_approved_product_for_current_policy_reuse(&db, product_id).await;
+        let aspect = PendingReviewAspect::avionics(
+            "avionics:0:primary",
+            "avionics_identity",
+            "Garmin G1000",
+            "Garmin G1000 integrated flight deck",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some("Garmin G1000 integrated flight deck".to_string()),
+            Some("high".to_string()),
+        );
+        let staged = stage_pending_review(&db, listing_id, None, &[aspect.clone()])
+            .await
+            .unwrap();
+
+        let target = preflight_pending_product_attestation(
+            &db,
+            user_id,
+            product_id,
+            listing_id,
+            &staged.review_payload_sha256,
+            &aspect.id,
+            &staged.catalog_revision_sha256,
+            "",
+            "",
+            "",
+        )
+        .await
+        .expect("an independent ordinary aspect must authorize an explicit reviewer selection");
+
+        assert!(target.already_reuse_attested);
+        assert_eq!(
+            target.commit_guard.authorization,
+            PendingProductAttestationAuthorization::ReviewerSelection
+        );
     }
 
     #[tokio::test]

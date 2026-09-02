@@ -17,6 +17,43 @@ DROP TRIGGER aircraft_reference_versions_require_approval;
 DROP TRIGGER aircraft_serial_schemes_require_approval;
 DROP TRIGGER aircraft_valuation_projection_validate_insert;
 DROP TRIGGER avionics_models_referenced_status_update;
+DROP TRIGGER avionics_approved_identity_preserve_delete;
+DROP TRIGGER avionics_models_approved_delete_guard;
+
+DROP TABLE avionics_catalog_product_deletion_guards;
+
+CREATE TRIGGER avionics_approved_identity_preserve_delete
+BEFORE DELETE ON avionics_approved_product_identities
+WHEN EXISTS (
+  SELECT 1 FROM avionics_models model
+  WHERE model.id = OLD.avionics_model_id AND model.catalog_status = 'approved'
+)
+AND NOT EXISTS (
+  SELECT 1
+  FROM avionics_catalog_authorized_consolidations authorization
+  JOIN avionics_models survivor
+    ON survivor.id = authorization.survivor_model_id
+  WHERE authorization.duplicate_model_id = OLD.avionics_model_id
+    AND survivor.catalog_status = 'approved'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'approved avionics product must retain its canonical identity');
+END;
+
+CREATE TRIGGER avionics_models_approved_delete_guard
+BEFORE DELETE ON avionics_models
+WHEN OLD.catalog_status = 'approved'
+AND NOT EXISTS (
+  SELECT 1
+  FROM avionics_catalog_authorized_consolidations authorization
+  JOIN avionics_models survivor
+    ON survivor.id = authorization.survivor_model_id
+  WHERE authorization.duplicate_model_id = OLD.id
+    AND survivor.catalog_status = 'approved'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'approved avionics product deletion requires exact consolidation authorization');
+END;
 
 DROP TABLE aircraft_reference_fact_set_attestations;
 DROP TABLE official_dollar_normalization_facts;

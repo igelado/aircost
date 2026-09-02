@@ -711,9 +711,12 @@
         <h2 id="avionics-detail-title">Avionics details</h2>
         <span id="avionics-detail-subtitle">Catalog identity and usage</span>
       </div>
-      <button class="icon-button" id="close-avionics-detail" type="button" aria-label="Close avionics details" title="Close">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
-      </button>
+      <div class="avionics-detail-actions">
+        <button class="button danger" id="delete-avionics-product" type="button" disabled>Delete product</button>
+        <button class="icon-button" id="close-avionics-detail" type="button" aria-label="Close avionics details" title="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
+        </button>
+      </div>
     </div>
     <div class="avionics-detail-body" id="avionics-detail-body" tabindex="-1"></div>
   </dialog>

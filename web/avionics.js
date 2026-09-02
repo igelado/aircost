@@ -6,6 +6,8 @@ let formatNumber;
 let formatPercent;
 let selectOption;
 let setButtonBusy;
+let refreshListings;
+let refreshReview;
 
 const state = {
   avionicsItems: [],
@@ -18,6 +20,8 @@ const state = {
   avionicsDetailRequestSequence: 0,
   avionicsSearchTimer: null,
   avionicsDetailTrigger: null,
+  avionicsDetail: null,
+  avionicsDeleting: false,
 };
 
 const elements = {};
@@ -36,6 +40,8 @@ export function initializeAvionicsInspector(shared) {
     formatPercent,
     selectOption,
     setButtonBusy,
+    refreshListings,
+    refreshReview,
   } = shared);
   collectElements();
   bindEvents();
@@ -77,6 +83,7 @@ function collectElements() {
     avionicsDetailTitle: "#avionics-detail-title",
     avionicsDetailSubtitle: "#avionics-detail-subtitle",
     avionicsDetailBody: "#avionics-detail-body",
+    deleteAvionicsProduct: "#delete-avionics-product",
     closeAvionicsDetail: "#close-avionics-detail",
   })) {
     elements[key] = document.querySelector(selector);
@@ -117,14 +124,23 @@ function bindEvents() {
     }
   });
   elements.avionicsTableBody.addEventListener("click", handleAvionicsTableClick);
+  elements.deleteAvionicsProduct.addEventListener("click", deleteCurrentAvionicsProduct);
   elements.closeAvionicsDetail.addEventListener("click", closeAvionicsDetail);
   elements.avionicsDetailDialog.addEventListener("click", (event) => {
     if (event.target === elements.avionicsDetailDialog) {
       closeAvionicsDetail();
     }
   });
+  elements.avionicsDetailDialog.addEventListener("cancel", (event) => {
+    if (state.avionicsDeleting) {
+      event.preventDefault();
+    }
+  });
   elements.avionicsDetailDialog.addEventListener("close", () => {
     state.avionicsDetailRequestSequence += 1;
+    state.avionicsDetail = null;
+    state.avionicsDeleting = false;
+    elements.deleteAvionicsProduct.disabled = true;
     state.avionicsDetailTrigger?.focus();
     state.avionicsDetailTrigger = null;
   });
@@ -489,6 +505,9 @@ function handleAvionicsTableClick(event) {
 async function openAvionicsDetail(id, trigger) {
   const requestSequence = ++state.avionicsDetailRequestSequence;
   state.avionicsDetailTrigger = trigger || document.activeElement;
+  state.avionicsDetail = null;
+  state.avionicsDeleting = false;
+  elements.deleteAvionicsProduct.disabled = true;
   const summary = state.avionicsItems.find((item) => Number(item.id) === id);
   elements.avionicsDetailTitle.textContent = summary?.display_name || `Avionics ${id}`;
   elements.avionicsDetailSubtitle.textContent = "Loading catalog identity and usage...";
@@ -509,7 +528,9 @@ async function openAvionicsDetail(id, trigger) {
     if (!detail || typeof detail !== "object") {
       throw new Error("The server returned an empty avionics record.");
     }
+    state.avionicsDetail = detail;
     renderAvionicsDetail(detail);
+    elements.deleteAvionicsProduct.disabled = false;
     elements.avionicsDetailBody.focus();
   } catch (error) {
     if (
@@ -526,7 +547,104 @@ async function openAvionicsDetail(id, trigger) {
   }
 }
 
-function closeAvionicsDetail() {
+async function deleteCurrentAvionicsProduct() {
+  const detail = state.avionicsDetail;
+  const productId = positiveInteger(detail?.summary?.id, null);
+  if (productId === null || state.avionicsDeleting) {
+    return;
+  }
+  const productName = detail.summary.display_name || `Avionics ${productId}`;
+  const visibleAssociationCount = nonnegativeInteger(
+    detail.summary?.usage?.visible_listings,
+    Array.isArray(detail.listing_occurrences) ? detail.listing_occurrences.length : 0,
+  );
+  const confirmation = [
+    `Delete product "${productName}"?`,
+    "This permanently deletes the catalog product and removes every direct and pending listing occurrence that references it.",
+    `${visibleAssociationCount} direct visible listing ${visibleAssociationCount === 1 ? "association is" : "associations are"} currently recorded. Additional pending review occurrences may also be removed.`,
+    "This cannot be undone.",
+  ].join("\n\n");
+  if (!window.confirm(confirmation)) {
+    return;
+  }
+
+  state.avionicsDeleting = true;
+  elements.closeAvionicsDetail.disabled = true;
+  setButtonBusy(elements.deleteAvionicsProduct, true);
+  elements.avionicsDetailSubtitle.textContent = "Deleting product and listing associations…";
+  removeAvionicsDeleteError();
+  try {
+    const payload = await api(`/api/avionics/${productId}`, { method: "DELETE" });
+    const outcome = avionicsDeletionOutcome(payload, productId);
+    if (state.avionicsItems.length === 1 && state.avionicsOffset > 0) {
+      state.avionicsOffset = Math.max(0, state.avionicsOffset - state.avionicsLimit);
+    }
+    closeAvionicsDetail(true);
+    await Promise.allSettled([
+      loadAvionicsWorkspace(true),
+      Promise.resolve(refreshListings()),
+      Promise.resolve(refreshReview()),
+    ]);
+    const listingIds = outcome.affectedListingIds.length
+      ? ` Listings: ${outcome.affectedListingIds.join(", ")}.`
+      : "";
+    setAvionicsMessage(
+      `${outcome.productName} deleted. Removed associations from ${outcome.affectedListingCount} ${outcome.affectedListingCount === 1 ? "listing" : "listings"}.${listingIds}`,
+    );
+  } catch (error) {
+    const message = `Could not delete ${productName}: ${error.message}`;
+    elements.avionicsDetailSubtitle.textContent = "Product deletion failed";
+    const failure = detailState(message, true);
+    failure.classList.add("avionics-delete-error");
+    elements.avionicsDetailBody.prepend(failure);
+    setAvionicsMessage(message, true);
+  } finally {
+    state.avionicsDeleting = false;
+    elements.closeAvionicsDetail.disabled = false;
+    setButtonBusy(elements.deleteAvionicsProduct, false);
+    elements.deleteAvionicsProduct.disabled = state.avionicsDetail === null;
+  }
+}
+
+function removeAvionicsDeleteError() {
+  elements.avionicsDetailBody
+    .querySelector(".avionics-delete-error")
+    ?.remove();
+}
+
+export function avionicsDeletionOutcome(payload, expectedProductId) {
+  const productId = positiveInteger(payload?.deleted_product_id, null);
+  const productName = typeof payload?.deleted_product_name === "string"
+    ? payload.deleted_product_name.trim()
+    : "";
+  const affectedListingCount = nonnegativeInteger(payload?.affected_listing_count, -1);
+  const affectedListingIds = Array.isArray(payload?.affected_listing_ids)
+    ? payload.affected_listing_ids.map((value) => positiveInteger(value, null))
+    : null;
+  if (
+    productId === null
+    || productId !== expectedProductId
+    || !productName
+    || affectedListingCount < 0
+    || affectedListingIds === null
+    || affectedListingIds.some((value) => value === null)
+    || new Set(affectedListingIds).size !== affectedListingIds.length
+    || affectedListingIds.length !== affectedListingCount
+  ) {
+    throw new Error("The server returned an invalid avionics deletion result.");
+  }
+  return {
+    productId,
+    productName,
+    affectedListingCount,
+    affectedListingIds,
+  };
+}
+
+function closeAvionicsDetail(force = false) {
+  if (state.avionicsDeleting && !force) {
+    return;
+  }
   if (elements.avionicsDetailDialog.open) {
     elements.avionicsDetailDialog.close();
   }
