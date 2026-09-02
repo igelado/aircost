@@ -338,14 +338,15 @@ An explicit avionics review rebuild is permitted only from an exactly bound
 retained submission using the current explicit occurrence schema. Before any
 write, every extracted occurrence must be represented one-to-one by a current
 listing link or residual avionics aspect; reviewer corrections and their
-connected replacement components are preserved exactly. The database has no
-durable historical discard ledger, so an occurrence with no such claim cannot
-be safely distinguished from a prior discard. That case returns `blocked` with
-the stable `occurrence_disposition_unknown` reason code, rolls back the
+connected replacement components are preserved exactly. The rebuild operation
+does not consume terminal disposition receipts to reconstruct cards. An
+occurrence omitted from the two live projections therefore returns `blocked`
+with the stable `occurrence_disposition_unknown` reason code, rolls back the
 transaction, and leaves the pending review byte-for-byte unchanged rather than
-reconstructing or guessing review state. Reviews containing non-avionics state
-are also refused before review mutation because this reset has an avionics-only
-public contract.
+reconstructing or guessing review state. Its immutable terminal receipt still
+prevents the ordinary replay path from resurrecting it. Reviews containing
+non-avionics state are also refused before review mutation because this reset
+has an avionics-only public contract.
 
 `valuation_snapshots`, `valuation_snapshot_rows`
 
@@ -466,6 +467,13 @@ avionics-graph, and listing-readiness finalizer used after complete review. Its
 response distinguishes a completed review from an actually `ready`, verified
 listing and returns the exact finalization error after a committed last-aspect
 decision, avoiding an unsafe retry of the already-applied association.
+
+An independent raw installed aspect may also commit a manual discard before the
+rest of the review. The same transaction writes an immutable occurrence
+disposition with the reviewer and bounded reason, removes exactly that aspect,
+and restages the residual review. Aspects that cover an existing association or
+participate in a replacement graph remain complete-review decisions so a
+partial commit cannot break configuration semantics.
 
 Hash-bound approved-product aspects use a product-centric workflow. One current
 OEM attestation is shared by every pending occurrence of that product. The

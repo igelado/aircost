@@ -23,12 +23,15 @@ import {
   associationsNeedingSourceRecovery,
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
+  canSaveAvionicsDiscardIndividually,
   characterLimitState,
   canonicalProductSelectionConflicts,
   describeAircraftIdentity,
   describeProductAssociationOutcome,
   describeResolvedListingOutcome,
   describeReviewReasons,
+  discardAvionicsObservationRequest,
+  discardReasonValidation,
   existingProductVerificationRequest,
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
@@ -2818,7 +2821,7 @@ function renderAspect(aspect, index, total) {
   saveDecision.className = "button button-primary";
   saveDecision.textContent = "Save verified product for this entry";
   saveDecision.addEventListener("click", () => {
-    saveUseExistingProduct(key);
+    saveIndividualAspectDecision(key);
   });
   const saveResult = document.createElement("p");
   saveResult.className = "review-aspect-save-result";
@@ -3170,7 +3173,7 @@ function actionPanel(aspect, draft, action, key) {
   } else if (action === "create_verified_product") {
     panel.append(...createProductControls(draft, key));
   } else if (action === "discard") {
-    panel.append(discardControls(draft, key));
+    panel.append(discardControls(aspect, draft, key));
   }
   return panel;
 }
@@ -3260,15 +3263,23 @@ function createProductControls(draft, key) {
   return [grid, capabilityHint];
 }
 
-function discardControls(draft, key) {
-  return draftTextarea(
+function discardControls(aspect, draft, key) {
+  const controls = document.createElement("div");
+  controls.append(draftTextarea(
     "Reason for discarding this observation",
     draft.discardReason,
     (value) => {
       draft.discardReason = value;
       draftChanged(key);
     },
-  );
+  ));
+  if (!canSaveAvionicsDiscardIndividually(aspect, state.currentReview?.aspects)) {
+    const hint = document.createElement("p");
+    hint.className = "review-catalog-message";
+    hint.textContent = "This is not an independent current raw observation; it is covered, synthetic, legacy, or part of a replacement relationship. Its discard must be saved with the complete listing review.";
+    controls.append(hint);
+  }
+  return controls;
 }
 
 function draftInput(
@@ -3381,7 +3392,8 @@ function syncAspectView(key) {
       : "Review required";
   view.validation.classList.toggle("error", draft.action !== null && !validation.valid);
   view.validation.textContent = validation.message;
-  const canSaveIndividually = draft.action === "use_verified_product";
+  const individualSaveKind = individualAspectSaveKind(draft);
+  const canSaveIndividually = individualSaveKind !== null;
   view.saveControls.classList.toggle(
     "is-hidden",
     !canSaveIndividually && !nonBlank(draft.decisionError),
@@ -3396,8 +3408,12 @@ function syncAspectView(key) {
     || state.resolving
     || state.automating;
   view.saveDecision.textContent = draft.savingDecision
-    ? "Saving this entry…"
-    : "Save verified product for this entry";
+    ? individualSaveKind === "discard"
+      ? "Saving discarded observation…"
+      : "Saving this entry…"
+    : individualSaveKind === "discard"
+      ? "Save discarded observation"
+      : "Save verified product for this entry";
   view.saveResult.classList.toggle("error", nonBlank(draft.decisionError));
   view.saveResult.setAttribute("role", nonBlank(draft.decisionError) ? "alert" : "status");
   view.saveResult.textContent = draft.decisionError
@@ -3405,8 +3421,26 @@ function syncAspectView(key) {
     : draft.savingDecision
       ? "Saving only this avionics entry. Other decisions remain unchanged."
       : canSaveIndividually
-        ? "Save this match now; the listing review will retain every other unresolved entry."
+        ? individualSaveKind === "discard"
+          ? "Save this discard now; every other unresolved entry and unsaved decision remains in place."
+          : "Save this match now; the listing review will retain every other unresolved entry."
         : "";
+}
+
+function individualAspectSaveKind(draft) {
+  if (draft?.action === "use_verified_product") {
+    return "use_verified_product";
+  }
+  if (
+    draft?.action === "discard"
+    && canSaveAvionicsDiscardIndividually(
+      draft.aspect,
+      state.currentReview?.aspects,
+    )
+  ) {
+    return "discard";
+  }
+  return null;
 }
 
 function currentCanonicalProductConflicts() {
@@ -3501,10 +3535,11 @@ function validateDraft(draft) {
     return validDraftResult(draft, "New verified product details are complete.");
   }
   if (draft.action === "discard") {
-    if (!nonBlank(draft.discardReason)) {
-      return { valid: false, message: "Explain why this listing observation should be discarded." };
+    const reasonValidation = discardReasonValidation(draft.discardReason);
+    if (!reasonValidation.valid) {
+      return reasonValidation;
     }
-    return validDraftResult(draft, "Discard rationale recorded.");
+    return validDraftResult(draft, reasonValidation.message);
   }
   return { valid: false, message: "Unsupported review action." };
 }
@@ -3913,16 +3948,17 @@ function showAspectResolutionError(error) {
   });
 }
 
-async function saveUseExistingProduct(key) {
+async function saveIndividualAspectDecision(key) {
   const review = state.currentReview;
   const draft = state.drafts.get(key);
+  const saveKind = individualAspectSaveKind(draft);
   const productId = positiveInteger(draft?.catalogProduct?.id);
   const validation = draft ? validateDraft(draft) : { valid: false };
   if (
     !review
     || !draft
-    || productId === null
-    || draft.action !== "use_verified_product"
+    || saveKind === null
+    || saveKind === "use_verified_product" && productId === null
     || !validation.valid
     || draft.correction.dirty
     || draft.correction.saving
@@ -3940,18 +3976,31 @@ async function saveUseExistingProduct(key) {
   draft.decisionError = "";
   syncAllAspectViews();
   updateProgress();
-  setWorkspaceMessage(`Saving only this avionics entry as catalog product ${productId}…`);
+  const discarding = saveKind === "discard";
+  setWorkspaceMessage(discarding
+    ? "Saving only this discarded avionics observation…"
+    : `Saving only this avionics entry as catalog product ${productId}…`);
   try {
+    const endpoint = discarding
+      ? `/api/review/listings/${review.listing_id}/avionics/discard`
+      : `/api/review/listings/${review.listing_id}/avionics/use-existing`;
+    const request = discarding
+      ? discardAvionicsObservationRequest(
+        review.review_payload_sha256,
+        draft.aspect.id,
+        draft.discardReason,
+      )
+      : useExistingProductRequest(
+        review.review_payload_sha256,
+        review.catalog_revision_sha256,
+        draft.aspect.id,
+        productId,
+      );
     const payload = await api(
-      `/api/review/listings/${review.listing_id}/avionics/use-existing`,
+      endpoint,
       {
         method: "POST",
-        body: JSON.stringify(useExistingProductRequest(
-          review.review_payload_sha256,
-          review.catalog_revision_sha256,
-          draft.aspect.id,
-          productId,
-        )),
+        body: JSON.stringify(request),
       },
     );
     if (state.currentReview !== review || state.savingAspectKey !== key) {
@@ -3973,23 +4022,24 @@ async function saveUseExistingProduct(key) {
     state.correctionViews.clear();
     initializeDrafts(refreshed, preservedDrafts);
     renderReview();
-    setWorkspaceMessage(
-      `Saved ${draft.catalogProduct.displayName} for this entry. Review the remaining avionics entries.`,
-    );
+    setWorkspaceMessage(discarding
+      ? "Saved the discard for this entry. Review the remaining avionics entries."
+      : `Saved ${draft.catalogProduct.displayName} for this entry. Review the remaining avionics entries.`);
   } catch (error) {
     if (state.currentReview !== review || state.savingAspectKey !== key) {
       return;
     }
     state.savingAspectKey = null;
     draft.savingDecision = false;
-    draft.decisionError = error?.message || "The server rejected this avionics decision.";
+    draft.decisionError = error?.message || (discarding
+      ? "The server rejected this discard decision."
+      : "The server rejected this avionics decision.");
     if (isStaleError(error)) {
       markStale(error.message);
     } else {
-      setWorkspaceMessage(
-        "This avionics entry was not saved. The exact error is shown on its card.",
-        true,
-      );
+      setWorkspaceMessage(discarding
+        ? "This discard was not saved. The exact error is shown on its avionics card."
+        : "This avionics entry was not saved. The exact error is shown on its card.", true);
     }
     syncAllAspectViews();
     updateProgress();

@@ -3,6 +3,7 @@ export const REVIEW_PRODUCT_IDENTITY_LIMITS = Object.freeze({
   sourceTitle: 200,
   evidenceText: 128,
 });
+export const REVIEW_DISCARD_REASON_MAX_BYTES = 500;
 
 const AVIONICS_REBUILD_BLOCK_MESSAGES = Object.freeze({
   retained_source_missing:
@@ -50,6 +51,70 @@ export function useExistingProductRequest(
     aspect_id: aspectId,
     avionics_model_id: avionicsModelId,
   };
+}
+
+export function discardAvionicsObservationRequest(
+  reviewPayloadSha256,
+  aspectId,
+  reason,
+) {
+  return {
+    review_payload_sha256: reviewPayloadSha256,
+    aspect_id: aspectId,
+    reason: typeof reason === "string" ? reason.trim() : "",
+  };
+}
+
+export function discardReasonValidation(reason) {
+  const value = typeof reason === "string" ? reason.trim() : "";
+  if (!value) {
+    return {
+      valid: false,
+      message: "Explain why this listing observation should be discarded.",
+    };
+  }
+  if (new TextEncoder().encode(value).length > REVIEW_DISCARD_REASON_MAX_BYTES) {
+    return {
+      valid: false,
+      message: `Discard reason must contain at most ${REVIEW_DISCARD_REASON_MAX_BYTES} UTF-8 bytes.`,
+    };
+  }
+  return { valid: true, message: "Discard rationale recorded." };
+}
+
+// The server's editable-action projection is false for covered associations
+// and observations used as another aspect's replacement. The remaining
+// checks require a current primary extraction coordinate and keep synthetic
+// or self-coupled replacement cards out of the observation-scoped discard
+// path even if a malformed response claims they are editable.
+export function canSaveAvionicsDiscardIndividually(aspect, aspects = []) {
+  if (
+    !aspect
+    || typeof aspect !== "object"
+    || typeof aspect.kind !== "string"
+    || !aspect.kind.startsWith("avionics")
+    || aspect.kind === "avionics_reuse_attestation"
+    || !/^avionics:\d+:primary$/.test(String(aspect.id ?? ""))
+    || aspect.configuration_action_editable !== true
+    || aspect.configuration_action !== "installed"
+    || !Number.isSafeInteger(aspect.quantity)
+    || aspect.quantity <= 0
+    || aspect.replacement_aspect_id !== null
+      && aspect.replacement_aspect_id !== undefined
+    || aspect.replacement_product !== null
+      && aspect.replacement_product !== undefined
+    || !Array.isArray(aspect.allowed_actions)
+    || !aspect.allowed_actions.includes("discard")
+  ) {
+    return false;
+  }
+  const aspectId = String(aspect.id ?? "");
+  return aspectId.length > 0 && !aspects.some((candidate) => (
+    candidate !== aspect
+    && candidate?.replacement_aspect_id !== null
+    && candidate?.replacement_aspect_id !== undefined
+    && String(candidate.replacement_aspect_id) === aspectId
+  ));
 }
 
 const MACHINE_REASON_CODE = /^[a-z0-9_]+$/;
