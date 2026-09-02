@@ -423,15 +423,18 @@ Ordinary extracted avionics aspects offer three decisions:
   nor a listing association.
 
 An existing-product match can be committed immediately with **Save verified
-product for this entry**. The server updates only that occurrence, removes its
-card from the hash-bound review, and returns a fresh revision for the remaining
+product for this entry**. An independent raw observation can likewise be
+committed immediately with **Save discarded observation** after the reviewer
+provides a reason. The server updates only that occurrence, removes its card
+from the hash-bound review, and returns a fresh revision for the remaining
 cards; unsaved browser drafts for those cards are preserved. The final saved
 card runs the ordinary canonical listing finalizer automatically. The UI reports
 completion only when the returned listing is both `ready` and verified, and
 keeps any exact association or finalization failure on the affected card or in
 the terminal result instead of replacing it with a listing-wide generic error.
-Create and discard decisions continue to participate in the atomic complete
-review action when they remain.
+Create decisions and discard decisions that cover an existing association or
+participate in a replacement graph continue to use the atomic complete-review
+action.
 
 Catalog search results expose `catalog.reuse_eligible`. An approved product that
 lacks a current reusable manufacturer-source attestation remains visible and
@@ -519,6 +522,7 @@ POST /api/review/listings/{listing_id}/aircraft/publisher-hierarchy
 POST /api/review/listings/{listing_id}/avionics/rebuild
 POST /api/review/listings/{listing_id}/avionics/consolidate
 POST /api/review/listings/{listing_id}/avionics/use-existing
+POST /api/review/listings/{listing_id}/avionics/discard
 POST /api/review/listings/{listing_id}/avionics/revise
 POST /api/review/listings/{listing_id}/avionics/verify-existing
 POST /api/review/listings/{listing_id}/avionics/approve-replacement

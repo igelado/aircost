@@ -122,6 +122,27 @@ test("saves a verified product decision on its own aspect card", () => {
   assert.match(appCss, /\.review-aspect-save-result\.error/);
 });
 
+test("saves only eligible raw observation discards from their aspect card", () => {
+  assert.match(reviewJs, /canSaveAvionicsDiscardIndividually/);
+  assert.match(reviewJs, /Save discarded observation/);
+  assert.match(
+    reviewJs,
+    /\/api\/review\/listings\/\$\{review\.listing_id\}\/avionics\/discard/,
+  );
+  assert.match(reviewJs, /discardAvionicsObservationRequest\(/);
+  assert.match(reviewJs, /const preservedDrafts = new Map\(state\.drafts\)/);
+  assert.match(reviewJs, /exact error is shown on its avionics card/);
+  assert.match(reviewJs, /Its discard must be saved with the complete listing review/);
+  const handler = reviewJs.match(
+    /async function saveIndividualAspectDecision\(key\) \{[\s\S]*?\n\}\n\nasync function validateExistingAssociation/,
+  )?.[0] ?? "";
+  assert.notEqual(handler, "");
+  assert.match(
+    handler,
+    /discardAvionicsObservationRequest\(\s*review\.review_payload_sha256,\s*draft\.aspect\.id,\s*draft\.discardReason/,
+  );
+});
+
 test("reports card-by-card completion only after final listing verification", () => {
   assert.match(reviewJs, /outcome\?\.listing_ready === true/);
   assert.match(reviewJs, /outcome\?\.listing_verified === true/);

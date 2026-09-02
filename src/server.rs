@@ -59,17 +59,18 @@ use crate::listing::review::replacement::{
 };
 use crate::listing::review::{
     approve_locally_verified_ordinary_aspect_and_restage,
-    corroborate_existing_product_association_and_restage, evaluate_existing_product_association,
-    get_listing_review, list_listing_reviews, list_pending_product_associations,
-    list_pending_product_reviews, preflight_listing_review_resolution,
-    preflight_pending_product_attestation, prepare_pending_product_reviews,
-    rebuild_pending_avionics_review_if_current, resolve_listing_review, resolved_review_response,
-    restage_unattested_preserved_products, revise_avionics_observation_and_restage,
-    use_existing_product_for_aspect_and_restage, ExistingProductAssociationCommit,
-    ExistingProductAssociationEvaluation, ListingReview, ListingReviewDetail, ListingReviewQueue,
-    PendingProductAssociationPage, PendingProductReviewPage, ProductReviewPageQuery,
-    RebuildPendingAvionicsReview, RebuildPendingAvionicsReviewBlockReason, ResolveReviewRequest,
-    ResolveReviewResponse, ReviewAspectId, ReviewDecision, ReviewError, ReviewQueueQuery,
+    corroborate_existing_product_association_and_restage, discard_raw_avionics_aspect_and_restage,
+    evaluate_existing_product_association, get_listing_review, list_listing_reviews,
+    list_pending_product_associations, list_pending_product_reviews,
+    preflight_listing_review_resolution, preflight_pending_product_attestation,
+    prepare_pending_product_reviews, rebuild_pending_avionics_review_if_current,
+    resolve_listing_review, resolved_review_response, restage_unattested_preserved_products,
+    revise_avionics_observation_and_restage, use_existing_product_for_aspect_and_restage,
+    ExistingProductAssociationCommit, ExistingProductAssociationEvaluation, ListingReview,
+    ListingReviewDetail, ListingReviewQueue, PendingProductAssociationPage,
+    PendingProductReviewPage, ProductReviewPageQuery, RebuildPendingAvionicsReview,
+    RebuildPendingAvionicsReviewBlockReason, ResolveReviewRequest, ResolveReviewResponse,
+    ReviewAspectId, ReviewDecision, ReviewError, ReviewQueueQuery,
     ReviseAvionicsObservationRequest, StagedPendingReview,
 };
 use crate::listing::run::{
@@ -214,6 +215,15 @@ struct UseExistingReviewAvionicsRequest {
     expected_catalog_revision_sha256: String,
     aspect_id: ReviewAspectId,
     avionics_model_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscardReviewAvionicsRequest {
+    #[serde(rename = "review_payload_sha256")]
+    expected_review_payload_sha256: String,
+    aspect_id: ReviewAspectId,
+    reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -379,6 +389,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/review/listings/{id}/avionics/use-existing",
             post(use_existing_review_avionics_handler),
+        )
+        .route(
+            "/api/review/listings/{id}/avionics/discard",
+            post(discard_review_avionics_handler),
         )
         .route(
             "/api/review/listings/{id}/avionics/revise",
@@ -1697,6 +1711,28 @@ async fn use_existing_review_avionics_handler(
         &payload.expected_review_payload_sha256,
         &payload.expected_catalog_revision_sha256,
         payload.avionics_model_id,
+    )
+    .await?;
+    review_maintenance_response(&state.db, user.id, listing_id, staged).await
+}
+
+/// Permanently discard one independent raw avionics occurrence without
+/// resolving any other aspect or depending on a catalog revision.
+async fn discard_review_avionics_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+    Json(payload): Json<DiscardReviewAvionicsRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let staged = discard_raw_avionics_aspect_and_restage(
+        &state.db,
+        user.id,
+        listing_id,
+        &payload.aspect_id,
+        &payload.expected_review_payload_sha256,
+        &payload.reason,
     )
     .await?;
     review_maintenance_response(&state.db, user.id, listing_id, staged).await

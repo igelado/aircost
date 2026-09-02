@@ -1845,6 +1845,12 @@ struct OrdinaryAspectUseExistingCommit {
 }
 
 #[derive(Clone, Debug)]
+struct IndependentRawAspectDiscardCommit {
+    aspect_id: ReviewAspectId,
+    reason: String,
+}
+
+#[derive(Clone, Debug)]
 enum OrdinaryAspectUseExistingAuthorization {
     ReviewerSelection,
     HashBoundReuseTarget {
@@ -1857,6 +1863,7 @@ enum OrdinaryAspectUseExistingAuthorization {
 enum ReviewMaintenanceCommit {
     CorroborateAssociation(AssociationCorroborationCommit),
     UseExistingForOrdinaryAspect(OrdinaryAspectUseExistingCommit),
+    DiscardIndependentRawAspect(IndependentRawAspectDiscardCommit),
 }
 
 async fn restage_pending_review_if_current_with_commit(
@@ -1888,6 +1895,9 @@ async fn restage_pending_review_if_current_with_commit(
                             || evidence_provenance.source_url.trim().is_empty()
                             || !valid_sha256(&evidence_provenance.rendered_html_sha256)
                     )
+            }
+            ReviewMaintenanceCommit::DiscardIndependentRawAspect(commit) => {
+                bounded_decision_reason(&commit.reason).is_err()
             }
         })
     {
@@ -2096,6 +2106,7 @@ async fn restage_pending_review_if_current_with_commit(
           AND replaces_avionics_model_id IS NULL
         "#,
     );
+    let insert_occurrence_disposition = db.sql(INSERT_DISPOSITION_SQL);
     let delete_review = db.sql(
         r#"
         DELETE FROM aircraft_sale_listing_pending_reviews
@@ -2166,6 +2177,21 @@ async fn restage_pending_review_if_current_with_commit(
                 Some(&row.review_payload_sha256),
                 row.pending_aspect_count,
             )?;
+            if let Some(ReviewMaintenanceCommit::DiscardIndependentRawAspect(commit)) =
+                maintenance_commit
+            {
+                let aspect = payload
+                    .aspects
+                    .iter()
+                    .find(|aspect| aspect.id == commit.aspect_id)
+                    .ok_or_else(|| {
+                        ReviewError::Stale(format!(
+                            "review aspect {} changed before aspect-scoped discard",
+                            commit.aspect_id
+                        ))
+                    })?;
+                validate_independent_raw_discard_aspect(aspect, &payload.aspects)?;
+            }
             let normalized_payload = serialize_review_payload(&payload.aspects)?;
             let mut repaired_evidence =
                 normalized_payload.review_payload_json != row.review_payload_json;
@@ -2182,6 +2208,7 @@ async fn restage_pending_review_if_current_with_commit(
                         } => Some((&commit.aspect_id, evidence_provenance)),
                     }
                 }
+                Some(ReviewMaintenanceCommit::DiscardIndependentRawAspect(_)) => None,
                 None => None,
             };
             if let Some((aspect_id, expected_provenance)) = local_evidence_guard {
@@ -2440,6 +2467,106 @@ async fn restage_pending_review_if_current_with_commit(
                     payload.aspects = validated_aspects(&payload.aspects)?;
                     validate_current_covered_associations(&payload.aspects, &assignments)?;
                 }
+            }
+
+            let mut independent_raw_aspect_discarded = false;
+            if let Some(ReviewMaintenanceCommit::DiscardIndependentRawAspect(commit)) =
+                maintenance_commit
+            {
+                let aspect_index = payload
+                    .aspects
+                    .iter()
+                    .position(|aspect| aspect.id == commit.aspect_id)
+                    .ok_or_else(|| {
+                        ReviewError::Stale(format!(
+                            "review aspect {} changed before aspect-scoped discard",
+                            commit.aspect_id
+                        ))
+                    })?;
+                let aspect = payload.aspects[aspect_index].clone();
+                validate_independent_raw_discard_aspect(&aspect, &payload.aspects)?;
+
+                let (occurrence_index, occurrence_role) =
+                    coordinates_from_aspect_id(&aspect.id).ok_or_else(|| {
+                        ReviewError::Validation(format!(
+                            "review aspect {} is not bound to a current raw occurrence",
+                            aspect.id
+                        ))
+                    })?;
+                if occurrence_role.as_str() != "primary" {
+                    return Err(ReviewError::Validation(format!(
+                        "review aspect {} is replacement-coupled and cannot be discarded independently",
+                        aspect.id
+                    )));
+                }
+
+                let submission_id = row.plugin_submission_id.ok_or_else(|| {
+                    ReviewError::Validation(format!(
+                        "review aspect {} has no retained raw listing submission",
+                        aspect.id
+                    ))
+                })?;
+                let capture =
+                    sqlx::query_as::<_, ListingEvidenceCaptureRow>(&evidence_capture_select)
+                        .bind(submission_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                        .ok_or_else(|| {
+                            ReviewError::Stale(format!(
+                                "retained source submission {submission_id} disappeared"
+                            ))
+                        })?;
+                validate_listing_evidence_capture_provenance(&row, &capture, None)
+                    .map_err(ReviewError::Stale)?;
+                let extracted_listing_json =
+                    capture.extracted_listing_json.as_deref().ok_or_else(|| {
+                        ReviewError::Stale(format!(
+                            "review aspect {} retained source has no current extraction",
+                            aspect.id
+                        ))
+                    })?;
+                let occurrences = parse_current_avionics_extraction_json(extracted_listing_json)
+                    .map_err(|error| ReviewError::Stale(error.to_string()))?;
+                occurrences.get(occurrence_index).ok_or_else(|| {
+                    ReviewError::Stale(format!(
+                        "review aspect {} no longer identifies a retained extraction occurrence",
+                        aspect.id
+                    ))
+                })?;
+
+                let extraction_sha256 = extraction_sha256(extracted_listing_json);
+                let fingerprint = occurrence_fingerprint(
+                    &extraction_sha256,
+                    occurrence_index,
+                    occurrence_role,
+                )
+                .map_err(ReviewError::Validation)?;
+                let inserted = sqlx::query(&insert_occurrence_disposition)
+                    .bind(listing_id)
+                    .bind(submission_id)
+                    .bind(&extraction_sha256)
+                    .bind(occurrence_index as i64)
+                    .bind(occurrence_role.as_str())
+                    .bind(fingerprint)
+                    .bind("discarded")
+                    .bind(Option::<i64>::None)
+                    .bind("reviewer_discarded")
+                    .bind(&commit.reason)
+                    .bind("manual")
+                    .bind(owner_user_id)
+                    .bind(DISPOSITION_POLICY_VERSION)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if inserted != 1 {
+                    return Err(ReviewError::Stale(format!(
+                        "review aspect {} already has a terminal occurrence disposition",
+                        aspect.id
+                    )));
+                }
+
+                payload.aspects.remove(aspect_index);
+                independent_raw_aspect_discarded = true;
             }
 
             let mut ordinary_aspect_used = false;
@@ -2983,6 +3110,7 @@ async fn restage_pending_review_if_current_with_commit(
                     || added_suggested_reuse_targets
                     || repaired_evidence
                     || ordinary_aspect_used
+                    || independent_raw_aspect_discarded
                 {
                     let serialized = serialize_review_payload(&payload.aspects)?;
                     let changed = sqlx::query(&update_review)
@@ -3554,6 +3682,39 @@ pub(crate) async fn approve_locally_verified_ordinary_aspect_and_restage(
                 expected_collision_closure_sha256: expected_collision_closure_sha256.to_string(),
                 evidence_provenance: evidence_provenance.clone(),
             },
+        });
+    restage_pending_review_if_current_with_commit(
+        db,
+        owner_user_id,
+        listing_id,
+        expected_review_payload_sha256,
+        Some(&commit),
+    )
+    .await
+}
+
+/// Atomically discards one independent raw extraction occurrence and removes
+/// only its hash-bound aspect from the pending bundle.
+///
+/// Covered listing associations, synthetic maintenance aspects, reviewer
+/// corrections bound to an existing association, and either side of a
+/// replacement relationship must use their relationship-aware workflows.
+/// This boundary writes the immutable terminal receipt before changing the
+/// review, so replay cannot resurrect the discarded observation.
+pub(crate) async fn discard_raw_avionics_aspect_and_restage(
+    db: &AppDb,
+    owner_user_id: i64,
+    listing_id: i64,
+    aspect_id: &ReviewAspectId,
+    expected_review_payload_sha256: &str,
+    reason: &str,
+) -> ReviewResult<Option<StagedPendingReview>> {
+    aspect_id.validate()?;
+    let reason = bounded_decision_reason(reason).map_err(ReviewError::Validation)?;
+    let commit =
+        ReviewMaintenanceCommit::DiscardIndependentRawAspect(IndependentRawAspectDiscardCommit {
+            aspect_id: aspect_id.clone(),
+            reason: reason.to_string(),
         });
     restage_pending_review_if_current_with_commit(
         db,
@@ -5425,6 +5586,28 @@ fn validate_independent_ordinary_aspect(
     {
         return Err(ReviewError::Validation(format!(
             "review aspect {} does not identify an independent installed association",
+            aspect.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_independent_raw_discard_aspect(
+    aspect: &PendingReviewAspect,
+    aspects: &[PendingReviewAspect],
+) -> ReviewResult<()> {
+    validate_independent_ordinary_aspect(aspect, aspects)?;
+    if !aspect.allowed_actions.contains(&ReviewAction::Discard) {
+        return Err(ReviewError::Validation(format!(
+            "review aspect {} is not a discardable raw avionics observation",
+            aspect.id
+        )));
+    }
+    if !aspect.covered_associations.is_empty()
+        || aspect.reviewer_correction_association_binding.is_some()
+    {
+        return Err(ReviewError::Validation(format!(
+            "review aspect {} covers an existing or reviewer-corrected association and cannot be discarded as a raw occurrence",
             aspect.id
         )));
     }
@@ -19523,5 +19706,249 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .unwrap();
         assert_eq!(remaining_links, vec![(first_id, Some(replacement_id))]);
         assert!(duplicate_target.to_string().contains("displaced"));
+    }
+
+    fn raw_discard_aspect(index: usize, model: &str, capability: &str) -> PendingReviewAspect {
+        PendingReviewAspect::avionics(
+            format!("avionics:{index}:primary"),
+            "avionics_identity",
+            format!("Garmin {model}"),
+            format!("Garmin {model} · {capability} · quantity 1 · installed"),
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some(format!("Garmin {model} installed")),
+            Some("high".to_string()),
+        )
+    }
+
+    #[tokio::test]
+    async fn aspect_scoped_discard_writes_receipt_and_rehashes_only_residual_work() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            "<main>Garmin G5 installed. Garmin GTX 345 installed.</main>",
+        )
+        .await;
+        store_current_avionics_extraction(
+            &db,
+            submission_id,
+            serde_json::json!([
+                {
+                    "manufacturer": "Garmin",
+                    "model": "G5",
+                    "types": ["Flight Display"],
+                    "quantity": 1,
+                    "configuration_action": "installed",
+                    "replaces": null,
+                    "source_evidence_text": "Garmin G5 installed",
+                    "source_confidence": "high"
+                },
+                {
+                    "manufacturer": "Garmin",
+                    "model": "GTX 345",
+                    "types": ["Transponder"],
+                    "quantity": 1,
+                    "configuration_action": "installed",
+                    "replaces": null,
+                    "source_evidence_text": "Garmin GTX 345 installed",
+                    "source_confidence": "high"
+                }
+            ]),
+        )
+        .await;
+        let mut first_aspect = raw_discard_aspect(0, "G5", "Flight Display");
+        // An unlinked reviewer correction still identifies the immutable raw
+        // coordinate even when its current review fields no longer equal the
+        // extraction. A later discard must terminate that source occurrence.
+        first_aspect.kind = REVIEWER_CORRECTED_AVIONICS_KIND.to_string();
+        first_aspect.quantity = 2;
+        let second_aspect = raw_discard_aspect(1, "GTX 345", "Transponder");
+        let original = stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[first_aspect.clone(), second_aspect.clone()],
+        )
+        .await
+        .unwrap();
+
+        let restaged = discard_raw_avionics_aspect_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &first_aspect.id,
+            &original.review_payload_sha256,
+            "  duplicate marketing text  ",
+        )
+        .await
+        .unwrap()
+        .expect("one unrelated aspect must remain");
+        assert_eq!(restaged.pending_aspect_count, 1);
+        assert_ne!(
+            restaged.review_payload_sha256,
+            original.review_payload_sha256
+        );
+        assert_eq!(
+            restaged.catalog_revision_sha256, original.catalog_revision_sha256,
+            "discard is independent of catalog revision"
+        );
+        let detail = get_listing_review(&db, user_id, listing_id)
+            .await
+            .unwrap()
+            .review;
+        assert_eq!(detail.aspects.len(), 1);
+        assert_eq!(detail.aspects[0].id, second_aspect.id);
+
+        let extraction_json: String = sqlx::query_scalar(
+            "SELECT extracted_listing_json FROM plugin_submissions WHERE id = ?",
+        )
+        .bind(submission_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        let first_receipt: (String, Option<i64>, String, String, String) = sqlx::query_as(
+            r#"
+            SELECT outcome, avionics_model_id, reason_code,
+                   decision_reason, decision_source
+            FROM aircraft_sale_listing_avionics_dispositions
+            WHERE plugin_submission_id = ? AND extraction_sha256 = ?
+              AND occurrence_index = 0 AND occurrence_role = 'primary'
+            "#,
+        )
+        .bind(submission_id)
+        .bind(extraction_sha256(&extraction_json))
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            first_receipt,
+            (
+                "discarded".to_string(),
+                None,
+                "reviewer_discarded".to_string(),
+                "duplicate marketing text".to_string(),
+                "manual".to_string(),
+            )
+        );
+
+        let completed = discard_raw_avionics_aspect_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &second_aspect.id,
+            &restaged.review_payload_sha256,
+            "not installed",
+        )
+        .await
+        .unwrap();
+        assert_eq!(completed, None);
+        let review_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(review_count, 0);
+        let listing_state: (String, bool) = sqlx::query_as(
+            "SELECT ingestion_state, is_verified FROM aircraft_sale_listings WHERE id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(listing_state, ("incomplete".to_string(), false));
+        let receipt_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_dispositions WHERE plugin_submission_id = ? AND outcome = 'discarded'",
+        )
+        .bind(submission_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(receipt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn aspect_scoped_discard_rejects_covered_and_replacement_coupled_aspects() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            "<main>Garmin G5 installed.</main>",
+        )
+        .await;
+        store_current_installed_avionics_evidence(
+            &db,
+            submission_id,
+            "G5",
+            "Flight Display",
+            1,
+            "Garmin G5 installed",
+        )
+        .await;
+        let covered = raw_discard_aspect(0, "G5", "Flight Display").with_covered_association(
+            9001,
+            ListingAssociationRole::Installed,
+            7001,
+        );
+        let staged = stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            std::slice::from_ref(&covered),
+        )
+        .await
+        .unwrap();
+        let covered_error = discard_raw_avionics_aspect_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &covered.id,
+            &staged.review_payload_sha256,
+            "not installed",
+        )
+        .await
+        .expect_err("covered associations require their relationship-aware workflow");
+        assert!(matches!(
+            covered_error,
+            ReviewError::Validation(message) if message.contains("covers an existing")
+        ));
+
+        let mut replacement = raw_discard_aspect(0, "G5", "Flight Display");
+        replacement.allowed_actions = vec![ReviewAction::Discard];
+        replacement.configuration_action = "replaces".to_string();
+        replacement.replaces_product_id = Some(7002);
+        let replacement_error = validate_independent_raw_discard_aspect(
+            &replacement,
+            std::slice::from_ref(&replacement),
+        )
+        .expect_err("replacement-coupled aspects require complete review");
+        assert!(matches!(
+            replacement_error,
+            ReviewError::Validation(message) if message.contains("coupled")
+        ));
+
+        let disposition_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_dispositions WHERE plugin_submission_id = ?",
+        )
+        .bind(submission_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(disposition_count, 0);
+        let retained_hash: String = sqlx::query_scalar(
+            "SELECT review_payload_sha256 FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(retained_hash, staged.review_payload_sha256);
     }
 }

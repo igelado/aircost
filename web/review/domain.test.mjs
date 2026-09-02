@@ -11,12 +11,15 @@ import {
   associationsNeedingSourceRecovery,
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
+  canSaveAvionicsDiscardIndividually,
   canonicalProductSelectionConflicts,
   characterLimitState,
   describeAircraftIdentity,
   describeProductAssociationOutcome,
   describeResolvedListingOutcome,
   describeReviewReasons,
+  discardAvionicsObservationRequest,
+  discardReasonValidation,
   existingProductVerificationRequest,
   groupProductAssociationsByListing,
   isAircraftIdentityStatus,
@@ -160,6 +163,72 @@ test("builds one hash-bound request for an independently saved product decision"
       avionics_model_id: 28,
     },
   );
+});
+
+test("builds one hash-bound catalog-independent observation discard request", () => {
+  assert.deepEqual(
+    discardAvionicsObservationRequest(
+      "a".repeat(64),
+      "avionics:3:primary",
+      "  duplicate listing text  ",
+    ),
+    {
+      review_payload_sha256: "a".repeat(64),
+      aspect_id: "avionics:3:primary",
+      reason: "duplicate listing text",
+    },
+  );
+});
+
+test("validates discard reasons against the server UTF-8 byte boundary", () => {
+  assert.equal(discardReasonValidation(" duplicate ").valid, true);
+  assert.deepEqual(discardReasonValidation(" "), {
+    valid: false,
+    message: "Explain why this listing observation should be discarded.",
+  });
+  assert.equal(discardReasonValidation("é".repeat(250)).valid, true);
+  assert.deepEqual(discardReasonValidation("é".repeat(251)), {
+    valid: false,
+    message: "Discard reason must contain at most 500 UTF-8 bytes.",
+  });
+});
+
+test("allows individual discard only for an independent raw installed aspect", () => {
+  const independent = {
+    id: "avionics:3:primary",
+    kind: "avionics_identity",
+    configuration_action: "installed",
+    configuration_action_editable: true,
+    quantity: 1,
+    allowed_actions: ["use_verified_product", "discard"],
+  };
+  assert.equal(canSaveAvionicsDiscardIndividually(independent, [independent]), true);
+  assert.equal(canSaveAvionicsDiscardIndividually({
+    ...independent,
+    configuration_action_editable: false,
+  }), false, "covered aspects use complete review");
+  assert.equal(canSaveAvionicsDiscardIndividually({
+    ...independent,
+    kind: "avionics_reuse_attestation",
+  }), false, "synthetic preserved cards cannot be discarded independently");
+  assert.equal(canSaveAvionicsDiscardIndividually({
+    ...independent,
+    reviewer_corrected: true,
+  }), true, "an unlinked corrected raw occurrence retains its extraction coordinate");
+  assert.equal(canSaveAvionicsDiscardIndividually({
+    ...independent,
+    id: "legacy-observation",
+  }), false, "opaque legacy aspects have no current extraction coordinate");
+  assert.equal(canSaveAvionicsDiscardIndividually({
+    ...independent,
+    configuration_action: "replaces",
+    replacement_product: { id: 9 },
+  }), false, "a replacement-coupled parent uses complete review");
+  const replacementChild = { ...independent, id: "avionics:4:replacement" };
+  assert.equal(canSaveAvionicsDiscardIndividually(replacementChild, [
+    replacementChild,
+    { ...independent, replacement_aspect_id: replacementChild.id },
+  ]), false, "a referenced replacement child uses complete review");
 });
 
 test("builds a hash-bound avionics correction without replacing source evidence", () => {
