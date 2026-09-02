@@ -434,12 +434,16 @@ Create and discard decisions continue to participate in the atomic complete
 review action when they remain.
 
 Catalog search results expose `catalog.reuse_eligible`. An approved product that
-lacks a current reusable manufacturer-source attestation remains visible for
-diagnosis but cannot be selected. Preparing the Known avionics products queue
-also promotes a still-current approved suggestion on an independent ordinary
-occurrence into an explicit product-attestation target. This lets the reviewer
-verify the OEM source once, validate each retained listing occurrence locally,
-and then return to manual review without recreating the catalog product.
+lacks a current reusable manufacturer-source attestation remains visible and
+can be selected only for inline source verification. The selected occurrence
+card accepts one exact OEM URL, title, and bounded identity excerpt, verifies
+the global product without Gemini, refreshes that card's catalog revision, and
+preserves every other unsaved listing decision. The reviewer must still save
+the listing association separately after confirming the match. Preparing the
+Known avionics products queue also promotes a still-current approved suggestion
+on an independent ordinary occurrence into an explicit product-attestation
+target. Both paths verify the OEM source once without recreating the catalog
+product.
 
 Each avionics card also allows the reviewer to correct the extracted
 manufacturer, model, canonical capabilities, and quantity. A fresh unlinked
@@ -499,6 +503,7 @@ The corresponding API is:
 ```http
 GET /api/review/listings?limit=25&offset=0
 GET /api/review/listings/{listing_id}
+DELETE /api/avionics/{product_id}
 GET /api/review/verification/preflight?limit=100&after_listing_id={listing_id}
 POST /api/review/verification-runs
 GET /api/review/verification-runs/{run_id}

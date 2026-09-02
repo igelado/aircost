@@ -1177,6 +1177,21 @@ label span,
   grid-template-rows: auto minmax(0, 1fr);
 }
 
+.avionics-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.avionics-delete-error {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid #efb4ab;
+  border-radius: 8px;
+  background: var(--danger-soft);
+}
+
 .avionics-detail-body {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2518,6 +2533,66 @@ label span,
   line-height: 1.4;
 }
 
+.review-selected-product.has-inline-attestation {
+  grid-column: 1 / -1;
+}
+
+.review-inline-attestation {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.review-inline-attestation > strong,
+.review-inline-attestation > p {
+  display: block;
+  margin: 0;
+}
+
+.review-inline-attestation > p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.review-inline-attestation form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.review-inline-attestation label > span {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.review-inline-attestation-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.review-inline-attestation-result {
+  flex: 1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+  text-align: right;
+}
+
+.review-inline-attestation-result.error {
+  color: var(--danger);
+  font-weight: 700;
+}
+
 .review-decision-fieldset {
   min-width: 0;
   margin: 0;
@@ -2643,8 +2718,16 @@ label span,
 .review-catalog-result.not-reusable:hover {
   border-color: rgba(177, 77, 48, 0.28);
   background: #fff7f2;
-  cursor: not-allowed;
   opacity: 0.78;
+}
+
+.review-catalog-result.not-reusable:not(:disabled) {
+  cursor: pointer;
+  opacity: 1;
+}
+
+.review-catalog-result.not-reusable:disabled {
+  cursor: not-allowed;
 }
 
 .review-catalog-result strong,
@@ -3040,7 +3123,18 @@ label span,
     width: 100%;
   }
 
-  .review-aspect-save-result {
+  .review-inline-attestation-actions {
+    align-items: stretch;
+    flex-direction: column;
+    grid-column: 1;
+  }
+
+  .review-inline-attestation-actions .button {
+    width: 100%;
+  }
+
+  .review-aspect-save-result,
+  .review-inline-attestation-result {
     text-align: left;
   }
 
@@ -3059,7 +3153,8 @@ label span,
   }
 
   .review-aspect-context,
-  .review-action-panel {
+  .review-action-panel,
+  .review-inline-attestation form {
     grid-template-columns: 1fr;
   }
 

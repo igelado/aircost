@@ -301,6 +301,13 @@ pub(crate) struct PendingProductAttestationCommitGuard {
     pub listing_id: i64,
     pub review_payload_sha256: String,
     pub aspect_id: Value,
+    pub authorization: PendingProductAttestationAuthorization,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingProductAttestationAuthorization {
+    ExistingTarget,
+    ReviewerSelection,
 }
 
 #[derive(Clone, Debug)]
@@ -1176,21 +1183,41 @@ pub(crate) async fn attest_pending_review_product_identity(
     .await
 }
 
-fn pending_review_payload_contains_attestation_target(
+fn pending_review_payload_authorizes_attestation(
     payload_json: &str,
     aspect_id: &Value,
     product_id: i64,
+    authorization: PendingProductAttestationAuthorization,
 ) -> bool {
     serde_json::from_str::<Value>(payload_json)
         .ok()
         .and_then(|payload| payload.get("aspects").and_then(Value::as_array).cloned())
         .is_some_and(|aspects| {
             aspects.iter().any(|aspect| {
-                aspect.get("id") == Some(aspect_id)
-                    && aspect
-                        .get("reuse_attestation_target_id")
-                        .and_then(Value::as_i64)
-                        == Some(product_id)
+                if aspect.get("id") != Some(aspect_id) {
+                    return false;
+                }
+                match authorization {
+                    PendingProductAttestationAuthorization::ExistingTarget => {
+                        aspect
+                            .get("reuse_attestation_target_id")
+                            .and_then(Value::as_i64)
+                            == Some(product_id)
+                    }
+                    PendingProductAttestationAuthorization::ReviewerSelection => {
+                        aspect
+                            .get("reuse_attestation_target_id")
+                            .is_none_or(Value::is_null)
+                            && aspect
+                                .get("allowed_actions")
+                                .and_then(Value::as_array)
+                                .is_some_and(|actions| {
+                                    actions.iter().any(|action| {
+                                        action.as_str() == Some("use_verified_product")
+                                    })
+                                })
+                    }
+                }
             })
         })
 }
@@ -1294,14 +1321,15 @@ async fn attest_grounded_existing_avionics_identity_with_guard(
                         .fetch_optional(&mut *transaction)
                         .await?;
                 if !pending_payload.as_deref().is_some_and(|payload| {
-                    pending_review_payload_contains_attestation_target(
+                    pending_review_payload_authorizes_attestation(
                         payload,
                         &guard.aspect_id,
                         grounded.id,
+                        guard.authorization,
                     )
                 }) {
                     return Err(CatalogError::Validation(format!(
-                        "the reviewer no longer owns the hash-bound pending association for catalog id {}; reload the product review queue",
+                        "the reviewer no longer owns the hash-bound pending review authorization for catalog id {}; reload the listing review",
                         grounded.id
                     )));
                 }
@@ -1596,6 +1624,8 @@ fn deterministic_graph_approved_identity_from_source(
             &target.manufacturer_identifier,
             &product_key,
         )
+        && !(target.manufacturer_identifier_kind == "manufacturer_model_number"
+            && identifier_key == product_key)
     {
         return Err(format!(
             "catalog id {target_id} is a prefix of another manufacturer product and lacks a distinct OEM part number or SKU proof"
@@ -7242,7 +7272,8 @@ mod tests {
         load_known_approved_candidates, load_review_catalog_candidates,
         manufacturer_collision_snapshot_sha256, manufacturer_scoped_catalog_candidates,
         model_identity_relation_score, nonpositive_identity_outcome,
-        opportunistic_authoritative_direct_source_plan, persist_approved_capability_enrichment,
+        opportunistic_authoritative_direct_source_plan,
+        pending_review_payload_authorizes_attestation, persist_approved_capability_enrichment,
         persist_approved_identity, plan_avionics_identity_verification_route,
         proposal_attestation_with_direct_source_proofs,
         require_response_evidence_source_urls_not_revoked, resolution_issues,
@@ -7263,9 +7294,10 @@ mod tests {
         DirectSourceRequirement, GeminiGroundingSource, GeminiGroundingSupport,
         GroundedJsonResponse, IdentityGroundingPlan, IdentityPersistenceMode,
         IdentityResolutionExecution, KnownApprovedAvionicsCandidate,
-        PendingProductAttestationCommitGuard, ReviewCatalogCandidate,
-        ReviewPreflightAvionicsIdentityOutcome, VerifiedIdentity, VerifiedLocalReuseProof,
-        COLLISION_CANDIDATE_LIMIT, COLLISION_STRUCTURE_CALL_BUDGET, KNOWN_APPROVED_SELECT_SQL,
+        PendingProductAttestationAuthorization, PendingProductAttestationCommitGuard,
+        ReviewCatalogCandidate, ReviewPreflightAvionicsIdentityOutcome, VerifiedIdentity,
+        VerifiedLocalReuseProof, COLLISION_CANDIDATE_LIMIT, COLLISION_STRUCTURE_CALL_BUDGET,
+        KNOWN_APPROVED_SELECT_SQL,
     };
     use crate::avionics::manufacturer::{
         ensure_manufacturer_identity, ManufacturerIdentityEvidence,
@@ -8100,6 +8132,50 @@ mod tests {
         .expect_err("a G1000 NXi row cannot attest the shorter G1000 target");
 
         assert!(error.contains("longer manufacturer-scoped prefix-neighbor"));
+    }
+
+    #[test]
+    fn deterministic_oem_proof_accepts_exact_base_model_number_without_neighbor_in_row() {
+        let (mut request, mut target, mut neighbor, admission, mut fetched) =
+            deterministic_gtx33_fixture();
+        target.model = "G1000".to_string();
+        target.canonical_product_key = normalize_avionics_identifier(&target.model);
+        target.manufacturer_identifier_kind = "manufacturer_model_number".to_string();
+        target.manufacturer_identifier = target.model.clone();
+        target.canonical_identifier_key = target.canonical_product_key.clone();
+        neighbor.model = "G1000 NXi".to_string();
+        neighbor.canonical_product_key = normalize_avionics_identifier(&neighbor.model);
+        neighbor.manufacturer_identifier_kind = "manufacturer_model_number".to_string();
+        neighbor.manufacturer_identifier = neighbor.model.clone();
+        neighbor.canonical_identifier_key = neighbor.canonical_product_key.clone();
+        request.model = target.model.clone();
+        request.manufacturer_identifier_kind = target.manufacturer_identifier_kind.clone();
+        request.manufacturer_identifier = target.manufacturer_identifier.clone();
+        fetched.publisher_text =
+            "Garmin G1000 Integrated Flight Deck Cockpit Reference Guide".to_string();
+        fetched.source_text_rows = vec![TextRow {
+            kind: TextRowKind::PdfVisualRow,
+            ordinal: 0,
+            text: fetched.publisher_text.clone(),
+        }];
+        let catalog = vec![
+            deterministic_review_candidate(&target),
+            deterministic_review_candidate(&neighbor),
+        ];
+
+        let approved = deterministic_graph_approved_identity_from_source(
+            &request,
+            target.id,
+            "Garmin G1000 product reference",
+            &fetched,
+            &admission,
+            std::slice::from_ref(&target),
+            &catalog,
+        )
+        .expect("an exact OEM base-model row must not require a separate part number");
+
+        assert_eq!(approved.id, target.id);
+        assert_eq!(approved.manufacturer_identifier, "G1000");
     }
 
     #[test]
@@ -13308,6 +13384,7 @@ mod tests {
     async fn pending_product_guard(
         db: &AppDb,
         product_id: i64,
+        authorization: PendingProductAttestationAuthorization,
     ) -> PendingProductAttestationCommitGuard {
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!("test uses SQLite")
@@ -13338,13 +13415,21 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        let payload = json!({
-            "version": 1,
-            "aspects": [{
+        let aspect = match authorization {
+            PendingProductAttestationAuthorization::ExistingTarget => json!({
                 "id": "guarded-product",
                 "reuse_attestation_target_id": product_id
-            }]
-        });
+            }),
+            PendingProductAttestationAuthorization::ReviewerSelection => json!({
+                "id": "guarded-product",
+                "allowed_actions": [
+                    "use_verified_product",
+                    "create_verified_product",
+                    "discard"
+                ]
+            }),
+        };
+        let payload = json!({"version": 1, "aspects": [aspect]});
         let payload_json = serde_json::to_string(&payload).unwrap();
         let payload_sha256 = format!("{:x}", Sha256::digest(payload_json.as_bytes()));
         sqlx::query(
@@ -13368,7 +13453,36 @@ mod tests {
             listing_id,
             review_payload_sha256: payload_sha256,
             aspect_id: json!("guarded-product"),
+            authorization,
         }
+    }
+
+    #[test]
+    fn pending_product_attestation_commit_guard_supports_explicit_reviewer_selection() {
+        let payload = json!({
+            "version": 1,
+            "aspects": [{
+                "id": "avionics:0:primary",
+                "allowed_actions": [
+                    "use_verified_product",
+                    "create_verified_product",
+                    "discard"
+                ]
+            }]
+        });
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        assert!(pending_review_payload_authorizes_attestation(
+            &payload_json,
+            &json!("avionics:0:primary"),
+            703,
+            PendingProductAttestationAuthorization::ReviewerSelection,
+        ));
+        assert!(!pending_review_payload_authorizes_attestation(
+            &payload_json,
+            &json!("avionics:0:primary"),
+            703,
+            PendingProductAttestationAuthorization::ExistingTarget,
+        ));
     }
 
     async fn guarded_source_verification(
@@ -13391,6 +13505,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_product_attestation_commits_for_reviewer_selected_product() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        seed_garmin_static_source_authority(&db).await;
+        let approved = persist_approved_identity(
+            &db,
+            None,
+            &[],
+            &verified_identity(),
+            &catalog_fingerprint(&[]),
+        )
+        .await
+        .unwrap();
+        let guard = pending_product_guard(
+            &db,
+            approved.id,
+            PendingProductAttestationAuthorization::ReviewerSelection,
+        )
+        .await;
+        let verification = guarded_source_verification(&db, approved.clone()).await;
+
+        assert!(
+            attest_pending_review_product_identity(&db, &verification, &guard)
+                .await
+                .expect("reviewer-selected product attestation should commit")
+        );
+    }
+
+    #[tokio::test]
     async fn pending_product_attestation_rejects_association_removed_after_source_fetch() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         seed_garmin_static_source_authority(&db).await;
@@ -13403,7 +13545,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let guard = pending_product_guard(&db, approved.id).await;
+        let guard = pending_product_guard(
+            &db,
+            approved.id,
+            PendingProductAttestationAuthorization::ExistingTarget,
+        )
+        .await;
         let verification = guarded_source_verification(&db, approved.clone()).await;
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!("test uses SQLite")
@@ -13433,7 +13580,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let guard = pending_product_guard(&db, approved.id).await;
+        let guard = pending_product_guard(
+            &db,
+            approved.id,
+            PendingProductAttestationAuthorization::ExistingTarget,
+        )
+        .await;
         let verification = guarded_source_verification(&db, approved.clone()).await;
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!("test uses SQLite")

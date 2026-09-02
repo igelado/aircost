@@ -401,7 +401,7 @@ END;
 const REFERENCE_CATALOG_CUTOVER_MIGRATION: &str = "20260819_reference_catalog_cutover";
 const REFERENCE_CATALOG_CUTOVER_CONTRACT_VERSION: i64 = 1;
 const REFERENCE_CATALOG_CUTOVER_CONTRACT_FINGERPRINT: &str =
-    "85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522";
+    "45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819";
 const REFERENCE_CATALOG_CUTOVER_SQLITE_MIGRATION_SQL: &str =
     include_str!("../migrations/20260819_reference_catalog_cutover.sqlite.sql");
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL: &str =
@@ -539,6 +539,8 @@ const REFERENCE_CATALOG_CUTOVER_ROUTINES: &[&str] = &[
     "aircraft_serial_natural_sort_key",
     "validate_aircraft_serial_scheme_ordering",
     "prevent_referenced_avionics_catalog_downgrade",
+    "preserve_avionics_approved_product_identity",
+    "guard_approved_avionics_model_delete",
     "validate_aircraft_valuation_compatibility_projection",
     "require_aircraft_catalog_approval",
     "validate_aircraft_reference_version_insert",
@@ -571,6 +573,7 @@ const REFERENCE_CATALOG_CUTOVER_SQLITE_TRIGGERS: &[&str] = &[
 const REFERENCE_CATALOG_CUTOVER_PROTECTED_RELATIONS: &[&str] = &[
     "plugin_submissions",
     "avionics_models",
+    "avionics_catalog_product_deletion_guards",
     "aircraft_engine_catalog_models",
     "aircraft_propeller_catalog_models",
     "aircraft_makes",
@@ -616,9 +619,9 @@ const REFERENCE_CATALOG_CUTOVER_RETIRED_ROUTINES: &[&str] = &[
     "move_admitted_default_avionics_candidate",
     "prevent_projected_aircraft_evidence_variant_move",
 ];
-const REFERENCE_CATALOG_CUTOVER_SQLITE_OBJECT_COUNT: i64 = 213;
+const REFERENCE_CATALOG_CUTOVER_SQLITE_OBJECT_COUNT: i64 = 215;
 const REFERENCE_CATALOG_CUTOVER_SQLITE_DEFINITION_DIGEST: &str =
-    "e719b1ac8845b11a21cc24b4fa36e0fd66e4e1fc2dfaa49cc25fab05a1aa4115";
+    "0b0c2e65ef87d0fd7a7762948cd09dcef32707687ea55921c30fcaea62f9a3ba";
 const REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES: &[&str] = &[
     "aircraft_reference_fact_set_attestations:sqlite_autoindex_aircraft_reference_fact_set_attestations_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:fact_set_kind:0:BINARY:1,2:-1::0:BINARY:0",
     "aircraft_reference_prices:sqlite_autoindex_aircraft_reference_prices_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:price_kind:0:BINARY:1,2:4:currency:0:BINARY:1,3:-1::0:BINARY:0",
@@ -630,9 +633,9 @@ const REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES: &[&str] = &[
     "official_dollar_normalization_facts:sqlite_autoindex_official_dollar_normalization_facts_1:1:u:0:0:7:evidence_claim_id:0:BINARY:1,1:-1::0:BINARY:0",
     "official_dollar_normalization_facts:sqlite_autoindex_official_dollar_normalization_facts_2:1:u:0:0:1:source_year:0:BINARY:1,1:2:target_year:0:BINARY:1,2:-1::0:BINARY:0",
 ];
-const REFERENCE_CATALOG_CUTOVER_POSTGRES_OBJECT_COUNT: i64 = 792;
+const REFERENCE_CATALOG_CUTOVER_POSTGRES_OBJECT_COUNT: i64 = 804;
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_DEFINITION_DIGEST: &str =
-    "9fccaee88521d99c9b4cdffdb8af610e";
+    "ba236136f4f31173a4a5d71c8d8a5be5";
 const SQLITE_SERIAL_SCHEME_INSERT_TRIGGER: &str = r#"
 CREATE TRIGGER aircraft_serial_schemes_require_approval
 BEFORE INSERT ON aircraft_serial_number_schemes
@@ -1824,6 +1827,7 @@ impl AppDb {
                         ('table', 'avionics_manufacturer_identity_merges', NULL),
                         ('table', 'avionics_approved_product_identities', NULL),
                         ('table', 'avionics_catalog_consolidation_guard', NULL),
+                        ('table', 'avionics_catalog_product_deletion_guards', NULL),
                         ('table', 'avionics_manufacturer_canonical_key_delete_context', NULL),
                         ('view', 'avionics_catalog_authorized_consolidations', NULL),
                         ('view', 'avionics_approved_product_graph_identities', NULL),
@@ -1983,6 +1987,7 @@ impl AppDb {
                         ('avionics_manufacturer_identity_merges', 'r'),
                         ('avionics_approved_product_identities', 'r'),
                         ('avionics_catalog_consolidation_guard', 'r'),
+                        ('avionics_catalog_product_deletion_guards', 'r'),
                         ('avionics_catalog_authorized_consolidations', 'v'),
                         ('avionics_approved_product_graph_identities', 'v'),
                         ('avionics_manufacturer_effective_identities', 'v'),
@@ -8222,6 +8227,7 @@ impl AppDb {
                   VALUES
                     ('plugin_submissions'),
                     ('avionics_models'),
+                    ('avionics_catalog_product_deletion_guards'),
                     ('aircraft_engine_catalog_models'),
                     ('aircraft_propeller_catalog_models'),
                     ('aircraft_makes'),
@@ -8264,6 +8270,9 @@ impl AppDb {
                   SELECT name FROM protected_relations
                   UNION ALL SELECT name FROM retired_relations
                 ),
+                owned_trigger_names(name) AS (
+                  VALUES ('avionics_approved_identity_preserve_delete')
+                ),
                 objects(object_key, definition) AS (
                   SELECT
                     schema_row.type || ':' || schema_row.name,
@@ -8282,7 +8291,10 @@ impl AppDb {
                     AND schema_row.name = 'aircraft_reference_serial_key_errors'
                   ) OR (
                     schema_row.type = 'trigger'
-                    AND schema_row.tbl_name IN (SELECT name FROM owned_relations)
+                    AND (
+                      schema_row.tbl_name IN (SELECT name FROM owned_relations)
+                      OR schema_row.name IN (SELECT name FROM owned_trigger_names)
+                    )
                     AND schema_row.name NOT IN (
                       'avionics_models_approved_concrete_model_insert',
                       'avionics_models_approved_concrete_model_update',

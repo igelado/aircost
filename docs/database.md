@@ -607,9 +607,18 @@ removes unreferenced lookup rows:
 
 Avionics catalog candidates, raw manufacturer spellings, and capability rows
 are deliberately excluded from generic orphan cleanup. Pending-review payloads
-can cite them without a foreign key, so only an explicit global catalog audit
-may delete them after proving that no relational role or review bundle refers
-to them.
+can cite them without a foreign key, so they are removed only through the
+explicit reviewer-only `DELETE /api/avionics/{id}` workflow. That operation
+locks the product, its listing links, and affected review bundles; converts
+every exact capture-bound occurrence of the product into a discarded terminal
+disposition; removes those occurrences from pending review; and then deletes
+the catalog row. Exact model matching for this explicit deletion includes only
+typography-equivalent retained occurrences under the same or an unspecified
+manufacturer. It never uses fuzzy similarity. Immutable plugin source captures
+remain unchanged, while the discard dispositions prevent review rebuild or
+replay from recreating the removed standalone product. Reference-configuration
+or active consolidation dependencies block deletion rather than being removed
+implicitly.
 
 The admin command is:
 
@@ -1917,15 +1926,15 @@ WHERE type = 'table'
 ```
 
 The contract must be version `1` with fingerprint
-`85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522`.
+`45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819`.
 The fingerprint is the SHA-256 of this newline-terminated manifest:
 
 ```text
 20260819_reference_catalog_cutover:v1
-sqlite-old:238:520dd12118080bb4525f8ef9ce8fdeb3b4d4241c063ee5fc6f0c294fa1d04ecd
-sqlite-post:213:581bc9491e66de7fcb0c81d6d0fd0c26abbed74dac4c56de6d133643dd4b4b54
-postgres-old:924:f4aad204c04ccc9cfb23743ae1c23edd
-postgres-post:792:a12dfb4a0ff4f026bee8b16c1c26ac0a
+sqlite-old:239:2e4f2cb9ab443550681d24447d23395bb52c0c51b6b87ca02556c630c0c2313c
+sqlite-post:215:0b0c2e65ef87d0fd7a7762948cd09dcef32707687ea55921c30fcaea62f9a3ba
+postgres-old:927:59b835f2713977662774deea8dc53e4a
+postgres-post:804:ba236136f4f31173a4a5d71c8d8a5be5
 ```
 
 Its `installed_at` value records the first successful installation and remains

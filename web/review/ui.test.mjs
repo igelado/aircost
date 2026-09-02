@@ -5,6 +5,7 @@ import test from "node:test";
 const indexHtml = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 const appCss = readFileSync(new URL("../app.css", import.meta.url), "utf8");
 const appJs = readFileSync(new URL("../app.js", import.meta.url), "utf8");
+const avionicsJs = readFileSync(new URL("../avionics.js", import.meta.url), "utf8");
 const reviewJs = readFileSync(new URL("../review.js", import.meta.url), "utf8");
 
 test("uses a compact multi-capability dropdown in listing avionics rows", () => {
@@ -136,12 +137,40 @@ test("routes aspect-scoped whole-review failures back to the affected card", () 
   assert.match(reviewJs, /showAspectResolutionError\(error\)/);
 });
 
-test("prevents selecting an explicitly non-reusable approved catalog product", () => {
+test("selects a non-reusable approved product only for inline source verification", () => {
   assert.match(reviewJs, /value\.catalog\?\.reuse_eligible \?\? value\.reuse_eligible/);
   assert.match(reviewJs, /product\.reuseEligible === false/);
   assert.match(reviewJs, /Reusable source verification required/);
-  assert.match(reviewJs, /Known avionics products before selection/);
+  assert.match(reviewJs, /allowUnattested: typeof onSelect !== "function"/);
+  assert.match(reviewJs, /can be selected for inline verification/);
   assert.match(appCss, /\.review-catalog-result\.not-reusable/);
+});
+
+test("attests a selected catalog product inline without rebuilding listing forms", () => {
+  assert.match(reviewJs, /function inlineProductAttestationControls\(key, product\)/);
+  assert.match(
+    reviewJs,
+    /\/api\/review\/avionics\/products\/\$\{productId\}\/attest/,
+  );
+  assert.match(reviewJs, /identity_source_url: attestation\.sourceUrl/);
+  assert.match(reviewJs, /const responseReview = result\?\.review/);
+  assert.match(reviewJs, /api\(`\/api\/review\/listings\/\$\{review\.listing_id\}`\)/);
+  assert.match(
+    reviewJs,
+    /responseReview === null \|\| responseReview === undefined[\s\S]*?Promise\.resolve\(\{ review: responseReview \}\)/,
+  );
+  assert.match(
+    reviewJs,
+    /state\.currentReview\.catalog_revision_sha256 = refreshedReview\.catalog_revision_sha256/,
+  );
+  assert.match(reviewJs, /renderSelectedCatalogProduct\(selected, draft\.catalogProduct, key\)/);
+  const handler = reviewJs.match(
+    /async function attestInlineCatalogProduct\(event, key\) \{[\s\S]*?\n\}\n\nasync function loadSelectedProductEvidence/,
+  )?.[0] ?? "";
+  assert.notEqual(handler, "");
+  assert.doesNotMatch(handler, /renderReview\(/);
+  assert.doesNotMatch(handler, /initializeDrafts\(|state\.drafts\.clear\(/);
+  assert.match(appCss, /\.review-inline-attestation/);
 });
 
 test("brings the product review workspace into view from a queue row action", () => {
@@ -156,4 +185,22 @@ test("brings the product review workspace into view from a queue row action", ()
   assert.match(openProductReview, /focus\(\{ preventScroll: true \}\)/);
   assert.match(openProductReview, /scrollIntoView\(\{/);
   assert.match(openProductReview, /behavior: "smooth"/);
+});
+
+test("offers a guarded destructive avionics product action and refreshes its consumers", () => {
+  assert.match(
+    indexHtml,
+    /id="delete-avionics-product"[^>]*>Delete product<\/button>/,
+  );
+  assert.match(avionicsJs, /Delete product \"\$\{productName\}\"\?/);
+  assert.match(avionicsJs, /every direct and pending listing occurrence/);
+  assert.match(avionicsJs, /Additional pending review occurrences may also be removed/);
+  assert.match(
+    avionicsJs,
+    /api\(`\/api\/avionics\/\$\{productId\}`[^]*method: "DELETE"/,
+  );
+  assert.match(avionicsJs, /affectedListingCount/);
+  assert.match(avionicsJs, /refreshListings\(\)/);
+  assert.match(avionicsJs, /refreshReview\(\)/);
+  assert.match(avionicsJs, /Could not delete \$\{productName\}: \$\{error\.message\}/);
 });

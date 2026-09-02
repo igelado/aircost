@@ -15,6 +15,7 @@ core_relations(name) AS (
   VALUES
     ('plugin_submissions'),
     ('avionics_models'),
+    ('avionics_catalog_product_deletion_guards'),
     ('aircraft_engine_catalog_models'),
     ('aircraft_propeller_catalog_models'),
     ('aircraft_makes'),
@@ -60,7 +61,8 @@ owned_relations(name) AS (
 owned_trigger_names(name) AS (
   VALUES
     ('avionics_models_referenced_status_update'),
-    ('aircraft_valuation_projection_validate_insert')
+    ('aircraft_valuation_projection_validate_insert'),
+    ('avionics_approved_identity_preserve_delete')
 )
 SELECT
   schema_row.type || ':' || schema_row.name,
@@ -85,7 +87,10 @@ WHERE (
   )
   AND schema_row.name NOT IN (
     'avionics_models_approved_concrete_model_insert',
-    'avionics_models_approved_concrete_model_update'
+    'avionics_models_approved_concrete_model_update',
+    'plugin_submissions_active_replay_membership_frozen_delete',
+    'plugin_submissions_active_replay_membership_frozen_insert',
+    'plugin_submissions_active_replay_membership_frozen_update'
   )
 )
 UNION ALL
@@ -120,7 +125,7 @@ SELECT CASE
       AND (
         contract_version IS NOT 1
         OR contract_fingerprint IS NOT
-          '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522'
+          '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819'
       )
   ) THEN 0
   WHEN EXISTS (
@@ -128,26 +133,26 @@ SELECT CASE
     WHERE migration_name = '20260819_reference_catalog_cutover'
   ) AND (
     (SELECT count(*) FROM reference_catalog_cutover_owned_objects) <>
-      213
+      215
     OR (SELECT lower(hex(sha3(group_concat(
           object_key || '=' || definition, '|'
         ), 256))) FROM (
           SELECT object_key, definition
           FROM reference_catalog_cutover_owned_objects ORDER BY object_key
-        )) <> '581bc9491e66de7fcb0c81d6d0fd0c26abbed74dac4c56de6d133643dd4b4b54'
+        )) <> '0b0c2e65ef87d0fd7a7762948cd09dcef32707687ea55921c30fcaea62f9a3ba'
   ) THEN 0
   WHEN NOT EXISTS (
     SELECT 1 FROM schema_migration_contracts
     WHERE migration_name = '20260819_reference_catalog_cutover'
   ) AND (
     (SELECT count(*) FROM reference_catalog_cutover_owned_objects) <>
-      238
+      239
     OR (SELECT lower(hex(sha3(group_concat(
           object_key || '=' || definition, '|'
         ), 256))) FROM (
           SELECT object_key, definition
           FROM reference_catalog_cutover_owned_objects ORDER BY object_key
-        )) <> '520dd12118080bb4525f8ef9ce8fdeb3b4d4241c063ee5fc6f0c294fa1d04ecd'
+        )) <> '2e4f2cb9ab443550681d24447d23395bb52c0c51b6b87ca02556c630c0c2313c'
     OR EXISTS (
       SELECT 1 FROM listing_verification_run_items
       WHERE status = 'pending_reference'
@@ -162,6 +167,59 @@ SELECT CASE
 END;
 DROP TABLE reference_catalog_cutover_preflight;
 DROP TABLE reference_catalog_cutover_owned_objects;
+
+CREATE TABLE IF NOT EXISTS avionics_catalog_product_deletion_guards (
+  avionics_model_id INTEGER PRIMARY KEY
+    REFERENCES avionics_models(id) ON DELETE CASCADE
+    CHECK (avionics_model_id > 0),
+  requested_by_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TRIGGER avionics_approved_identity_preserve_delete;
+CREATE TRIGGER avionics_approved_identity_preserve_delete
+BEFORE DELETE ON avionics_approved_product_identities
+WHEN EXISTS (
+  SELECT 1 FROM avionics_models model
+  WHERE model.id = OLD.avionics_model_id AND model.catalog_status = 'approved'
+)
+AND NOT EXISTS (
+  SELECT 1
+  FROM avionics_catalog_authorized_consolidations authorization
+  JOIN avionics_models survivor
+    ON survivor.id = authorization.survivor_model_id
+  WHERE authorization.duplicate_model_id = OLD.avionics_model_id
+    AND survivor.catalog_status = 'approved'
+)
+AND NOT EXISTS (
+  SELECT 1
+  FROM avionics_catalog_product_deletion_guards deletion_guard
+  WHERE deletion_guard.avionics_model_id = OLD.avionics_model_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'approved avionics product must retain its canonical identity');
+END;
+
+DROP TRIGGER avionics_models_approved_delete_guard;
+CREATE TRIGGER avionics_models_approved_delete_guard
+BEFORE DELETE ON avionics_models
+WHEN OLD.catalog_status = 'approved'
+AND NOT EXISTS (
+  SELECT 1
+  FROM avionics_catalog_authorized_consolidations authorization
+  JOIN avionics_models survivor
+    ON survivor.id = authorization.survivor_model_id
+  WHERE authorization.duplicate_model_id = OLD.id
+    AND survivor.catalog_status = 'approved'
+)
+AND NOT EXISTS (
+  SELECT 1
+  FROM avionics_catalog_product_deletion_guards deletion_guard
+  WHERE deletion_guard.avionics_model_id = OLD.id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'approved avionics product deletion requires exact consolidation or explicit deletion authorization');
+END;
 
 -- Reference readiness is independent from listing verification. Rewrite the
 -- obsolete terminal run-item outcome before tightening the durable queue
@@ -955,6 +1013,7 @@ core_relations(name) AS (
   VALUES
     ('plugin_submissions'),
     ('avionics_models'),
+    ('avionics_catalog_product_deletion_guards'),
     ('aircraft_engine_catalog_models'),
     ('aircraft_propeller_catalog_models'),
     ('aircraft_makes'),
@@ -1000,7 +1059,8 @@ owned_relations(name) AS (
 owned_trigger_names(name) AS (
   VALUES
     ('avionics_models_referenced_status_update'),
-    ('aircraft_valuation_projection_validate_insert')
+    ('aircraft_valuation_projection_validate_insert'),
+    ('avionics_approved_identity_preserve_delete')
 )
 SELECT
   schema_row.type || ':' || schema_row.name,
@@ -1025,7 +1085,10 @@ WHERE (
   )
   AND schema_row.name NOT IN (
     'avionics_models_approved_concrete_model_insert',
-    'avionics_models_approved_concrete_model_update'
+    'avionics_models_approved_concrete_model_update',
+    'plugin_submissions_active_replay_membership_frozen_delete',
+    'plugin_submissions_active_replay_membership_frozen_insert',
+    'plugin_submissions_active_replay_membership_frozen_update'
   )
 )
 UNION ALL
@@ -1055,13 +1118,13 @@ CREATE TEMP TABLE reference_catalog_cutover_postflight (
 INSERT INTO reference_catalog_cutover_postflight (valid)
 SELECT CASE WHEN
   (SELECT count(*) FROM reference_catalog_cutover_post_objects) <>
-    213
+    215
   OR (SELECT lower(hex(sha3(group_concat(
         object_key || '=' || definition, '|'
       ), 256))) FROM (
         SELECT object_key, definition
         FROM reference_catalog_cutover_post_objects ORDER BY object_key
-      )) <> '581bc9491e66de7fcb0c81d6d0fd0c26abbed74dac4c56de6d133643dd4b4b54'
+      )) <> '0b0c2e65ef87d0fd7a7762948cd09dcef32707687ea55921c30fcaea62f9a3ba'
   OR EXISTS (
     SELECT 1 FROM sqlite_schema
     WHERE name IN (
@@ -1090,7 +1153,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522', CURRENT_TIMESTAMP
+  '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 

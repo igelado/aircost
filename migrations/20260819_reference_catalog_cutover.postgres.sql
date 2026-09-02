@@ -21,7 +21,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 1
         OR contract_fingerprint IS DISTINCT FROM
-          '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522'
+          '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819'
       )
   ) THEN
     RAISE EXCEPTION 'reference catalog cutover contract marker mismatch';
@@ -33,7 +33,7 @@ BEGIN
     WHERE migration_name = '20260819_reference_catalog_cutover'
       AND contract_version = 1
       AND contract_fingerprint =
-        '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522'
+        '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819'
   ) INTO exact_marker;
 
   IF exact_marker THEN
@@ -42,6 +42,8 @@ BEGIN
         ('aircraft_serial_natural_sort_key'),
         ('validate_aircraft_serial_scheme_ordering'),
         ('prevent_referenced_avionics_catalog_downgrade'),
+        ('preserve_avionics_approved_product_identity'),
+        ('guard_approved_avionics_model_delete'),
         ('validate_aircraft_valuation_compatibility_projection'),
         ('require_aircraft_catalog_approval'),
         ('validate_aircraft_reference_version_insert'),
@@ -58,6 +60,7 @@ BEGIN
         ('aircraft_reference_prices'),
         ('aircraft_reference_fact_set_attestations'),
         ('official_dollar_normalization_facts'),
+        ('avionics_catalog_product_deletion_guards'),
         ('listing_verification_run_items')
     ),
     objects(object_key, definition) AS (
@@ -190,9 +193,9 @@ BEGIN
     INTO actual_object_count, actual_definition_digest
     FROM objects;
 
-    IF actual_object_count <> 149
+    IF actual_object_count <> 161
        OR actual_definition_digest <>
-            '49a1d92edd48b2f8b8e8b8a336dd2fa9' THEN
+            '3fa0ba900b6c129030f98955776da593' THEN
       RAISE EXCEPTION
         'reference catalog cutover marker-present owned-object mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
@@ -216,6 +219,8 @@ active_routines(name) AS (
     ('aircraft_serial_natural_sort_key'),
     ('validate_aircraft_serial_scheme_ordering'),
     ('prevent_referenced_avionics_catalog_downgrade'),
+    ('preserve_avionics_approved_product_identity'),
+    ('guard_approved_avionics_model_delete'),
     ('validate_aircraft_valuation_compatibility_projection'),
     ('require_aircraft_catalog_approval'),
     ('validate_aircraft_reference_version_insert'),
@@ -244,6 +249,7 @@ protected_relations(name) AS (
   VALUES
     ('plugin_submissions'),
     ('avionics_models'),
+    ('avionics_catalog_product_deletion_guards'),
     ('aircraft_engine_catalog_models'),
     ('aircraft_propeller_catalog_models'),
     ('aircraft_makes'),
@@ -396,6 +402,11 @@ JOIN pg_catalog.pg_proc routine ON routine.oid = trigger_row.tgfoid
 LEFT JOIN owned_relations expected_relation ON expected_relation.name = relation.relname
 LEFT JOIN owned_routines expected_routine ON expected_routine.name = routine.proname
 WHERE NOT trigger_row.tgisinternal
+  AND trigger_row.tgname NOT IN (
+    'avionics_models_approved_concrete_model',
+    'plugin_submissions_active_replay_membership_frozen',
+    'plugin_submissions_active_replay_membership_frozen_truncate'
+  )
   AND namespace.nspname = 'public'
   AND (expected_relation.name IS NOT NULL OR expected_routine.name IS NOT NULL)
 UNION ALL
@@ -446,8 +457,8 @@ BEGIN
   FROM pg_temp.reference_catalog_cutover_owned_objects();
 
   IF exact_marker AND (
-    actual_object_count <> 792
-    OR actual_definition_digest <> 'a12dfb4a0ff4f026bee8b16c1c26ac0a'
+    actual_object_count <> 804
+    OR actual_definition_digest <> 'ba236136f4f31173a4a5d71c8d8a5be5'
   ) THEN
     RAISE EXCEPTION
       'reference catalog cutover marker-present owned-object mismatch (% objects, digest %)',
@@ -455,8 +466,8 @@ BEGIN
   END IF;
 
   IF NOT exact_marker AND (
-    actual_object_count <> 924
-    OR actual_definition_digest <> 'f4aad204c04ccc9cfb23743ae1c23edd'
+    actual_object_count <> 927
+    OR actual_definition_digest <> '59b835f2713977662774deea8dc53e4a'
   ) THEN
     RAISE EXCEPTION
       'reference catalog cutover marker-absent pre-state mismatch (% objects, digest %)',
@@ -479,6 +490,128 @@ BEGIN
   END IF;
 END
 $reference_catalog_cutover_owned_preflight$;
+
+CREATE TABLE IF NOT EXISTS public.avionics_catalog_product_deletion_guards (
+  avionics_model_id BIGINT PRIMARY KEY
+    REFERENCES public.avionics_models(id) ON DELETE CASCADE
+    CHECK (avionics_model_id > 0),
+  requested_by_user_id BIGINT NOT NULL
+    REFERENCES public.users(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE OR REPLACE FUNCTION public.preserve_avionics_approved_product_identity()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM public.avionics_models model
+    WHERE model.id = OLD.avionics_model_id AND model.catalog_status = 'approved'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM public.avionics_catalog_authorized_consolidations authorized_pair
+    JOIN public.avionics_models survivor
+      ON survivor.id = authorized_pair.survivor_model_id
+    WHERE authorized_pair.duplicate_model_id = OLD.avionics_model_id
+      AND survivor.catalog_status = 'approved'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM public.avionics_catalog_product_deletion_guards deletion_guard
+    WHERE deletion_guard.avionics_model_id = OLD.avionics_model_id
+  ) THEN
+    RAISE EXCEPTION 'approved avionics product must retain its canonical identity';
+  END IF;
+  RETURN OLD;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.guard_approved_avionics_model_delete()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  IF OLD.catalog_status = 'approved'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM public.avionics_catalog_authorized_consolidations authorized_pair
+    JOIN public.avionics_models survivor
+      ON survivor.id = authorized_pair.survivor_model_id
+    WHERE authorized_pair.duplicate_model_id = OLD.id
+      AND survivor.catalog_status = 'approved'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM public.avionics_catalog_product_deletion_guards deletion_guard
+    WHERE deletion_guard.avionics_model_id = OLD.id
+  ) THEN
+    RAISE EXCEPTION 'approved avionics product deletion requires exact consolidation or explicit deletion authorization';
+  END IF;
+  RETURN OLD;
+END;
+$function$;
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_model_proof_update
+ON public.avionics_models;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_model_proof_update
+AFTER UPDATE OF
+  avionics_manufacturer_id, name, normalized_name, catalog_status,
+  manufacturer_identifier_kind, manufacturer_identifier,
+  normalized_manufacturer_identifier, identity_source_url,
+  identity_source_title, identity_evidence_text
+ON public.avionics_models
+FOR EACH ROW
+WHEN (
+  NEW.avionics_manufacturer_id IS DISTINCT FROM OLD.avionics_manufacturer_id
+  OR NEW.name IS DISTINCT FROM OLD.name
+  OR NEW.normalized_name IS DISTINCT FROM OLD.normalized_name
+  OR NEW.catalog_status IS DISTINCT FROM OLD.catalog_status
+  OR NEW.manufacturer_identifier_kind IS DISTINCT FROM OLD.manufacturer_identifier_kind
+  OR NEW.manufacturer_identifier IS DISTINCT FROM OLD.manufacturer_identifier
+  OR NEW.normalized_manufacturer_identifier IS DISTINCT FROM OLD.normalized_manufacturer_identifier
+  OR NEW.identity_source_url IS DISTINCT FROM OLD.identity_source_url
+  OR NEW.identity_source_title IS DISTINCT FROM OLD.identity_source_title
+  OR NEW.identity_evidence_text IS DISTINCT FROM OLD.identity_evidence_text
+)
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_model_proof();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_capture_update
+ON public.plugin_submissions;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_capture_update
+AFTER UPDATE OF
+  user_id,
+  plugin_install_id,
+  source_url,
+  submitted_at,
+  signature_base64,
+  canonical_listing_id,
+  rendered_html,
+  rendered_html_sha256,
+  extracted_listing_json,
+  extraction_error
+ON public.plugin_submissions
+FOR EACH ROW
+WHEN (
+  NEW.user_id IS DISTINCT FROM OLD.user_id
+  OR NEW.plugin_install_id IS DISTINCT FROM OLD.plugin_install_id
+  OR NEW.source_url IS DISTINCT FROM OLD.source_url
+  OR NEW.submitted_at IS DISTINCT FROM OLD.submitted_at
+  OR NEW.signature_base64 IS DISTINCT FROM OLD.signature_base64
+  OR NEW.canonical_listing_id IS DISTINCT FROM OLD.canonical_listing_id
+  OR NEW.rendered_html IS DISTINCT FROM OLD.rendered_html
+  OR NEW.rendered_html_sha256 IS DISTINCT FROM OLD.rendered_html_sha256
+  OR NEW.extracted_listing_json IS DISTINCT FROM OLD.extracted_listing_json
+  OR NEW.extraction_error IS DISTINCT FROM OLD.extraction_error
+)
+EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_capture();
 
 -- The predecessor relied on the database's default collation for serialized
 -- natural-sort keys. Pin the invariant to the bytewise ordering used by the
@@ -1436,8 +1569,8 @@ BEGIN
   INTO actual_object_count, actual_definition_digest
   FROM pg_temp.reference_catalog_cutover_owned_objects();
 
-  IF actual_object_count <> 792
-     OR actual_definition_digest <> 'a12dfb4a0ff4f026bee8b16c1c26ac0a' THEN
+  IF actual_object_count <> 804
+     OR actual_definition_digest <> 'ba236136f4f31173a4a5d71c8d8a5be5' THEN
     RAISE EXCEPTION
       'reference catalog cutover post-state mismatch (% objects, digest %)',
       actual_object_count, actual_definition_digest;
@@ -1482,7 +1615,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522', CURRENT_TIMESTAMP
+  '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 

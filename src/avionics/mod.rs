@@ -1,6 +1,7 @@
 pub(crate) mod authorization;
 pub mod catalog;
 pub mod consolidation;
+pub mod deletion;
 pub(crate) mod fingerprint;
 pub mod inspection;
 pub mod manufacturer;
