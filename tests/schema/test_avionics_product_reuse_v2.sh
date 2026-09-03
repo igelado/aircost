@@ -17,11 +17,12 @@ VALUES ('Garmin', 'garmin');
 INSERT INTO avionics_types (name, normalized_name)
 VALUES ('Navigator', 'navigator');
 INSERT INTO avionics_manufacturer_identities (
-  canonical_name, normalized_identity_key, identity_evidence_kind,
+  canonical_name, normalized_identity_key, verification_method,
+  identity_evidence_kind,
   identity_source_url, identity_source_title, identity_evidence_text,
   identity_confidence
 ) VALUES (
-  'Garmin', 'garmin', 'authoritative_reference',
+  'Garmin', 'garmin', 'automated', 'authoritative_reference',
   'https://www.garmin.com/en-US/p/reuse-v2-fixture',
   'Garmin reuse-v2 fixture',
   'Garmin identifies this manufacturer.',
@@ -29,11 +30,12 @@ INSERT INTO avionics_manufacturer_identities (
 );
 INSERT INTO avionics_manufacturer_identity_memberships (
   avionics_manufacturer_id, avionics_manufacturer_identity_id,
-  membership_basis, normalized_name_key, evidence_source_url,
+  membership_basis, normalized_name_key, verification_method,
+  evidence_source_url,
   evidence_source_title, evidence_text, evidence_confidence
 )
 SELECT manufacturer.id, identity.id, 'authoritative_primary',
-       'garmin', identity.identity_source_url,
+       'garmin', 'automated', identity.identity_source_url,
        identity.identity_source_title,
        identity.identity_evidence_text, 'very_high'
 FROM avionics_manufacturers manufacturer,
@@ -60,7 +62,7 @@ FROM avionics_models model, avionics_types capability
 WHERE model.normalized_name = 'testnav 100'
   AND capability.normalized_name = 'navigator';
 UPDATE avionics_models
-SET catalog_status = 'approved'
+SET catalog_status = 'approved', verification_method = 'automated'
 WHERE normalized_name = 'testnav 100';
 
 INSERT INTO aircraft_sale_listings (
