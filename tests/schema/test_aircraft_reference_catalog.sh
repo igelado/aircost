@@ -148,7 +148,7 @@ sqlite3 -bail "$marker_null_predecessor_database" \
      migration_name, contract_version, contract_fingerprint, installed_at
    ) VALUES (
      '20260819_reference_catalog_cutover', 1,
-     '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819',
+     '63cae87c0bc5081f0018855535d9a9c7ac9e457f7e8972f6d29ccabdb790b1a7',
      '2000-01-01 00:00:00'
    );"
 for null_case in version fingerprint both

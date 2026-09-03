@@ -859,7 +859,7 @@ async fn listing_avionics_estimates(
           ON model.id = link.avionics_model_id
         WHERE link.aircraft_sale_listing_id = ?
           AND link.source IN (
-            'listing', 'listing_explicit_count', 'listing_review'
+            'listing', 'listing_explicit_count', 'listing_review', 'human_review'
           )
           AND model.catalog_status = 'approved'
           AND (
@@ -1421,11 +1421,13 @@ mod tests {
             ensure_test_manufacturer_identity(db, manufacturer_id)
                 .await
                 .unwrap();
-            sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
-                .bind(model_id)
-                .execute(pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated', verified_by_user_id = NULL WHERE id = ?",
+            )
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
         }
         model_id
     }
@@ -1889,7 +1891,9 @@ mod tests {
         ensure_test_manufacturer_identity(&db, manufacturer_id)
             .await
             .unwrap();
-        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+        sqlx::query(
+            "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated', verified_by_user_id = NULL WHERE id = ?",
+        )
             .bind(model_id)
             .execute(pool)
             .await

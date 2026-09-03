@@ -125,7 +125,7 @@ const AUTOMATIC_LISTING_LINKS_SQL: &str = r#"
     LEFT JOIN avionics_models replacement_model
       ON replacement_model.id = link.replaces_avionics_model_id
     WHERE listing.id = ?
-      AND link.source IN ('listing', 'listing_explicit_count')
+      AND link.source IN ('listing', 'listing_explicit_count', 'listing_review')
     ORDER BY link.id
 "#;
 
@@ -507,9 +507,18 @@ pub(crate) async fn listing_authorization_state(
 mod tests {
     use std::collections::HashSet;
 
+    use crate::avionics::manufacturer::{
+        ensure_manufacturer_identity, ManufacturerIdentityEvidence,
+    };
+    use crate::db::{AppDb, DatabaseBackend};
+    use crate::normalize::{
+        normalize_avionics_identifier, normalize_avionics_manufacturer_name,
+        normalize_avionics_model_name, normalize_name,
+    };
+
     use super::{
-        exact_checkpoint_is_current, sha256_hex, AssociationAuthorizationRow,
-        ListingAuthorizationState,
+        exact_checkpoint_is_current, listing_authorization_state, sha256_hex,
+        AssociationAuthorizationRow, ListingAuthorizationState,
     };
 
     const EVIDENCE: &str = "Garmin G5 installed";
@@ -609,5 +618,155 @@ mod tests {
         assert!(state.automatic_link_is_current(1));
         assert!(!state.automatic_link_is_current(2));
         assert!(ListingAuthorizationState::default().all_automatic_associations_current());
+    }
+
+    #[tokio::test]
+    async fn listing_review_requires_machine_authorization_but_human_review_is_row_free() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test database is SQLite")
+        };
+        let owner_id: i64 = sqlx::query_scalar("SELECT id FROM users ORDER BY id LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let variant_id: i64 = sqlx::query_scalar(
+            "SELECT aircraft_model_variant_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let listing_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            ) VALUES (?, ?, 'https://broker.example/review-source', 2020, 100000, 1000)
+            RETURNING id
+            "#,
+        )
+        .bind(variant_id)
+        .bind(owner_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let manufacturer_key = normalize_avionics_manufacturer_name("Garmin");
+        let manufacturer_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Garmin', ?) RETURNING id",
+        )
+        .bind(manufacturer_key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        ensure_manufacturer_identity(
+            &db,
+            manufacturer_id,
+            &ManufacturerIdentityEvidence {
+                source_url: "https://www.garmin.com/en-US/aviation/".to_string(),
+                source_title: "Garmin Aviation".to_string(),
+                evidence_text: "Garmin identifies itself as the avionics manufacturer.".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let capability_key = normalize_name("GPS");
+        let capability_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES ('GPS', ?) RETURNING id",
+        )
+        .bind(capability_key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let mut product_ids = Vec::new();
+        for model in ["G5", "GTN 650Xi"] {
+            let identifier = normalize_avionics_identifier(model);
+            let model_id: i64 = sqlx::query_scalar(
+                r#"
+                INSERT INTO avionics_models (
+                  avionics_manufacturer_id, name, normalized_name,
+                  manufacturer_identifier_kind, manufacturer_identifier,
+                  normalized_manufacturer_identifier, identity_source_url,
+                  identity_source_title, identity_evidence_text,
+                  identity_evidence_kind, identity_confidence, catalog_reviewed_at
+                ) VALUES (
+                  ?, ?, ?, 'manufacturer_model_number', ?, ?,
+                  'https://www.garmin.com/en-US/aviation/',
+                  'Garmin product reference',
+                  'Garmin identifies this exact marketed avionics product.',
+                  'authoritative_reference', 'very_high', CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                "#,
+            )
+            .bind(manufacturer_id)
+            .bind(model)
+            .bind(normalize_avionics_model_name(model))
+            .bind(model)
+            .bind(identifier)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+            )
+            .bind(model_id)
+            .bind(capability_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated' WHERE id = ?",
+            )
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            product_ids.push(model_id);
+        }
+
+        let human_link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, source,
+              source_confidence, configuration_action
+            ) VALUES (?, ?, 'human_review', 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_ids[0])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let machine_link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, source,
+              source_confidence, configuration_action
+            ) VALUES (?, ?, 'listing_review', 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_ids[1])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let state = listing_authorization_state(&db, listing_id).await.unwrap();
+        assert!(!state.all_automatic_associations_current());
+        assert!(!state.automatic_link_is_current(machine_link_id));
+        assert!(!state.automatic_link_ids.contains(&human_link_id));
+
+        sqlx::query("DELETE FROM aircraft_sale_listing_avionics WHERE id = ?")
+            .bind(machine_link_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let human_only = listing_authorization_state(&db, listing_id).await.unwrap();
+        assert!(human_only.all_automatic_associations_current());
+        assert!(!human_only.automatic_link_ids.contains(&human_link_id));
     }
 }

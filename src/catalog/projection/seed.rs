@@ -626,7 +626,7 @@ async fn insert_projection(
     target: &mut SeedConnection<'_>,
     projection: &CurrentCatalogProjection,
 ) -> Result<()> {
-    let mut approved_model_ids = Vec::new();
+    let mut approved_models = Vec::new();
     let mut generated_products = Vec::new();
     let mut post_approval = Vec::new();
     let mut materialized_rows = 0usize;
@@ -644,8 +644,12 @@ async fn insert_projection(
                 "avionics_models" => {
                     let mut staged = row.clone();
                     staged.set("catalog_status", Value::String("unreviewed".into()))?;
+                    staged.set("verification_method", Value::Null)?;
+                    staged.set("verified_by_user_id", Value::Null)?;
+                    staged.set("structure_verified_by_user_id", Value::Null)?;
+                    staged.set("structure_reviewed_at", Value::Null)?;
                     insert_row(target, &staged).await?;
-                    approved_model_ids.push(row.integer("id")?);
+                    approved_models.push(row.clone());
                 }
                 table if POST_APPROVAL_TABLES.contains(&table) => post_approval.push(row),
                 "avionics_authoritative_source_origins" if row_exists(target, row).await? => {
@@ -668,12 +672,24 @@ async fn insert_projection(
         bail!("current projection contains unphased materialization tables: {unknown:?}");
     }
 
-    for model_id in approved_model_ids {
+    for model in &approved_models {
+        let model_id = model.integer("id")?;
+        let verification_method = model
+            .value("verification_method")
+            .context("approved avionics projection is missing verification_method")?;
+        let verified_by_user_id = model
+            .value("verified_by_user_id")
+            .context("approved avionics projection is missing verified_by_user_id")?;
         let changed = execute_sql(
             target,
             &format!(
-                "UPDATE avionics_models SET catalog_status = 'approved' \
-                 WHERE id = {model_id} AND catalog_status = 'unreviewed'"
+                "UPDATE avionics_models \
+                 SET catalog_status = 'approved', \
+                     verification_method = {}, \
+                     verified_by_user_id = {} \
+                 WHERE id = {model_id} AND catalog_status = 'unreviewed'",
+                sql_literal(verification_method)?,
+                sql_literal(verified_by_user_id)?,
             ),
         )
         .await?;
@@ -686,6 +702,33 @@ async fn insert_projection(
     }
     for row in post_approval {
         insert_row(target, row).await?;
+    }
+    for model in &approved_models {
+        let structure_verified_by_user_id = model
+            .value("structure_verified_by_user_id")
+            .context("approved avionics projection is missing structure_verified_by_user_id")?;
+        let structure_reviewed_at = model
+            .value("structure_reviewed_at")
+            .context("approved avionics projection is missing structure_reviewed_at")?;
+        if structure_verified_by_user_id.is_null() && structure_reviewed_at.is_null() {
+            continue;
+        }
+        let model_id = model.integer("id")?;
+        let changed = execute_sql(
+            target,
+            &format!(
+                "UPDATE avionics_models \
+                 SET structure_verified_by_user_id = {}, \
+                     structure_reviewed_at = {} \
+                 WHERE id = {model_id} AND catalog_status = 'approved'",
+                sql_literal(structure_verified_by_user_id)?,
+                sql_literal(structure_reviewed_at)?,
+            ),
+        )
+        .await?;
+        if changed != 1 {
+            bail!("could not restore reviewed avionics structure for model {model_id}");
+        }
     }
     Ok(())
 }
@@ -1317,7 +1360,9 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = 601")
+        sqlx::query(
+            "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated', verified_by_user_id = NULL WHERE id = 601",
+        )
             .execute(pool)
             .await
             .unwrap();

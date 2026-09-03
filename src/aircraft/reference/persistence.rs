@@ -1938,7 +1938,9 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+        sqlx::query(
+            "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated', verified_by_user_id = NULL WHERE id = ?",
+        )
             .bind(avionics_id)
             .execute(pool)
             .await

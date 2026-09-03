@@ -40,16 +40,13 @@ use crate::avionics::fingerprint::{
     APPROVED_CATALOG_ROWS_SQL,
 };
 use crate::avionics::manufacturer::{
-    admit_manufacturer_product_scope_postgres, admit_manufacturer_product_scope_sqlite,
-    stage_batch_manufacturer_alias_collision_postgres,
-    stage_batch_manufacturer_alias_collision_sqlite, ManufacturerIdentityError,
-    ManufacturerIdentityEvidence, ManufacturerProductAdmission,
+    admit_human_manufacturer_product_scope_postgres, admit_human_manufacturer_product_scope_sqlite,
+    HumanManufacturerProductAdmission, ManufacturerIdentityError,
     ManufacturerProductAdmissionOutcome,
 };
 use crate::avionics::model::avionics_identities_are_typography_exact;
 use crate::avionics::reuse::{
-    current_reuse_attested_product_ids, refresh_reuse_attestation_postgres,
-    refresh_reuse_attestation_sqlite, reuse_attestation_is_current_postgres,
+    current_reuse_attested_product_ids, reuse_attestation_is_current_postgres,
     reuse_attestation_is_current_sqlite, reuse_source_origin_is_authorized,
 };
 use crate::db::{AppDb, DatabaseBackend};
@@ -234,6 +231,38 @@ pub struct StableIdentifier {
     pub value: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AvionicsValuationScope {
+    #[default]
+    Unit,
+    IntegratedSuite,
+}
+
+impl AvionicsValuationScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unit => "unit",
+            Self::IntegratedSuite => "integrated_suite",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSuiteComponent {
+    pub avionics_model_id: i64,
+    pub quantity: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReviewProductSuiteComponent {
+    pub avionics_model_id: i64,
+    pub manufacturer: String,
+    pub model: String,
+    pub quantity: i64,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ListingAssociationRole {
@@ -282,6 +311,15 @@ pub struct ReviewProduct {
     pub capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable_identifier: Option<StableIdentifier>,
+    pub valuation_scope: AvionicsValuationScope,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suite_components: Vec<ReviewProductSuiteComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_by_user_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_source_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -303,6 +341,11 @@ impl ReviewProduct {
             model: model.into(),
             capabilities,
             stable_identifier: None,
+            valuation_scope: AvionicsValuationScope::Unit,
+            suite_components: Vec::new(),
+            verification_method: None,
+            verified_by_user_id: None,
+            reviewed_at: None,
             identity_source_url: None,
             identity_source_title: None,
             identity_evidence_text: None,
@@ -320,6 +363,11 @@ impl ReviewProduct {
             model: model.into(),
             capabilities,
             stable_identifier: None,
+            valuation_scope: AvionicsValuationScope::Unit,
+            suite_components: Vec::new(),
+            verification_method: None,
+            verified_by_user_id: None,
+            reviewed_at: None,
             identity_source_url: None,
             identity_source_title: None,
             identity_evidence_text: None,
@@ -342,6 +390,11 @@ impl ReviewProduct {
             model: model.into(),
             capabilities,
             stable_identifier: None,
+            valuation_scope: AvionicsValuationScope::Unit,
+            suite_components: Vec::new(),
+            verification_method: None,
+            verified_by_user_id: None,
+            reviewed_at: None,
             identity_source_url: None,
             identity_source_title: None,
             identity_evidence_text: None,
@@ -357,6 +410,11 @@ impl ReviewProduct {
             kind: kind.into(),
             value: value.into(),
         });
+        self
+    }
+
+    pub fn with_valuation_scope(mut self, valuation_scope: AvionicsValuationScope) -> Self {
+        self.valuation_scope = valuation_scope;
         self
     }
 
@@ -853,7 +911,41 @@ pub struct ReviseAvionicsObservationRequest {
     pub replacement_target: Option<ReviewReplacementTarget>,
 }
 
+/// Source-free, reviewer-authenticated admission of one canonical product for
+/// one independent ordinary listing aspect.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateHumanAvionicsProductRequest {
+    #[serde(rename = "review_payload_sha256")]
+    pub expected_review_payload_sha256: String,
+    #[serde(rename = "catalog_revision_sha256")]
+    pub expected_catalog_revision_sha256: String,
+    pub aspect_id: ReviewAspectId,
+    #[serde(default)]
+    pub unreviewed_avionics_model_id: Option<i64>,
+    pub manufacturer: String,
+    pub model: String,
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub stable_identifier: Option<StableIdentifier>,
+    #[serde(default)]
+    pub valuation_scope: AvionicsValuationScope,
+    #[serde(default)]
+    pub suite_components: Vec<ReviewSuiteComponent>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAvionicsProductStructureRequest {
+    #[serde(rename = "catalog_revision_sha256")]
+    pub expected_catalog_revision_sha256: String,
+    pub valuation_scope: AvionicsValuationScope,
+    #[serde(default)]
+    pub suite_components: Vec<ReviewSuiteComponent>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolveReviewRequest {
     #[serde(rename = "review_payload_sha256")]
     pub expected_review_payload_sha256: String,
@@ -868,7 +960,7 @@ pub struct ResolveReviewRequest {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReviewDecision {
     UseVerifiedProduct {
         aspect_id: ReviewAspectId,
@@ -884,15 +976,12 @@ pub enum ReviewDecision {
         manufacturer: String,
         model: String,
         capabilities: Vec<String>,
-        manufacturer_identifier_kind: String,
-        manufacturer_identifier: String,
-        identity_source_url: String,
-        identity_source_title: String,
-        identity_evidence_text: String,
-        /// Populated only by the server after grounded adjudication. Client
-        /// input is ignored so these URLs remain a trusted write sidecar.
-        #[serde(skip)]
-        grounded_claim_source_urls: Vec<String>,
+        #[serde(default)]
+        stable_identifier: Option<StableIdentifier>,
+        #[serde(default)]
+        valuation_scope: AvionicsValuationScope,
+        #[serde(default)]
+        suite_components: Vec<ReviewSuiteComponent>,
     },
     Discard {
         aspect_id: ReviewAspectId,
@@ -1026,6 +1115,14 @@ struct ApprovedProductRow {
     identity_source_url: Option<String>,
     identity_source_title: Option<String>,
     identity_evidence_text: Option<String>,
+    valuation_scope: String,
+    verification_method: Option<String>,
+    verified_by_user_id: Option<i64>,
+    catalog_reviewed_at: Option<String>,
+    suite_component_model_id: Option<i64>,
+    suite_component_manufacturer: Option<String>,
+    suite_component_model: Option<String>,
+    suite_component_quantity: Option<i64>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -1160,7 +1257,30 @@ struct CatalogIdentityRow {
     model: String,
     manufacturer_identifier_kind: Option<String>,
     normalized_manufacturer_identifier: Option<String>,
-    avionics_manufacturer_identity_id: Option<i64>,
+}
+
+fn catalog_identity_matches_create_product(
+    candidate: &CatalogIdentityRow,
+    product: &CreateProductSpec,
+) -> bool {
+    if normalize_avionics_manufacturer_name(&candidate.manufacturer)
+        != normalize_avionics_manufacturer_name(&product.manufacturer)
+        || normalize_avionics_model_name(&candidate.model) != product.normalized_model
+    {
+        return false;
+    }
+    match (
+        candidate.manufacturer_identifier_kind.as_deref(),
+        candidate.normalized_manufacturer_identifier.as_deref(),
+    ) {
+        (None, None) => true,
+        (Some(kind), Some(identifier)) => {
+            kind.trim() == product.manufacturer_identifier_kind
+                && normalize_avionics_identifier(identifier)
+                    == product.normalized_manufacturer_identifier
+        }
+        _ => false,
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1851,6 +1971,14 @@ struct IndependentRawAspectDiscardCommit {
 }
 
 #[derive(Clone, Debug)]
+struct HumanProductCreationCommit {
+    aspect_id: ReviewAspectId,
+    unreviewed_avionics_model_id: Option<i64>,
+    expected_catalog_revision_sha256: String,
+    product: CreateProductSpec,
+}
+
+#[derive(Clone, Debug)]
 enum OrdinaryAspectUseExistingAuthorization {
     ReviewerSelection,
     HashBoundReuseTarget {
@@ -1863,6 +1991,7 @@ enum OrdinaryAspectUseExistingAuthorization {
 enum ReviewMaintenanceCommit {
     CorroborateAssociation(AssociationCorroborationCommit),
     UseExistingForOrdinaryAspect(OrdinaryAspectUseExistingCommit),
+    CreateHumanProductForOrdinaryAspect(HumanProductCreationCommit),
     DiscardIndependentRawAspect(IndependentRawAspectDiscardCommit),
 }
 
@@ -1895,6 +2024,12 @@ async fn restage_pending_review_if_current_with_commit(
                             || evidence_provenance.source_url.trim().is_empty()
                             || !valid_sha256(&evidence_provenance.rendered_html_sha256)
                     )
+            }
+            ReviewMaintenanceCommit::CreateHumanProductForOrdinaryAspect(commit) => {
+                !valid_sha256(&commit.expected_catalog_revision_sha256)
+                    || commit
+                        .unreviewed_avionics_model_id
+                        .is_some_and(|id| id <= 0)
             }
             ReviewMaintenanceCommit::DiscardIndependentRawAspect(commit) => {
                 bounded_decision_reason(&commit.reason).is_err()
@@ -2084,7 +2219,7 @@ async fn restage_pending_review_if_current_with_commit(
           source_confidence,
           configuration_action,
           replaces_avionics_model_id
-        ) VALUES (?, ?, ?, 'listing_review', ?, 'high', 'installed', NULL)
+        ) VALUES (?, ?, ?, ?, ?, 'high', 'installed', NULL)
         RETURNING id
         "#,
     );
@@ -2093,7 +2228,7 @@ async fn restage_pending_review_if_current_with_commit(
         UPDATE aircraft_sale_listing_avionics
         SET avionics_model_id = ?,
             quantity = ?,
-            source = 'listing_review',
+            source = ?,
             source_notes = ?,
             source_confidence = 'high',
             configuration_action = 'installed',
@@ -2104,6 +2239,126 @@ async fn restage_pending_review_if_current_with_commit(
           AND quantity = ?
           AND configuration_action = 'installed'
           AND replaces_avionics_model_id IS NULL
+        "#,
+    );
+    let select_create_catalog_identity = db.sql(
+        r#"
+        SELECT
+          model.id,
+          model.catalog_status,
+          manufacturer.name AS manufacturer,
+          model.name AS model,
+          model.manufacturer_identifier_kind,
+          model.normalized_manufacturer_identifier
+        FROM avionics_models model
+        JOIN avionics_manufacturers manufacturer
+          ON manufacturer.id = model.avionics_manufacturer_id
+        LEFT JOIN avionics_manufacturer_effective_memberships manufacturer_scope
+          ON manufacturer_scope.avionics_manufacturer_id = model.avionics_manufacturer_id
+        WHERE model.id = ?
+        "#,
+    );
+    let select_create_approved_collisions = db.sql(
+        r#"
+        SELECT avionics_model_id
+        FROM avionics_approved_product_identities
+        WHERE avionics_manufacturer_identity_id = ?
+          AND (
+            canonical_product_key = ?
+            OR (manufacturer_identifier_kind = ? AND canonical_identifier_key = ?)
+          )
+        ORDER BY avionics_model_id
+        "#,
+    );
+    let select_create_unreviewed_collisions = db.sql(
+        r#"
+        SELECT model.id
+        FROM avionics_models model
+        JOIN avionics_manufacturer_effective_memberships manufacturer_scope
+          ON manufacturer_scope.avionics_manufacturer_id = model.avionics_manufacturer_id
+        WHERE manufacturer_scope.avionics_manufacturer_identity_id = ?
+          AND model.catalog_status = 'unreviewed'
+          AND (
+            lower(replace(replace(replace(replace(replace(trim(model.normalized_name), ' ', ''), '-', ''), '/', ''), '.', ''), '_', '')) = ?
+            OR (
+              model.manufacturer_identifier_kind = ?
+              AND lower(replace(replace(replace(replace(replace(trim(model.normalized_manufacturer_identifier), ' ', ''), '-', ''), '/', ''), '.', ''), '_', '')) = ?
+            )
+          )
+        ORDER BY model.id
+        "#,
+    );
+    let select_create_external_references = db.sql(SELECT_EXTERNAL_LEGACY_REFERENCES_SQL);
+    let select_create_global_references = db.sql(SELECT_GLOBAL_LEGACY_REFERENCES_SQL);
+    let insert_create_type = db.sql(
+        "INSERT INTO avionics_types (name, normalized_name) VALUES (?, ?) ON CONFLICT (normalized_name) DO NOTHING",
+    );
+    let select_create_type = db.sql("SELECT id FROM avionics_types WHERE normalized_name = ?");
+    let insert_create_model = db.sql(
+        r#"
+        INSERT INTO avionics_models (
+          avionics_manufacturer_id, name, normalized_name, catalog_status,
+          manufacturer_identifier_kind, manufacturer_identifier,
+          normalized_manufacturer_identifier, identity_source_url,
+          identity_source_title, identity_evidence_text, identity_evidence_kind,
+          identity_confidence, catalog_reviewed_at, valuation_scope,
+          verification_method, verified_by_user_id
+        ) VALUES (?, ?, ?, 'unreviewed', ?, ?, ?, NULL, NULL, NULL,
+                  'unreviewed', NULL, CURRENT_TIMESTAMP, ?, NULL, NULL)
+        RETURNING id
+        "#,
+    );
+    let delete_create_types =
+        db.sql("DELETE FROM avionics_model_types WHERE avionics_model_id = ?");
+    let rewrite_create_model = db.sql(
+        r#"
+        UPDATE avionics_models
+        SET avionics_manufacturer_id = ?, name = ?, normalized_name = ?,
+            manufacturer_identifier_kind = ?, manufacturer_identifier = ?,
+            normalized_manufacturer_identifier = ?, identity_source_url = NULL,
+            identity_source_title = NULL, identity_evidence_text = NULL,
+            identity_evidence_kind = 'unreviewed', identity_confidence = NULL,
+            catalog_reviewed_at = CURRENT_TIMESTAMP, valuation_scope = ?,
+            verification_method = NULL, verified_by_user_id = NULL,
+            introduced_year = NULL, discontinued_year = NULL,
+            estimated_unit_value_usd = NULL, value_basis = 'unreviewed',
+            replacement_cost_usd = NULL, value_reference_year = NULL,
+            value_source = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND catalog_status = 'unreviewed'
+        "#,
+    );
+    let insert_create_membership = db.sql(
+        "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?) ON CONFLICT (avionics_model_id, avionics_type_id) DO NOTHING",
+    );
+    let select_create_suite_component = db.sql(
+        r#"
+        SELECT model.id FROM avionics_models model
+        WHERE model.id = ? AND model.catalog_status = 'approved'
+          AND model.valuation_scope = 'unit'
+          AND EXISTS (SELECT 1 FROM avionics_approved_product_graph_identities identity WHERE identity.avionics_model_id = model.id)
+          AND EXISTS (SELECT 1 FROM avionics_model_types membership WHERE membership.avionics_model_id = model.id)
+        "#,
+    );
+    let insert_create_suite_component = db.sql(
+        "INSERT INTO avionics_suite_components (suite_model_id, component_model_id, quantity) VALUES (?, ?, ?)",
+    );
+    let approve_create_model = db.sql(
+        r#"
+        UPDATE avionics_models
+        SET catalog_status = 'approved', catalog_reviewed_at = CURRENT_TIMESTAMP,
+            verification_method = 'human', verified_by_user_id = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND catalog_status = 'unreviewed'
+          AND EXISTS (SELECT 1 FROM avionics_model_types membership WHERE membership.avionics_model_id = avionics_models.id)
+        "#,
+    );
+    let review_create_structure = db.sql(
+        r#"
+        UPDATE avionics_models
+        SET structure_verified_by_user_id = ?,
+            structure_reviewed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND catalog_status = 'approved'
         "#,
     );
     let insert_occurrence_disposition = db.sql(INSERT_DISPOSITION_SQL);
@@ -2134,7 +2389,7 @@ async fn restage_pending_review_if_current_with_commit(
     );
 
     macro_rules! restage_in_transaction {
-        ($pool:expr, $reuse_attestation_is_current:ident) => {{
+        ($pool:expr, $reuse_attestation_is_current:ident, $admit_manufacturer:ident) => {{
             let mut transaction = $pool.begin().await?;
             // Match the global writer order used by resolve: catalog first,
             // listing child tables second, then the listing/review rows.
@@ -2208,6 +2463,7 @@ async fn restage_pending_review_if_current_with_commit(
                         } => Some((&commit.aspect_id, evidence_provenance)),
                     }
                 }
+                Some(ReviewMaintenanceCommit::CreateHumanProductForOrdinaryAspect(_)) => None,
                 Some(ReviewMaintenanceCommit::DiscardIndependentRawAspect(_)) => None,
                 None => None,
             };
@@ -2253,6 +2509,276 @@ async fn restage_pending_review_if_current_with_commit(
                     .bind(listing_id)
                     .fetch_all(&mut *transaction)
                     .await?;
+            let mut created_product_id = None;
+            if let Some(ReviewMaintenanceCommit::CreateHumanProductForOrdinaryAspect(commit)) =
+                maintenance_commit
+            {
+                let aspect = payload
+                    .aspects
+                    .iter()
+                    .find(|aspect| aspect.id == commit.aspect_id)
+                    .ok_or_else(|| {
+                        ReviewError::Stale(format!(
+                            "review aspect {} changed before product creation",
+                            commit.aspect_id
+                        ))
+                    })?;
+                validate_independent_ordinary_aspect(aspect, &payload.aspects)?;
+                if aspect.reuse_attestation_target_id.is_some()
+                    || !aspect
+                        .allowed_actions
+                        .contains(&ReviewAction::CreateVerifiedProduct)
+                {
+                    return Err(ReviewError::Validation(format!(
+                        "review aspect {} does not allow creation of a canonical product",
+                        aspect.id
+                    )));
+                }
+
+                let pre_create_catalog_rows =
+                    sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
+                        .fetch_all(&mut *transaction)
+                        .await?;
+                let pre_create_catalog_revision = fingerprint_catalog_products(
+                    &catalog_products(pre_create_catalog_rows),
+                );
+                if commit.expected_catalog_revision_sha256 != pre_create_catalog_revision {
+                    return Err(ReviewError::Stale(
+                        "approved avionics catalog changed during product creation; reload and re-evaluate"
+                            .to_string(),
+                    ));
+                }
+
+                let manufacturer_admission = HumanManufacturerProductAdmission {
+                    manufacturer: commit.product.manufacturer.as_str(),
+                    model: commit.product.model.as_str(),
+                    manufacturer_identifier_kind: commit
+                        .product
+                        .manufacturer_identifier_kind
+                        .as_str(),
+                    manufacturer_identifier: commit.product.manufacturer_identifier.as_str(),
+                    verified_by_user_id: owner_user_id,
+                };
+                let manufacturer_scope = match $admit_manufacturer(
+                    db,
+                    &mut transaction,
+                    &manufacturer_admission,
+                )
+                .await
+                .map_err(manufacturer_identity_review_error)?
+                {
+                    ManufacturerProductAdmissionOutcome::Admitted(scope) => scope,
+                    ManufacturerProductAdmissionOutcome::PendingAliasReview => {
+                        return Err(ReviewError::Conflict(format!(
+                            "manufacturer identity for review aspect {} requires explicit correction; no alias was created",
+                            aspect.id
+                        )));
+                    }
+                };
+
+                let staged_candidate_id = aspect
+                    .proposed_product
+                    .as_ref()
+                    .and_then(|candidate| candidate.id);
+                if let (Some(staged_id), Some(requested_id)) =
+                    (staged_candidate_id, commit.unreviewed_avionics_model_id)
+                {
+                    if staged_id != requested_id {
+                        return Err(ReviewError::Conflict(format!(
+                            "review aspect {} was staged with unreviewed catalog candidate id {staged_id}, but product creation selected id {requested_id}",
+                            aspect.id
+                        )));
+                    }
+                }
+                let promotion_target_id = commit
+                    .unreviewed_avionics_model_id
+                    .or(staged_candidate_id);
+                if let Some(target_id) = promotion_target_id {
+                    let target = sqlx::query_as::<_, CatalogIdentityRow>(
+                        &select_create_catalog_identity,
+                    )
+                    .bind(target_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .ok_or_else(|| {
+                        ReviewError::Stale(format!(
+                            "unreviewed catalog candidate id {target_id} disappeared"
+                        ))
+                    })?;
+                    if target.catalog_status != "unreviewed" {
+                        return Err(ReviewError::Stale(format!(
+                            "catalog candidate id {target_id} is now {}; reload",
+                            target.catalog_status
+                        )));
+                    }
+                    if commit.unreviewed_avionics_model_id.is_some()
+                        && staged_candidate_id.is_none()
+                        && !catalog_identity_matches_create_product(&target, &commit.product)
+                    {
+                        return Err(ReviewError::Conflict(format!(
+                            "unreviewed catalog candidate id {target_id} does not match the submitted manufacturer, model, and stable identifier"
+                        )));
+                    }
+                    let global_references =
+                        sqlx::query_as::<_, GlobalCatalogReferenceRow>(
+                            &select_create_global_references,
+                        )
+                        .bind(target_id)
+                        .bind(target_id)
+                        .bind(target_id)
+                        .fetch_all(&mut *transaction)
+                        .await?;
+                    let external_references =
+                        sqlx::query_as::<_, ExternalCoveredReferenceRow>(
+                            &select_create_external_references,
+                        )
+                        .bind(target_id)
+                        .bind(listing_id)
+                        .bind(target_id)
+                        .bind(listing_id)
+                        .fetch_all(&mut *transaction)
+                        .await?;
+                    if !global_references.is_empty() || !external_references.is_empty() {
+                        return Err(ReviewError::Conflict(format!(
+                            "unreviewed catalog candidate id {target_id} is referenced outside this listing and cannot be corrected entry-by-entry"
+                        )));
+                    }
+                }
+
+                let approved_collisions: Vec<i64> = sqlx::query_scalar(
+                    &select_create_approved_collisions,
+                )
+                .bind(manufacturer_scope.avionics_manufacturer_identity_id)
+                .bind(manufacturer_scope.canonical_product_key.as_str())
+                .bind(commit.product.manufacturer_identifier_kind.as_str())
+                .bind(manufacturer_scope.canonical_identifier_key.as_str())
+                .fetch_all(&mut *transaction)
+                .await?;
+                if let Some(collision_id) = approved_collisions.first() {
+                    return Err(ReviewError::Conflict(format!(
+                        "human-approved product matches existing approved catalog id {collision_id}; select that product instead"
+                    )));
+                }
+                let unreviewed_collisions: Vec<i64> = sqlx::query_scalar(
+                    &select_create_unreviewed_collisions,
+                )
+                .bind(manufacturer_scope.avionics_manufacturer_identity_id)
+                .bind(manufacturer_scope.canonical_product_key.as_str())
+                .bind(commit.product.manufacturer_identifier_kind.as_str())
+                .bind(manufacturer_scope.canonical_identifier_key.as_str())
+                .fetch_all(&mut *transaction)
+                .await?;
+                if let Some(collision_id) = unreviewed_collisions
+                    .into_iter()
+                    .find(|id| Some(*id) != promotion_target_id)
+                {
+                    return Err(ReviewError::Conflict(format!(
+                        "human-approved product matches unreviewed catalog id {collision_id}; select it as the correction target or consolidate it first"
+                    )));
+                }
+
+                let model_id = if let Some(target_id) = promotion_target_id {
+                    sqlx::query(&delete_create_types)
+                        .bind(target_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    let updated = sqlx::query(&rewrite_create_model)
+                        .bind(manufacturer_scope.avionics_manufacturer_id)
+                        .bind(commit.product.model.as_str())
+                        .bind(commit.product.normalized_model.as_str())
+                        .bind(commit.product.manufacturer_identifier_kind.as_str())
+                        .bind(commit.product.manufacturer_identifier.as_str())
+                        .bind(commit.product.normalized_manufacturer_identifier.as_str())
+                        .bind(commit.product.valuation_scope.as_str())
+                        .bind(target_id)
+                        .execute(&mut *transaction)
+                        .await?
+                        .rows_affected();
+                    if updated != 1 {
+                        return Err(ReviewError::Stale(format!(
+                            "unreviewed catalog candidate id {target_id} changed during correction"
+                        )));
+                    }
+                    target_id
+                } else {
+                    sqlx::query_scalar(&insert_create_model)
+                        .bind(manufacturer_scope.avionics_manufacturer_id)
+                        .bind(commit.product.model.as_str())
+                        .bind(commit.product.normalized_model.as_str())
+                        .bind(commit.product.manufacturer_identifier_kind.as_str())
+                        .bind(commit.product.manufacturer_identifier.as_str())
+                        .bind(commit.product.normalized_manufacturer_identifier.as_str())
+                        .bind(commit.product.valuation_scope.as_str())
+                        .fetch_one(&mut *transaction)
+                        .await?
+                };
+                for capability in &commit.product.capabilities {
+                    let normalized_capability = normalize_name(capability);
+                    sqlx::query(&insert_create_type)
+                        .bind(capability)
+                        .bind(normalized_capability.as_str())
+                        .execute(&mut *transaction)
+                        .await?;
+                    let capability_id: i64 = sqlx::query_scalar(&select_create_type)
+                        .bind(normalized_capability.as_str())
+                        .fetch_one(&mut *transaction)
+                        .await?;
+                    sqlx::query(&insert_create_membership)
+                        .bind(model_id)
+                        .bind(capability_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                if sqlx::query(&approve_create_model)
+                    .bind(owner_user_id)
+                    .bind(model_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected()
+                    != 1
+                {
+                    return Err(ReviewError::Conflict(
+                        "human-reviewed catalog product could not be approved".to_string(),
+                    ));
+                }
+                for component in &commit.product.suite_components {
+                    if component.avionics_model_id == model_id {
+                        return Err(ReviewError::Validation(
+                            "an integrated suite cannot contain itself".to_string(),
+                        ));
+                    }
+                    if sqlx::query_scalar::<_, i64>(&select_create_suite_component)
+                        .bind(component.avionics_model_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                        .is_none()
+                    {
+                        return Err(ReviewError::Conflict(format!(
+                            "suite component catalog id {} is not a complete approved unit product",
+                            component.avionics_model_id
+                        )));
+                    }
+                    sqlx::query(&insert_create_suite_component)
+                        .bind(model_id)
+                        .bind(component.avionics_model_id)
+                        .bind(component.quantity)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                if sqlx::query(&review_create_structure)
+                    .bind(owner_user_id)
+                    .bind(model_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected()
+                    != 1
+                {
+                    return Err(ReviewError::Conflict(
+                        "human-reviewed product structure could not be recorded".to_string(),
+                    ));
+                }
+                created_product_id = Some(model_id);
+            }
             let approved_rows = sqlx::query_as::<_, ApprovedProductRow>(&approved_products_sql)
                 .fetch_all(&mut *transaction)
                 .await?;
@@ -2570,9 +3096,29 @@ async fn restage_pending_review_if_current_with_commit(
             }
 
             let mut ordinary_aspect_used = false;
-            if let Some(ReviewMaintenanceCommit::UseExistingForOrdinaryAspect(commit)) =
-                maintenance_commit
-            {
+            let created_product_selection = created_product_id.map(|avionics_model_id| {
+                OrdinaryAspectUseExistingCommit {
+                    aspect_id: match maintenance_commit {
+                        Some(ReviewMaintenanceCommit::CreateHumanProductForOrdinaryAspect(
+                            commit,
+                        )) => commit.aspect_id.clone(),
+                        _ => unreachable!("created product has a creation commit"),
+                    },
+                    avionics_model_id,
+                    expected_catalog_revision_sha256: catalog_revision_sha256.clone(),
+                    authorization: OrdinaryAspectUseExistingAuthorization::ReviewerSelection,
+                }
+            });
+            let ordinary_aspect_commit = match maintenance_commit {
+                Some(ReviewMaintenanceCommit::UseExistingForOrdinaryAspect(commit)) => {
+                    Some(commit)
+                }
+                Some(ReviewMaintenanceCommit::CreateHumanProductForOrdinaryAspect(_)) => {
+                    created_product_selection.as_ref()
+                }
+                _ => None,
+            };
+            if let Some(commit) = ordinary_aspect_commit {
                 if commit.expected_catalog_revision_sha256 != catalog_revision_sha256 {
                     return Err(ReviewError::Stale(
                         "approved avionics catalog changed during aspect-scoped review; reload and re-evaluate"
@@ -2620,7 +3166,11 @@ async fn restage_pending_review_if_current_with_commit(
                         commit.avionics_model_id
                     )));
                 }
-                if !reuse_attested_ids.contains(&commit.avionics_model_id) {
+                if matches!(
+                    commit.authorization,
+                    OrdinaryAspectUseExistingAuthorization::HashBoundReuseTarget { .. }
+                ) && !reuse_attested_ids.contains(&commit.avionics_model_id)
+                {
                     return Err(ReviewError::Conflict(format!(
                         "review aspect {} references approved avionics catalog id {}, but that product has no current reuse attestation; verify its authoritative manufacturer source in Known avionics products, then retry this entry",
                         commit.aspect_id,
@@ -2701,6 +3251,12 @@ async fn restage_pending_review_if_current_with_commit(
                 }
 
                 let source_notes = aspect.source_evidence_text.as_deref();
+                let assignment_source = match &commit.authorization {
+                    OrdinaryAspectUseExistingAuthorization::ReviewerSelection => "human_review",
+                    OrdinaryAspectUseExistingAuthorization::HashBoundReuseTarget { .. } => {
+                        "listing_review"
+                    }
+                };
                 let selected_product = approved
                     .get(&commit.avionics_model_id)
                     .expect("approved aspect-scoped product was loaded under lock");
@@ -2716,6 +3272,7 @@ async fn restage_pending_review_if_current_with_commit(
                     let changed = sqlx::query(&update_reviewed_link)
                         .bind(commit.avionics_model_id)
                         .bind(aspect.quantity)
+                        .bind(assignment_source)
                         .bind(source_notes)
                         .bind(assignment.listing_link_id)
                         .bind(listing_id)
@@ -2737,7 +3294,7 @@ async fn restage_pending_review_if_current_with_commit(
                     assignment.replacement_manufacturer = None;
                     assignment.replacement_model = None;
                     assignment.quantity = aspect.quantity;
-                    assignment.source = "listing_review".to_string();
+                    assignment.source = assignment_source.to_string();
                     assignment.source_notes = aspect.source_evidence_text.clone();
                     assignment.source_confidence = Some("high".to_string());
                     assignment.configuration_action = "installed".to_string();
@@ -2749,6 +3306,7 @@ async fn restage_pending_review_if_current_with_commit(
                         .bind(listing_id)
                         .bind(commit.avionics_model_id)
                         .bind(aspect.quantity)
+                        .bind(assignment_source)
                         .bind(source_notes)
                         .fetch_one(&mut *transaction)
                         .await?;
@@ -2760,7 +3318,7 @@ async fn restage_pending_review_if_current_with_commit(
                         replacement_manufacturer: None,
                         replacement_model: None,
                         quantity: aspect.quantity,
-                        source: "listing_review".to_string(),
+                        source: assignment_source.to_string(),
                         source_notes: aspect.source_evidence_text.clone(),
                         source_confidence: Some("high".to_string()),
                         configuration_action: "installed".to_string(),
@@ -3148,10 +3706,18 @@ async fn restage_pending_review_if_current_with_commit(
     }
     match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
-            restage_in_transaction!(pool, reuse_attestation_is_current_sqlite)
+            restage_in_transaction!(
+                pool,
+                reuse_attestation_is_current_sqlite,
+                admit_human_manufacturer_product_scope_sqlite
+            )
         }
         DatabaseBackend::Postgres(pool) => {
-            restage_in_transaction!(pool, reuse_attestation_is_current_postgres)
+            restage_in_transaction!(
+                pool,
+                reuse_attestation_is_current_postgres,
+                admit_human_manufacturer_product_scope_postgres
+            )
         }
     }
 }
@@ -3648,6 +4214,246 @@ pub(crate) async fn use_existing_product_for_aspect_and_restage(
         Some(&commit),
     )
     .await
+}
+
+/// Atomically creates or corrects one reviewer-approved canonical product,
+/// assigns it to one independent ordinary aspect, and preserves every other
+/// pending decision.
+pub(crate) async fn create_human_product_for_aspect_and_restage(
+    db: &AppDb,
+    owner_user_id: i64,
+    listing_id: i64,
+    request: &CreateHumanAvionicsProductRequest,
+) -> ReviewResult<Option<StagedPendingReview>> {
+    request.aspect_id.validate()?;
+    if request
+        .unreviewed_avionics_model_id
+        .is_some_and(|id| id <= 0)
+    {
+        return Err(ReviewError::Validation(
+            "unreviewed_avionics_model_id must be positive".to_string(),
+        ));
+    }
+    let decision = ReviewDecision::CreateVerifiedProduct {
+        aspect_id: request.aspect_id.clone(),
+        unreviewed_avionics_model_id: request.unreviewed_avionics_model_id,
+        manufacturer: request.manufacturer.clone(),
+        model: request.model.clone(),
+        capabilities: request.capabilities.clone(),
+        stable_identifier: request.stable_identifier.clone(),
+        valuation_scope: request.valuation_scope,
+        suite_components: request.suite_components.clone(),
+    };
+    let commit =
+        ReviewMaintenanceCommit::CreateHumanProductForOrdinaryAspect(HumanProductCreationCommit {
+            aspect_id: request.aspect_id.clone(),
+            unreviewed_avionics_model_id: request.unreviewed_avionics_model_id,
+            expected_catalog_revision_sha256: request.expected_catalog_revision_sha256.clone(),
+            product: prepare_create_product(&decision)?,
+        });
+    restage_pending_review_if_current_with_commit(
+        db,
+        owner_user_id,
+        listing_id,
+        &request.expected_review_payload_sha256,
+        Some(&commit),
+    )
+    .await
+}
+
+/// Reviewer-only correction of the valuation structure of an already
+/// approved product. Identity, manufacturer, and capabilities are immutable
+/// at this boundary.
+pub(crate) async fn update_approved_product_structure(
+    db: &AppDb,
+    reviewer_user_id: i64,
+    avionics_model_id: i64,
+    request: &UpdateAvionicsProductStructureRequest,
+) -> ReviewResult<String> {
+    if reviewer_user_id <= 0 || avionics_model_id <= 0 {
+        return Err(ReviewError::Validation(
+            "reviewer and avionics model IDs must be positive".to_string(),
+        ));
+    }
+    if !valid_sha256(&request.expected_catalog_revision_sha256) {
+        return Err(ReviewError::Validation(
+            "catalog_revision_sha256 must be a lowercase SHA-256 digest".to_string(),
+        ));
+    }
+    let mut component_ids = HashSet::new();
+    for component in &request.suite_components {
+        if component.avionics_model_id <= 0 || component.quantity <= 0 {
+            return Err(ReviewError::Validation(
+                "suite component IDs and quantities must be positive".to_string(),
+            ));
+        }
+        if component.avionics_model_id == avionics_model_id {
+            return Err(ReviewError::Validation(
+                "an integrated suite cannot contain itself".to_string(),
+            ));
+        }
+        if !component_ids.insert(component.avionics_model_id) {
+            return Err(ReviewError::Validation(format!(
+                "suite component catalog id {} appears more than once",
+                component.avionics_model_id
+            )));
+        }
+    }
+    match request.valuation_scope {
+        AvionicsValuationScope::Unit if !request.suite_components.is_empty() => {
+            return Err(ReviewError::Validation(
+                "unit avionics products cannot contain suite components".to_string(),
+            ));
+        }
+        AvionicsValuationScope::IntegratedSuite if request.suite_components.is_empty() => {
+            return Err(ReviewError::Validation(
+                "an integrated avionics suite requires at least one component".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    let lock_catalog = match db.backend() {
+        DatabaseBackend::Sqlite(_) => db.sql(
+            "UPDATE avionics_models SET updated_at = updated_at WHERE id = (SELECT id FROM avionics_models WHERE catalog_status = 'approved' ORDER BY id LIMIT 1)",
+        ),
+        DatabaseBackend::Postgres(_) => db.sql(POSTGRES_RESTAGE_CATALOG_LOCK_SQL),
+    };
+    let catalog_sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
+    let select_target = db.sql(
+        r#"
+        SELECT model.catalog_status,
+               EXISTS (SELECT 1 FROM avionics_approved_product_graph_identities identity WHERE identity.avionics_model_id = model.id),
+               EXISTS (SELECT 1 FROM avionics_model_types membership WHERE membership.avionics_model_id = model.id)
+        FROM avionics_models model WHERE model.id = ?
+        "#,
+    );
+    let select_component = db.sql(
+        r#"
+        SELECT model.id FROM avionics_models model
+        WHERE model.id = ? AND model.catalog_status = 'approved'
+          AND model.valuation_scope = 'unit'
+          AND EXISTS (SELECT 1 FROM avionics_approved_product_graph_identities identity WHERE identity.avionics_model_id = model.id)
+          AND EXISTS (SELECT 1 FROM avionics_model_types membership WHERE membership.avionics_model_id = model.id)
+        "#,
+    );
+    let delete_components =
+        db.sql("DELETE FROM avionics_suite_components WHERE suite_model_id = ?");
+    let stage_scope = db.sql(
+        r#"
+        UPDATE avionics_models
+        SET valuation_scope = ?, structure_verified_by_user_id = NULL,
+            structure_reviewed_at = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND catalog_status = 'approved'
+        "#,
+    );
+    let insert_component = db.sql(
+        "INSERT INTO avionics_suite_components (suite_model_id, component_model_id, quantity) VALUES (?, ?, ?)",
+    );
+    let finalize_structure = db.sql(
+        r#"
+        UPDATE avionics_models
+        SET structure_verified_by_user_id = ?, structure_reviewed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND catalog_status = 'approved'
+        "#,
+    );
+    let delete_reuse_attestation =
+        db.sql("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?");
+
+    macro_rules! update_structure_in_transaction {
+        ($pool:expr) => {{
+            let mut transaction = $pool.begin().await?;
+            sqlx::query(&lock_catalog)
+                .execute(&mut *transaction)
+                .await?;
+            let catalog_rows = sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
+                .fetch_all(&mut *transaction)
+                .await?;
+            let current_revision =
+                fingerprint_catalog_products(&catalog_products(catalog_rows));
+            if current_revision != request.expected_catalog_revision_sha256 {
+                return Err(ReviewError::Stale(
+                    "approved avionics catalog changed during structure review; reload"
+                        .to_string(),
+                ));
+            }
+            let target: Option<(String, bool, bool)> = sqlx::query_as(&select_target)
+                .bind(avionics_model_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+            if !matches!(target, Some((ref status, true, true)) if status == "approved") {
+                return Err(ReviewError::Conflict(format!(
+                    "avionics catalog id {avionics_model_id} is not a complete approved product"
+                )));
+            }
+            for component in &request.suite_components {
+                if sqlx::query_scalar::<_, i64>(&select_component)
+                    .bind(component.avionics_model_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .is_none()
+                {
+                    return Err(ReviewError::Conflict(format!(
+                        "suite component catalog id {} is not a complete approved unit product",
+                        component.avionics_model_id
+                    )));
+                }
+            }
+
+            sqlx::query(&delete_components)
+                .bind(avionics_model_id)
+                .execute(&mut *transaction)
+                .await?;
+            if sqlx::query(&stage_scope)
+                .bind(request.valuation_scope.as_str())
+                .bind(avionics_model_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                != 1
+            {
+                return Err(ReviewError::Stale(
+                    "approved product changed during structure review".to_string(),
+                ));
+            }
+            for component in &request.suite_components {
+                sqlx::query(&insert_component)
+                    .bind(avionics_model_id)
+                    .bind(component.avionics_model_id)
+                    .bind(component.quantity)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            if sqlx::query(&finalize_structure)
+                .bind(reviewer_user_id)
+                .bind(avionics_model_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                != 1
+            {
+                return Err(ReviewError::Stale(
+                    "approved product changed during structure review".to_string(),
+                ));
+            }
+            sqlx::query(&delete_reuse_attestation)
+                .bind(avionics_model_id)
+                .execute(&mut *transaction)
+                .await?;
+            let catalog_rows = sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
+                .fetch_all(&mut *transaction)
+                .await?;
+            let updated_revision =
+                fingerprint_catalog_products(&catalog_products(catalog_rows));
+            transaction.commit().await?;
+            Ok::<String, ReviewError>(updated_revision)
+        }};
+    }
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => update_structure_in_transaction!(pool),
+        DatabaseBackend::Postgres(pool) => update_structure_in_transaction!(pool),
+    }
 }
 
 /// Atomically accepts one locally verified, hash-bound reuse target on an
@@ -4376,7 +5182,15 @@ const APPROVED_PRODUCT_ROWS_SQL: &str = r#"
       model.manufacturer_identifier,
       model.identity_source_url,
       model.identity_source_title,
-      model.identity_evidence_text
+      model.identity_evidence_text,
+      model.valuation_scope,
+      model.verification_method,
+      model.verified_by_user_id,
+      model.catalog_reviewed_at,
+      suite_component.component_model_id AS suite_component_model_id,
+      suite_manufacturer.name AS suite_component_manufacturer,
+      suite_model.name AS suite_component_model,
+      suite_component.quantity AS suite_component_quantity
     FROM avionics_models model
     JOIN avionics_manufacturers manufacturer
       ON manufacturer.id = model.avionics_manufacturer_id
@@ -4384,8 +5198,15 @@ const APPROVED_PRODUCT_ROWS_SQL: &str = r#"
       ON membership.avionics_model_id = model.id
     JOIN avionics_types capability
       ON capability.id = membership.avionics_type_id
+    LEFT JOIN avionics_suite_components suite_component
+      ON suite_component.suite_model_id = model.id
+    LEFT JOIN avionics_models suite_model
+      ON suite_model.id = suite_component.component_model_id
+    LEFT JOIN avionics_manufacturers suite_manufacturer
+      ON suite_manufacturer.id = suite_model.avionics_manufacturer_id
     WHERE model.catalog_status = 'approved'
-    ORDER BY model.id, capability.normalized_name, capability.id
+    ORDER BY model.id, capability.normalized_name, capability.id,
+             suite_component.component_model_id
 "#;
 
 const EXISTING_ASSIGNMENT_ROWS_SQL: &str = r#"
@@ -4525,11 +5346,37 @@ fn approved_product_map(rows: Vec<ApprovedProductRow>) -> HashMap<i64, ReviewPro
                 (Some(kind), Some(value)) => Some(StableIdentifier { kind, value }),
                 _ => None,
             },
+            valuation_scope: match row.valuation_scope.as_str() {
+                "integrated_suite" => AvionicsValuationScope::IntegratedSuite,
+                _ => AvionicsValuationScope::Unit,
+            },
+            suite_components: Vec::new(),
+            verification_method: row.verification_method,
+            verified_by_user_id: row.verified_by_user_id,
+            reviewed_at: row.catalog_reviewed_at,
             identity_source_url: row.identity_source_url,
             identity_source_title: row.identity_source_title,
             identity_evidence_text: row.identity_evidence_text,
         });
-        product.capabilities.push(row.capability);
+        if !product.capabilities.contains(&row.capability) {
+            product.capabilities.push(row.capability);
+        }
+        if let (Some(avionics_model_id), Some(manufacturer), Some(model), Some(quantity)) = (
+            row.suite_component_model_id,
+            row.suite_component_manufacturer,
+            row.suite_component_model,
+            row.suite_component_quantity,
+        ) {
+            let component = ReviewProductSuiteComponent {
+                avionics_model_id,
+                manufacturer,
+                model,
+                quantity,
+            };
+            if !product.suite_components.contains(&component) {
+                product.suite_components.push(component);
+            }
+        }
     }
     products.into_iter().collect()
 }
@@ -4573,7 +5420,9 @@ async fn load_all_approved_product_map(db: &AppDb) -> ReviewResult<HashMap<i64, 
 async fn load_approved_product_map(db: &AppDb) -> ReviewResult<HashMap<i64, ReviewProduct>> {
     let reuse_attested_ids = current_reuse_attested_product_ids(db).await?;
     let mut products = load_all_approved_product_map(db).await?;
-    products.retain(|id, _| reuse_attested_ids.contains(id));
+    products.retain(|id, product| {
+        product.verification_method.as_deref() == Some("human") || reuse_attested_ids.contains(id)
+    });
     Ok(products)
 }
 
@@ -5139,7 +5988,8 @@ fn add_unattested_suggested_product_targets(
             let suggested = aspect.suggested_product.as_ref()?;
             let product_id = suggested.id?;
             let current = approved.get(&product_id)?;
-            (!reuse_attested_ids.contains(&product_id)
+            (current.verification_method.as_deref() != Some("human")
+                && !reuse_attested_ids.contains(&product_id)
                 && staged_suggestion_matches_approved_product(suggested, current))
             .then_some((aspect.id.clone(), product_id))
         })
@@ -5695,25 +6545,34 @@ fn current_authorized_associations(
         catalog_product_fingerprints,
     );
 
-    // A completed whole-listing review remains a legacy authorization only
-    // while each exact product is globally reusable. Unlike a hash-bound
-    // authorization row, source/confidence alone carries no current product
-    // or collision fingerprint and must never bypass global eligibility.
+    // Explicit human decisions are durable association authorization while
+    // the selected product remains approved. Automated listing-review writes
+    // remain dependent on their current global reuse attestation.
     for assignment in assignments.iter().filter(|assignment| {
-        assignment.source == "listing_review"
-            && assignment.source_confidence.as_deref() == Some("high")
+        matches!(
+            assignment.source.as_str(),
+            "human_review" | "listing_review"
+        ) && assignment.source_confidence.as_deref() == Some("high")
     }) {
-        if reuse_attested_ids.contains(&assignment.avionics_model_id) {
+        let installed_authorized = if assignment.source == "human_review" {
+            catalog_product_fingerprints.contains_key(&assignment.avionics_model_id)
+        } else {
+            reuse_attested_ids.contains(&assignment.avionics_model_id)
+        };
+        if installed_authorized {
             authorized.insert(CoveredListingAssociation {
                 listing_link_id: assignment.listing_link_id,
                 role: ListingAssociationRole::Installed,
                 avionics_model_id: assignment.avionics_model_id,
             });
         }
-        if let Some(avionics_model_id) = assignment
-            .replaces_avionics_model_id
-            .filter(|id| reuse_attested_ids.contains(id))
-        {
+        if let Some(avionics_model_id) = assignment.replaces_avionics_model_id.filter(|id| {
+            if assignment.source == "human_review" {
+                catalog_product_fingerprints.contains_key(id)
+            } else {
+                reuse_attested_ids.contains(id)
+            }
+        }) {
             authorized.insert(CoveredListingAssociation {
                 listing_link_id: assignment.listing_link_id,
                 role: ListingAssociationRole::Replacement,
@@ -7883,10 +8742,8 @@ struct CreateProductSpec {
     manufacturer_identifier_kind: String,
     manufacturer_identifier: String,
     normalized_manufacturer_identifier: String,
-    identity_source_url: String,
-    identity_source_title: String,
-    identity_evidence_text: String,
-    grounded_claim_source_urls: Vec<String>,
+    valuation_scope: AvionicsValuationScope,
+    suite_components: Vec<ReviewSuiteComponent>,
 }
 
 #[derive(Clone, Debug)]
@@ -7960,12 +8817,9 @@ fn prepare_create_product(decision: &ReviewDecision) -> ReviewResult<CreateProdu
         manufacturer,
         model,
         capabilities,
-        manufacturer_identifier_kind,
-        manufacturer_identifier,
-        identity_source_url,
-        identity_source_title,
-        identity_evidence_text,
-        grounded_claim_source_urls,
+        stable_identifier,
+        valuation_scope,
+        suite_components,
         ..
     } = decision
     else {
@@ -7994,7 +8848,13 @@ fn prepare_create_product(decision: &ReviewDecision) -> ReviewResult<CreateProdu
             "verified avionics manufacturer and model must be nonblank".to_string(),
         ));
     }
-    let manufacturer_identifier_kind = manufacturer_identifier_kind.trim();
+    let stable_identifier = stable_identifier
+        .clone()
+        .unwrap_or_else(|| StableIdentifier {
+            kind: "manufacturer_model_number".to_string(),
+            value: model.to_string(),
+        });
+    let manufacturer_identifier_kind = stable_identifier.kind.trim();
     if !matches!(
         manufacturer_identifier_kind,
         "manufacturer_part_number" | "manufacturer_model_number" | "sku"
@@ -8003,7 +8863,7 @@ fn prepare_create_product(decision: &ReviewDecision) -> ReviewResult<CreateProdu
             "unsupported manufacturer_identifier_kind {manufacturer_identifier_kind:?}"
         )));
     }
-    let manufacturer_identifier = manufacturer_identifier.trim();
+    let manufacturer_identifier = stable_identifier.value.trim();
     if manufacturer_identifier.chars().count() > MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS {
         return Err(ReviewError::Validation(format!(
             "manufacturer_identifier must contain at most {MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS} characters"
@@ -8015,25 +8875,33 @@ fn prepare_create_product(decision: &ReviewDecision) -> ReviewResult<CreateProdu
             "manufacturer_identifier must be a concrete manufacturer identifier".to_string(),
         ));
     }
-    let identity_source_title = identity_source_title.trim();
-    let identity_evidence_text = identity_evidence_text.trim();
-    validate_review_product_identity_source_fields(identity_source_title, identity_evidence_text)?;
-    if !exact_product_identity_signal_is_present(
-        identity_evidence_text,
-        model,
-        manufacturer_identifier,
-    ) {
-        return Err(ReviewError::Validation(
-            "identity_evidence_text must itself contain the complete model and manufacturer identifier at alphanumeric boundaries"
-            .to_string(),
-        ));
+    let mut component_ids = HashSet::new();
+    for component in suite_components {
+        if component.avionics_model_id <= 0 || component.quantity <= 0 {
+            return Err(ReviewError::Validation(
+                "suite component IDs and quantities must be positive".to_string(),
+            ));
+        }
+        if !component_ids.insert(component.avionics_model_id) {
+            return Err(ReviewError::Validation(format!(
+                "suite component catalog id {} appears more than once",
+                component.avionics_model_id
+            )));
+        }
     }
-    let mut grounded_claim_source_urls = grounded_claim_source_urls
-        .iter()
-        .map(|source_url| authoritative_source_url(source_url))
-        .collect::<ReviewResult<Vec<_>>>()?;
-    grounded_claim_source_urls.sort();
-    grounded_claim_source_urls.dedup();
+    match valuation_scope {
+        AvionicsValuationScope::Unit if !suite_components.is_empty() => {
+            return Err(ReviewError::Validation(
+                "unit avionics products cannot contain suite components".to_string(),
+            ));
+        }
+        AvionicsValuationScope::IntegratedSuite if suite_components.is_empty() => {
+            return Err(ReviewError::Validation(
+                "an integrated avionics suite requires at least one component".to_string(),
+            ));
+        }
+        _ => {}
+    }
     Ok(CreateProductSpec {
         manufacturer: manufacturer.to_string(),
         model: model.to_string(),
@@ -8042,10 +8910,8 @@ fn prepare_create_product(decision: &ReviewDecision) -> ReviewResult<CreateProdu
         manufacturer_identifier_kind: manufacturer_identifier_kind.to_string(),
         manufacturer_identifier: manufacturer_identifier.to_string(),
         normalized_manufacturer_identifier,
-        identity_source_url: authoritative_source_url(identity_source_url)?,
-        identity_source_title: identity_source_title.to_string(),
-        identity_evidence_text: identity_evidence_text.to_string(),
-        grounded_claim_source_urls,
+        valuation_scope: *valuation_scope,
+        suite_components: suite_components.clone(),
     })
 }
 
@@ -8183,6 +9049,7 @@ enum ApprovedProductSelectionStatus {
 #[derive(Debug, FromRow)]
 struct ApprovedProductSelectionRow {
     catalog_status: String,
+    verification_method: Option<String>,
     has_graph_identity: bool,
     has_capability: bool,
 }
@@ -8195,6 +9062,7 @@ async fn approved_product_selection_status(
         r#"
         SELECT
           model.catalog_status,
+          model.verification_method,
           EXISTS (
             SELECT 1
             FROM avionics_approved_product_graph_identities identity
@@ -8232,6 +9100,9 @@ async fn approved_product_selection_status(
     if !row.has_graph_identity || !row.has_capability {
         return Ok(ApprovedProductSelectionStatus::IncompleteProductGraph);
     }
+    if row.verification_method.as_deref() == Some("human") {
+        return Ok(ApprovedProductSelectionStatus::Selectable);
+    }
     if !current_reuse_attested_product_ids(db)
         .await?
         .contains(&avionics_model_id)
@@ -8265,16 +9136,6 @@ fn product_selection_rejection(
     }
 }
 
-pub(crate) async fn approved_product_is_selectable(
-    db: &AppDb,
-    avionics_model_id: i64,
-) -> ReviewResult<bool> {
-    Ok(
-        approved_product_selection_status(db, avionics_model_id).await?
-            == ApprovedProductSelectionStatus::Selectable,
-    )
-}
-
 async fn load_catalog_identity(
     db: &AppDb,
     avionics_model_id: i64,
@@ -8287,8 +9148,7 @@ async fn load_catalog_identity(
           manufacturer.name AS manufacturer,
           model.name AS model,
           model.manufacturer_identifier_kind,
-          model.normalized_manufacturer_identifier,
-          manufacturer_scope.avionics_manufacturer_identity_id
+          model.normalized_manufacturer_identifier
         FROM avionics_models model
         JOIN avionics_manufacturers manufacturer
           ON manufacturer.id = model.avionics_manufacturer_id
@@ -8307,39 +9167,6 @@ async fn load_catalog_identity(
             .bind(avionics_model_id)
             .fetch_optional(pool)
             .await?),
-    }
-}
-
-fn catalog_candidate_matches_product(
-    candidate: &CatalogIdentityRow,
-    product: &CreateProductSpec,
-) -> bool {
-    let has_concrete_identifier = candidate
-        .manufacturer_identifier_kind
-        .as_deref()
-        .is_some_and(|kind| !kind.trim().is_empty())
-        && candidate
-            .normalized_manufacturer_identifier
-            .as_deref()
-            .is_some_and(|identifier| !normalize_avionics_identifier(identifier).is_empty());
-    let exact_identifier = candidate
-        .manufacturer_identifier_kind
-        .as_deref()
-        .is_some_and(|kind| kind.trim() == product.manufacturer_identifier_kind)
-        && candidate
-            .normalized_manufacturer_identifier
-            .as_deref()
-            .is_some_and(|identifier| {
-                normalize_avionics_identifier(identifier)
-                    == product.normalized_manufacturer_identifier
-            });
-    let exact_name = normalize_avionics_manufacturer_name(&candidate.manufacturer)
-        == normalize_avionics_manufacturer_name(&product.manufacturer)
-        && normalize_avionics_model_name(&candidate.model) == product.normalized_model;
-    if has_concrete_identifier {
-        exact_identifier
-    } else {
-        exact_name
     }
 }
 
@@ -8662,7 +9489,11 @@ pub async fn preflight_listing_review_resolution(
     for (aspect_id, avionics_model_id) in referenced_products {
         if checked_product_ids.insert(avionics_model_id) {
             let selection_status = approved_product_selection_status(db, avionics_model_id).await?;
-            if selection_status != ApprovedProductSelectionStatus::Selectable {
+            if !matches!(
+                selection_status,
+                ApprovedProductSelectionStatus::Selectable
+                    | ApprovedProductSelectionStatus::MissingCurrentReuseAttestation
+            ) {
                 return Err(ReviewError::Validation(product_selection_rejection(
                     &aspect_id,
                     avionics_model_id,
@@ -8733,9 +9564,12 @@ pub async fn preflight_listing_review_resolution(
                     creation.aspect_id, candidate.catalog_status
                 )));
             }
-            if !catalog_candidate_matches_product(&candidate, &creation.product) {
+            if creation.unreviewed_avionics_model_id.is_some()
+                && staged_candidate_id.is_none()
+                && !catalog_identity_matches_create_product(&candidate, &creation.product)
+            {
                 return Err(ReviewError::Conflict(format!(
-                    "unreviewed catalog candidate id {candidate_id} does not match the submitted manufacturer, model, or stable identifier for review aspect {}",
+                    "unreviewed catalog candidate id {candidate_id} for review aspect {} does not match the submitted manufacturer, model, and stable identifier",
                     creation.aspect_id
                 )));
             }
@@ -8778,17 +9612,10 @@ pub async fn preflight_listing_review_resolution(
 
     for creation in create_products {
         if let Some(avionics_model_id) = approved_product_collision(db, &creation.product).await? {
-            if approved_product_is_selectable(db, avionics_model_id).await? {
-                return Err(ReviewError::Conflict(format!(
-                    "new verified product for review aspect {} collides with current-policy reusable catalog id {avionics_model_id}; select the existing product",
-                    creation.aspect_id
-                )));
-            }
-            // The historical approved row remains a mandatory collision
-            // candidate, but cannot yet be selected. Let the server's fresh
-            // grounded preview adjudicate it; an exact existing match is
-            // persisted through the dedicated reuse-attestation transaction
-            // and then requires a reload/use action.
+            return Err(ReviewError::Conflict(format!(
+                "new verified product for review aspect {} collides with approved catalog id {avionics_model_id}; select the existing product",
+                creation.aspect_id
+            )));
         }
     }
 
@@ -8909,8 +9736,7 @@ pub async fn resolve_listing_review(
           manufacturer.name AS manufacturer,
           model.name AS model,
           model.manufacturer_identifier_kind,
-          model.normalized_manufacturer_identifier,
-          manufacturer_scope.avionics_manufacturer_identity_id
+          model.normalized_manufacturer_identifier
         FROM avionics_models model
         JOIN avionics_manufacturers manufacturer
           ON manufacturer.id = model.avionics_manufacturer_id
@@ -8941,9 +9767,12 @@ pub async fn resolve_listing_review(
           identity_evidence_text,
           identity_evidence_kind,
           identity_confidence,
-          catalog_reviewed_at
-        ) VALUES (?, ?, ?, 'unreviewed', ?, ?, ?, ?, ?, ?,
-                  'authoritative_reference', 'very_high', CURRENT_TIMESTAMP)
+          catalog_reviewed_at,
+          valuation_scope,
+          verification_method,
+          verified_by_user_id
+        ) VALUES (?, ?, ?, 'unreviewed', ?, ?, ?, NULL, NULL, NULL,
+                  'unreviewed', NULL, CURRENT_TIMESTAMP, ?, NULL, NULL)
         RETURNING id
         "#,
     );
@@ -8958,12 +9787,14 @@ pub async fn resolve_listing_review(
             manufacturer_identifier_kind = ?,
             manufacturer_identifier = ?,
             normalized_manufacturer_identifier = ?,
-            identity_source_url = ?,
-            identity_source_title = ?,
-            identity_evidence_text = ?,
-            identity_evidence_kind = 'authoritative_reference',
-            identity_confidence = 'very_high',
+            identity_source_url = NULL,
+            identity_source_title = NULL,
+            identity_evidence_text = NULL,
+            identity_evidence_kind = 'unreviewed',
+            identity_confidence = NULL,
             catalog_reviewed_at = CURRENT_TIMESTAMP,
+            verification_method = NULL,
+            verified_by_user_id = NULL,
             introduced_year = NULL,
             discontinued_year = NULL,
             estimated_unit_value_usd = NULL,
@@ -8971,7 +9802,7 @@ pub async fn resolve_listing_review(
             replacement_cost_usd = NULL,
             value_reference_year = NULL,
             value_source = NULL,
-            valuation_scope = 'unit',
+            valuation_scope = ?,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND catalog_status = 'unreviewed'
         "#,
@@ -8979,11 +9810,42 @@ pub async fn resolve_listing_review(
     let insert_membership = db.sql(
         "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?) ON CONFLICT (avionics_model_id, avionics_type_id) DO NOTHING",
     );
+    let select_suite_component = db.sql(
+        r#"
+        SELECT model.id
+        FROM avionics_models model
+        WHERE model.id = ?
+          AND model.catalog_status = 'approved'
+          AND model.valuation_scope = 'unit'
+          AND EXISTS (
+            SELECT 1 FROM avionics_approved_product_graph_identities identity
+            WHERE identity.avionics_model_id = model.id
+          )
+          AND EXISTS (
+            SELECT 1 FROM avionics_model_types membership
+            WHERE membership.avionics_model_id = model.id
+          )
+        "#,
+    );
+    let insert_suite_component = db.sql(
+        "INSERT INTO avionics_suite_components (suite_model_id, component_model_id, quantity) VALUES (?, ?, ?)",
+    );
+    let review_product_structure = db.sql(
+        r#"
+        UPDATE avionics_models
+        SET structure_verified_by_user_id = ?,
+            structure_reviewed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND catalog_status = 'approved'
+        "#,
+    );
     let approve_model = db.sql(
         r#"
         UPDATE avionics_models
         SET catalog_status = 'approved',
             catalog_reviewed_at = CURRENT_TIMESTAMP,
+            verification_method = 'human',
+            verified_by_user_id = ?,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
           AND catalog_status = 'unreviewed'
@@ -9060,8 +9922,6 @@ pub async fn resolve_listing_review(
         (
             $pool:expr,
             $admit_manufacturer:path,
-            $stage_batch_alias:path,
-            $refresh_reuse:path,
             $reuse_is_current:path
         ) => {{
             let mut transaction = $pool.begin().await?;
@@ -9311,17 +10171,12 @@ pub async fn resolve_listing_review(
                     continue;
                 }
                 let product = prepare_create_product(decision)?;
-                let manufacturer_admission = ManufacturerProductAdmission {
+                let manufacturer_admission = HumanManufacturerProductAdmission {
                     manufacturer: product.manufacturer.as_str(),
                     model: product.model.as_str(),
                     manufacturer_identifier_kind: product.manufacturer_identifier_kind.as_str(),
                     manufacturer_identifier: product.manufacturer_identifier.as_str(),
-                    evidence: ManufacturerIdentityEvidence {
-                        source_url: product.identity_source_url.clone(),
-                        source_title: product.identity_source_title.clone(),
-                        evidence_text: product.identity_evidence_text.clone(),
-                    },
-                    additional_evidence_source_urls: &product.grounded_claim_source_urls,
+                    verified_by_user_id: owner_user_id,
                 };
                 match $admit_manufacturer(db, &mut transaction, &manufacturer_admission)
                     .await
@@ -9336,32 +10191,24 @@ pub async fn resolve_listing_review(
                 }
             }
             if !pending_alias_aspects.is_empty() {
-                transaction.commit().await?;
                 return Err(ReviewError::Conflict(format!(
-                    "manufacturer identity requires human alias review before product approval for review aspect(s): {}",
+                    "manufacturer identity collides with a different canonical manufacturer namespace for review aspect(s): {}; correct the manufacturer instead of creating an implicit alias",
                     pending_alias_aspects.join(", ")
                 )));
             }
 
-            let mut representative_manufacturers = BTreeMap::<i64, i64>::new();
-            for (_, _, scope) in &preflighted_creates {
-                representative_manufacturers
-                    .entry(scope.avionics_manufacturer_identity_id)
-                    .and_modify(|manufacturer_id| {
-                        *manufacturer_id =
-                            (*manufacturer_id).min(scope.avionics_manufacturer_id);
-                    })
-                    .or_insert(scope.avionics_manufacturer_id);
-            }
             let mut same_identity_duplicates = Vec::new();
-            let mut cross_identity_collisions =
-                BTreeMap::<(i64, i64), (String, Vec<String>)>::new();
             for left_index in 0..preflighted_creates.len() {
                 for right_index in (left_index + 1)..preflighted_creates.len() {
                     let (left_aspect_id, left_product, left_scope) =
                         &preflighted_creates[left_index];
                     let (right_aspect_id, right_product, right_scope) =
                         &preflighted_creates[right_index];
+                    if left_scope.avionics_manufacturer_identity_id
+                        != right_scope.avionics_manufacturer_identity_id
+                    {
+                        continue;
+                    }
                     let exact_stable_identifier =
                         left_product.manufacturer_identifier_kind
                             == right_product.manufacturer_identifier_kind
@@ -9369,76 +10216,13 @@ pub async fn resolve_listing_review(
                                 == right_scope.canonical_identifier_key;
                     let exact_product_name = left_scope.canonical_product_key
                         == right_scope.canonical_product_key;
-                    if !exact_stable_identifier && !exact_product_name {
-                        continue;
-                    }
-                    let basis = if exact_stable_identifier {
-                        "exact_stable_identifier"
-                    } else {
-                        "exact_product_name"
-                    };
-                    let aspect_pair = format!("{left_aspect_id} / {right_aspect_id}");
-                    if left_scope.avionics_manufacturer_identity_id
-                        == right_scope.avionics_manufacturer_identity_id
-                    {
+                    if exact_stable_identifier || exact_product_name {
                         same_identity_duplicates.push(format!(
-                            "{aspect_pair} ({basis}, manufacturer identity {})",
+                            "{left_aspect_id} / {right_aspect_id} (manufacturer identity {})",
                             left_scope.avionics_manufacturer_identity_id
                         ));
-                        continue;
                     }
-                    let source_identity_id = left_scope
-                        .avionics_manufacturer_identity_id
-                        .max(right_scope.avionics_manufacturer_identity_id);
-                    let target_identity_id = left_scope
-                        .avionics_manufacturer_identity_id
-                        .min(right_scope.avionics_manufacturer_identity_id);
-                    let source_manufacturer_id = *representative_manufacturers
-                        .get(&source_identity_id)
-                        .expect("every admitted identity has a representative manufacturer");
-                    let entry = cross_identity_collisions
-                        .entry((source_manufacturer_id, target_identity_id))
-                        .or_insert_with(|| (basis.to_string(), Vec::new()));
-                    if exact_stable_identifier {
-                        entry.0 = "exact_stable_identifier".to_string();
-                    }
-                    entry.1.push(aspect_pair);
                 }
-            }
-            if !cross_identity_collisions.is_empty() {
-                let mut descriptions = Vec::new();
-                for (
-                    (source_manufacturer_id, target_identity_id),
-                    (basis, aspect_pairs),
-                ) in &cross_identity_collisions
-                {
-                    $stage_batch_alias(
-                        db,
-                        &mut transaction,
-                        *source_manufacturer_id,
-                        *target_identity_id,
-                        basis.as_str(),
-                    )
-                    .await
-                    .map_err(manufacturer_identity_review_error)?;
-                    descriptions.push(format!(
-                        "{} ({basis}, manufacturer {} -> identity {})",
-                        aspect_pairs.join(", "),
-                        source_manufacturer_id,
-                        target_identity_id
-                    ));
-                }
-                if !same_identity_duplicates.is_empty() {
-                    descriptions.push(format!(
-                        "same-identity duplicates: {}",
-                        same_identity_duplicates.join(", ")
-                    ));
-                }
-                transaction.commit().await?;
-                return Err(ReviewError::Conflict(format!(
-                    "review batch contains cross-manufacturer product collisions requiring human alias review: {}",
-                    descriptions.join("; ")
-                )));
             }
             if !same_identity_duplicates.is_empty() {
                 return Err(ReviewError::Conflict(format!(
@@ -9469,11 +10253,6 @@ pub async fn resolve_listing_review(
                                 "avionics catalog id {avionics_model_id} is missing or no longer approved"
                             ))
                         })?;
-                        if !$reuse_is_current(db, &mut transaction, approved).await? {
-                            return Err(ReviewError::Stale(format!(
-                                "avionics catalog id {avionics_model_id} is not eligible for current-policy reuse; ground and re-attest it before selection"
-                            )));
-                        }
                         Some(approved)
                     }
                     ReviewDecision::CreateVerifiedProduct { .. } => {
@@ -9548,6 +10327,16 @@ pub async fn resolve_listing_review(
                                     target.catalog_status
                                 )));
                             }
+                            if decision_candidate_id.is_some()
+                                && staged_candidate_id.is_none()
+                                && target.catalog_status == "unreviewed"
+                                && !catalog_identity_matches_create_product(&target, &product)
+                            {
+                                return Err(ReviewError::Conflict(format!(
+                                    "unreviewed catalog candidate id {target_id} for review aspect {} does not match the submitted manufacturer, model, and stable identifier",
+                                    aspect.id
+                                )));
+                            }
                             if staged_candidate_id.is_some() {
                                 let staged = aspect
                                     .proposed_product
@@ -9588,53 +10377,9 @@ pub async fn resolve_listing_review(
                                     )));
                                 }
                             }
-                            let same_manufacturer_identity = target
-                                .avionics_manufacturer_identity_id
-                                .is_some_and(|identity_id| {
-                                    identity_id
-                                        == manufacturer_scope
-                                            .avionics_manufacturer_identity_id
-                                });
-                            let has_concrete_identifier = target
-                                .manufacturer_identifier_kind
-                                .as_deref()
-                                .is_some_and(|kind| !kind.trim().is_empty())
-                                && target
-                                    .normalized_manufacturer_identifier
-                                    .as_deref()
-                                    .is_some_and(|identifier| {
-                                        !normalize_avionics_identifier(identifier).is_empty()
-                                    });
-                            let exact_stable_identifier = target
-                                    .manufacturer_identifier_kind
-                                    .as_deref()
-                                    .is_some_and(|kind| {
-                                        kind.trim()
-                                            == product.manufacturer_identifier_kind
-                                    })
-                                && target
-                                    .normalized_manufacturer_identifier
-                                    .as_deref()
-                                    .is_some_and(|identifier| {
-                                        normalize_avionics_identifier(identifier)
-                                            == product
-                                                .normalized_manufacturer_identifier
-                                    });
-                            let exact_product_name =
-                                normalize_avionics_model_name(&target.model)
-                                    == product.normalized_model;
-                            let exact_target_identity = same_manufacturer_identity
-                                && (exact_stable_identifier
-                                    || (decision_candidate_id.is_some()
-                                        && !has_concrete_identifier
-                                        && exact_product_name));
-                            if decision_candidate_id.is_some() && !exact_target_identity {
-                                return Err(ReviewError::Conflict(format!(
-                                    "explicit unreviewed catalog candidate id {target_id} no longer matches the independently grounded manufacturer identity and product identity for review aspect {}",
-                                    aspect.id
-                                )));
-                            }
-                            exact_target_identity.then(|| (target_id, target.catalog_status))
+                            (target.catalog_status == "unreviewed"
+                                || candidate_target_id.is_some())
+                            .then_some((target_id, target.catalog_status))
                         } else {
                             None
                         };
@@ -9796,9 +10541,7 @@ pub async fn resolve_listing_review(
                                 .bind(product.manufacturer_identifier_kind.as_str())
                                 .bind(product.manufacturer_identifier.as_str())
                                 .bind(product.normalized_manufacturer_identifier.as_str())
-                                .bind(product.identity_source_url.as_str())
-                                .bind(product.identity_source_title.as_str())
-                                .bind(product.identity_evidence_text.as_str())
+                                .bind(product.valuation_scope.as_str())
                                 .bind(target_id)
                                 .execute(&mut *transaction)
                                 .await?
@@ -9817,9 +10560,7 @@ pub async fn resolve_listing_review(
                                 .bind(product.manufacturer_identifier_kind.as_str())
                                 .bind(product.manufacturer_identifier.as_str())
                                 .bind(product.normalized_manufacturer_identifier.as_str())
-                                .bind(product.identity_source_url.as_str())
-                                .bind(product.identity_source_title.as_str())
-                                .bind(product.identity_evidence_text.as_str())
+                                .bind(product.valuation_scope.as_str())
                                 .fetch_one(&mut *transaction)
                                 .await?
                         };
@@ -9841,6 +10582,7 @@ pub async fn resolve_listing_review(
                                 .await?;
                         }
                         let approved = sqlx::query(&approve_model)
+                            .bind(owner_user_id)
                             .bind(model_id)
                             .execute(&mut *transaction)
                             .await?
@@ -9850,17 +10592,42 @@ pub async fn resolve_listing_review(
                                 "new catalog product could not be atomically approved".to_string(),
                             ));
                         }
-                        let reuse_attested = $refresh_reuse(
-                            db,
-                            &mut transaction,
-                            model_id,
-                            product.identity_source_url.as_str(),
-                        )
-                        .await?;
-                        if !reuse_attested {
-                            return Err(ReviewError::Conflict(format!(
-                                "new verified catalog id {model_id} could not be bound to a current active exact manufacturer source origin"
-                            )));
+                        for component in &product.suite_components {
+                            if component.avionics_model_id == model_id {
+                                return Err(ReviewError::Validation(format!(
+                                    "integrated suite catalog id {model_id} cannot contain itself"
+                                )));
+                            }
+                            let selectable_component: Option<i64> =
+                                sqlx::query_scalar(&select_suite_component)
+                                    .bind(component.avionics_model_id)
+                                    .fetch_optional(&mut *transaction)
+                                    .await?;
+                            if selectable_component.is_none() {
+                                return Err(ReviewError::Conflict(format!(
+                                    "suite component catalog id {} is not a complete approved unit product",
+                                    component.avionics_model_id
+                                )));
+                            }
+                            sqlx::query(&insert_suite_component)
+                                .bind(model_id)
+                                .bind(component.avionics_model_id)
+                                .bind(component.quantity)
+                                .execute(&mut *transaction)
+                                .await?;
+                        }
+                        if sqlx::query(&review_product_structure)
+                            .bind(owner_user_id)
+                            .bind(model_id)
+                            .execute(&mut *transaction)
+                            .await?
+                            .rows_affected()
+                            != 1
+                        {
+                            return Err(ReviewError::Conflict(
+                                "human-reviewed product structure could not be recorded"
+                                    .to_string(),
+                            ));
                         }
                         Some(model_id)
                     }
@@ -9986,11 +10753,6 @@ pub async fn resolve_listing_review(
                                     "replacement catalog id {replaced_id} is missing or no longer approved"
                                 ))
                             })?;
-                            if !$reuse_is_current(db, &mut transaction, approved).await? {
-                                return Err(ReviewError::Stale(format!(
-                                    "replacement catalog id {replaced_id} is not eligible for current-policy reuse; ground and re-attest it before selection"
-                                )));
-                            }
                             Some(approved)
                         } else if let Some(replacement_aspect_id) = &aspect.replacement_aspect_id {
                             Some(
@@ -10031,7 +10793,7 @@ pub async fn resolve_listing_review(
                 let incoming = PreparedAssignment {
                     avionics_model_id,
                     quantity: aspect.quantity,
-                    source: "listing_review".to_string(),
+                    source: "human_review".to_string(),
                     source_notes: aspect.source_evidence_text.clone(),
                     // An explicit reviewer decision is the corroboration
                     // boundary for this listing association. Keep the source
@@ -10159,16 +10921,12 @@ pub async fn resolve_listing_review(
     match db.backend() {
         DatabaseBackend::Sqlite(pool) => resolve_in_transaction!(
             pool,
-            admit_manufacturer_product_scope_sqlite,
-            stage_batch_manufacturer_alias_collision_sqlite,
-            refresh_reuse_attestation_sqlite,
+            admit_human_manufacturer_product_scope_sqlite,
             reuse_attestation_is_current_sqlite
         ),
         DatabaseBackend::Postgres(pool) => resolve_in_transaction!(
             pool,
-            admit_manufacturer_product_scope_postgres,
-            stage_batch_manufacturer_alias_collision_postgres,
-            refresh_reuse_attestation_postgres,
+            admit_human_manufacturer_product_scope_postgres,
             reuse_attestation_is_current_postgres
         ),
     }
@@ -10488,14 +11246,12 @@ mod tests {
             manufacturer: "Garmin".to_string(),
             model: model.to_string(),
             capabilities: vec!["GPS".to_string()],
-            manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
-            manufacturer_identifier: identifier.to_string(),
-            identity_source_url: "https://www.garmin.com/aviation/product".to_string(),
-            identity_source_title: format!("Garmin {model} product page"),
-            identity_evidence_text: format!(
-                "Garmin identifies {model} by manufacturer model number {identifier}."
-            ),
-            grounded_claim_source_urls: Vec::new(),
+            stable_identifier: Some(StableIdentifier {
+                kind: "manufacturer_model_number".to_string(),
+                value: identifier.to_string(),
+            }),
+            valuation_scope: AvionicsValuationScope::Unit,
+            suite_components: Vec::new(),
         }
     }
 
@@ -10604,107 +11360,33 @@ mod tests {
     }
 
     #[test]
-    fn verified_product_requires_one_bounded_exact_publisher_excerpt() {
-        let mut missing = create_candidate_decision("identity", "GIA 63W", "GIA 63W");
-        let ReviewDecision::CreateVerifiedProduct {
-            identity_evidence_text,
-            ..
-        } = &mut missing
-        else {
-            unreachable!("helper creates a product decision");
-        };
-        identity_evidence_text.clear();
-        let error = prepare_create_product(&missing).unwrap_err();
-        assert_eq!(error.to_string(), "identity_evidence_text is required");
-
-        let mut oversized = create_candidate_decision("identity", "GIA 63W", "GIA 63W");
-        let ReviewDecision::CreateVerifiedProduct {
-            identity_evidence_text,
-            ..
-        } = &mut oversized
-        else {
-            unreachable!("helper creates a product decision");
-        };
-        *identity_evidence_text = "x".repeat(MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS + 1);
-        let error = prepare_create_product(&oversized).unwrap_err();
+    fn human_product_creation_is_source_free_and_derives_a_model_identifier() {
+        let decision: ReviewDecision = serde_json::from_value(serde_json::json!({
+            "action": "create_verified_product",
+            "aspect_id": "identity",
+            "manufacturer": "Garmin",
+            "model": "GIA 63W",
+            "capabilities": ["GPS"]
+        }))
+        .expect("human decisions do not require publisher evidence");
+        let prepared = prepare_create_product(&decision).unwrap();
         assert_eq!(
-            error.to_string(),
-            "identity_evidence_text must be an exact publisher excerpt of at most 128 characters"
+            prepared.manufacturer_identifier_kind,
+            "manufacturer_model_number"
         );
+        assert_eq!(prepared.manufacturer_identifier, "GIA 63W");
 
-        let mut unrelated = create_candidate_decision("identity", "GIA 63W", "GIA 63W");
-        let ReviewDecision::CreateVerifiedProduct {
-            identity_evidence_text,
-            ..
-        } = &mut unrelated
-        else {
-            unreachable!("helper creates a product decision");
-        };
-        *identity_evidence_text =
-            "This page also lists GIA 64W by manufacturer model number GIA 64W.".to_string();
-        let error = prepare_create_product(&unrelated).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("must itself contain the complete model"));
-
-        let mut oversized_title = create_candidate_decision("identity", "GIA 63W", "GIA 63W");
-        let ReviewDecision::CreateVerifiedProduct {
-            identity_source_title,
-            ..
-        } = &mut oversized_title
-        else {
-            unreachable!("helper creates a product decision");
-        };
-        *identity_source_title = "x".repeat(MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS + 1);
-        let error = prepare_create_product(&oversized_title).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "identity_source_title must contain at most 200 characters"
-        );
-
-        let client_attempt: ReviewDecision = serde_json::from_value(serde_json::json!({
+        let legacy_source_fields = serde_json::from_value::<ReviewDecision>(serde_json::json!({
             "action": "create_verified_product",
             "aspect_id": "identity",
             "manufacturer": "Garmin",
             "model": "GIA 63W",
             "capabilities": ["GPS"],
-            "manufacturer_identifier_kind": "manufacturer_model_number",
-            "manufacturer_identifier": "GIA 63W",
-            "identity_source_url": "https://www.garmin.com/aviation/product",
-            "identity_source_title": "Garmin GIA 63W product page",
-            "identity_evidence_text":
-                "Garmin identifies GIA 63W by manufacturer model number GIA 63W.",
-            "grounded_claim_source_urls": ["https://attacker.example/fake"]
-        }))
-        .expect("client decision should deserialize");
-        let ReviewDecision::CreateVerifiedProduct {
-            grounded_claim_source_urls,
-            ..
-        } = client_attempt
-        else {
-            unreachable!("JSON creates a product decision");
-        };
+            "identity_source_url": "https://example.test/product"
+        }));
         assert!(
-            grounded_claim_source_urls.is_empty(),
-            "client input cannot populate the trusted grounding sidecar"
-        );
-
-        let mut server_grounded = create_candidate_decision("identity", "GIA 63W", "GIA 63W");
-        let ReviewDecision::CreateVerifiedProduct {
-            grounded_claim_source_urls,
-            ..
-        } = &mut server_grounded
-        else {
-            unreachable!("helper creates a product decision");
-        };
-        grounded_claim_source_urls.push(
-            "https://static.garmin.com/pumac/GIA63_GIA63W_InstallationManual.pdf".to_string(),
-        );
-        let prepared = prepare_create_product(&server_grounded)
-            .expect("server-owned grounding claims should survive preflight");
-        assert_eq!(
-            prepared.grounded_claim_source_urls,
-            vec!["https://static.garmin.com/pumac/GIA63_GIA63W_InstallationManual.pdf".to_string()]
+            legacy_source_fields.is_err(),
+            "human create has no evidence side channel"
         );
     }
 
@@ -10745,14 +11427,12 @@ mod tests {
             manufacturer: manufacturer.to_string(),
             model: model.to_string(),
             capabilities: vec!["GPS".to_string()],
-            manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
-            manufacturer_identifier: identifier.to_string(),
-            identity_source_url: "https://example.org/avionics/product-reference".to_string(),
-            identity_source_title: format!("{manufacturer} {model} product reference"),
-            identity_evidence_text: format!(
-                "The authoritative product reference identifies {model} as manufacturer model number {identifier}."
-            ),
-            grounded_claim_source_urls: Vec::new(),
+            stable_identifier: Some(StableIdentifier {
+                kind: "manufacturer_model_number".to_string(),
+                value: identifier.to_string(),
+            }),
+            valuation_scope: AvionicsValuationScope::Unit,
+            suite_components: Vec::new(),
         }
     }
 
@@ -12474,11 +13154,13 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .await
         .unwrap();
         if approve {
-            sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
-                .bind(model_id)
-                .execute(pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated' WHERE id = ?",
+            )
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
         }
         model_id
     }
@@ -14534,7 +15216,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                 (
                     product_id,
                     quantity,
-                    "listing_review".to_string(),
+                    "human_review".to_string(),
                     Some("GTX 345 shown in listing equipment".to_string()),
                     Some("high".to_string()),
                 )
@@ -14639,7 +15321,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                 link_id,
                 approved_id,
                 2,
-                "listing_review".to_string(),
+                "human_review".to_string(),
                 Some("high".to_string()),
             )
         );
@@ -14875,7 +15557,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
     }
 
     #[tokio::test]
-    async fn aspect_scoped_approval_rejects_stale_revoked_and_coupled_inputs() {
+    async fn aspect_scoped_human_selection_rejects_stale_and_coupled_but_not_unattested_inputs() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
         let product_id = insert_approved_product(&db, "GTX 345", "GTX345", "Transponder").await;
@@ -14940,8 +15622,8 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             product_id,
         )
         .await
-        .expect_err("revoked products must fail under the transaction lock");
-        assert!(matches!(revoked, ReviewError::Conflict(_)));
+        .expect("explicit reviewer selection does not inherit the automated attestation gate");
+        assert_eq!(revoked, None);
 
         let other_db = test_db().await;
         let (other_user_id, other_listing_id) = insert_listing(&other_db).await;
@@ -15149,6 +15831,8 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             identity_source_url: "https://www.garmin.com/gtx345".to_string(),
             identity_source_title: "GTX 345".to_string(),
             identity_evidence_text: "Garmin identifies the GTX 345 model.".to_string(),
+            valuation_scope: "unit".to_string(),
+            suite_components: Vec::new(),
         };
         let original = fingerprint_catalog_product(&product);
         let mut mutations = Vec::new();
@@ -15172,6 +15856,10 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         mutations.push(changed);
         let mut changed = product.clone();
         changed.identity_evidence_text.push_str(" Updated proof.");
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.valuation_scope = "integrated_suite".to_string();
+        changed.suite_components = vec![(8, 2)];
         mutations.push(changed);
 
         for changed in mutations {
@@ -16557,18 +17245,9 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                 },
             ],
         );
-        assert!(matches!(
-            preflight_listing_review_resolution(
-                &db,
-                &review,
-                &approved_without_attestation
-            )
-            .await,
-            Err(ReviewError::Validation(message))
-                if message.contains("approved avionics catalog id")
-                    && message.contains("no current reuse attestation")
-                    && message.contains("Known avionics products")
-        ));
+        preflight_listing_review_resolution(&db, &review, &approved_without_attestation)
+            .await
+            .expect("an explicit human selection does not require an automation reuse attestation");
     }
 
     #[tokio::test]
@@ -16597,9 +17276,8 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         assert!(matches!(
             preflight_listing_review_resolution(&db, &review, &request).await,
             Err(ReviewError::Conflict(message))
-                if message.contains(&format!(
-                    "current-policy reusable catalog id {approved_id}"
-                ))
+                if message.contains(&format!("approved catalog id {approved_id}"))
+                    && message.contains("select the existing product")
         ));
     }
 
@@ -16786,7 +17464,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         }));
         assert!(rows
             .iter()
-            .any(|row| row.0 == reviewed_id && row.2 == "listing_review"));
+            .any(|row| row.0 == reviewed_id && row.2 == "human_review"));
         let listing_state: (String, bool) = sqlx::query_as(
             "SELECT ingestion_state, is_verified FROM aircraft_sale_listings WHERE id = ?",
         )
@@ -16853,7 +17531,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
     }
 
     #[tokio::test]
-    async fn immutable_replacement_target_requires_current_reuse_attestation() {
+    async fn immutable_replacement_target_is_accepted_by_complete_human_review() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
         let subject_id = insert_approved_product(&db, "GTX 345", "GTX345", "Transponder").await;
@@ -16866,7 +17544,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             .await
             .unwrap();
 
-        let error = resolve_listing_review(
+        resolve_listing_review(
             &db,
             user_id,
             listing_id,
@@ -16881,16 +17559,10 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             },
         )
         .await
-        .expect_err("an immutable historical replacement target must fail closed");
-        assert!(matches!(
-            error,
-            ReviewError::Stale(message)
-                if message.contains("replacement catalog id")
-                    && message.contains("not eligible for current-policy reuse")
-        ));
+        .expect("complete human review approves both explicit replacement endpoints");
         let pool = sqlite_pool(&db);
-        let link_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        let link: (i64, Option<i64>, String, String) = sqlx::query_as(
+            "SELECT avionics_model_id, replaces_avionics_model_id, configuration_action, source FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
         )
         .bind(listing_id)
         .fetch_one(pool)
@@ -16903,8 +17575,16 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(link_count, 0);
-        assert_eq!(review_count, 1);
+        assert_eq!(
+            link,
+            (
+                subject_id,
+                Some(replacement_id),
+                "replaces".to_string(),
+                "human_review".to_string(),
+            )
+        );
+        assert_eq!(review_count, 0);
     }
 
     #[tokio::test]
@@ -17548,15 +18228,9 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
     }
 
     #[tokio::test]
-    async fn corrected_create_identity_does_not_rewrite_staged_candidate() {
+    async fn corrected_create_identity_rewrites_the_bound_candidate_and_stale_link() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
-        let other_listing_id = insert_additional_listing(
-            &db,
-            user_id,
-            "https://broker.example/aircraft/corrected-candidate-reference",
-        )
-        .await;
         let candidate_id = insert_unreviewed_product(&db, "GNC 355", "GNC355", "GPS").await;
         let pool = sqlite_pool(&db);
         sqlx::query("DROP TRIGGER aircraft_sale_listing_avionics_approved_insert")
@@ -17569,14 +18243,6 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .bind(listing_id)
         .bind(candidate_id)
         .fetch_one(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id, avionics_model_id) VALUES (?, ?)",
-        )
-        .bind(other_listing_id)
-        .bind(candidate_id)
-        .execute(pool)
         .await
         .unwrap();
         let aspect = candidate_aspect("candidate", candidate_id, "GNC 355")
@@ -17602,16 +18268,24 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .await
         .unwrap();
 
-        let candidate: (String, String) =
-            sqlx::query_as("SELECT name, catalog_status FROM avionics_models WHERE id = ?")
-                .bind(candidate_id)
-                .fetch_one(pool)
-                .await
-                .unwrap();
-        assert_eq!(candidate, ("GNC 355".to_string(), "unreviewed".to_string()));
-        let linked: (i64, String) = sqlx::query_as(
+        let candidate: (String, String, String) = sqlx::query_as(
+            "SELECT name, catalog_status, verification_method FROM avionics_models WHERE id = ?",
+        )
+        .bind(candidate_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            candidate,
+            (
+                "GPS 175".to_string(),
+                "approved".to_string(),
+                "human".to_string()
+            )
+        );
+        let linked: (i64, String, String) = sqlx::query_as(
             r#"
-            SELECT model.id, model.name
+            SELECT model.id, model.name, link.source
             FROM aircraft_sale_listing_avionics link
             JOIN avionics_models model ON model.id = link.avionics_model_id
             WHERE link.aircraft_sale_listing_id = ?
@@ -17621,21 +18295,13 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_ne!(linked.0, candidate_id);
+        assert_eq!(linked.0, candidate_id);
         assert_eq!(linked.1, "GPS 175");
-        let unrelated_link: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ? AND avionics_model_id = ?",
-        )
-        .bind(other_listing_id)
-        .bind(candidate_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(unrelated_link, 1);
+        assert_eq!(linked.2, "human_review");
     }
 
     #[tokio::test]
-    async fn name_only_legacy_row_is_retained_while_stable_product_is_created() {
+    async fn name_only_legacy_row_is_promoted_in_place_without_a_duplicate() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
         let legacy_id =
@@ -17704,14 +18370,12 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                     manufacturer: "Garmin".to_string(),
                     model: "GTX 345".to_string(),
                     capabilities: vec!["Transponder".to_string()],
-                    manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
-                    manufacturer_identifier: "GTX345".to_string(),
-                    identity_source_url: "https://www.garmin.com/en-US/p/140949/".to_string(),
-                    identity_source_title: "Garmin GTX 345 product page".to_string(),
-                    identity_evidence_text:
-                        "Garmin identifies GTX 345 as the exact manufacturer model number."
-                            .to_string(),
-                    grounded_claim_source_urls: Vec::new(),
+                    stable_identifier: Some(StableIdentifier {
+                        kind: "manufacturer_model_number".to_string(),
+                        value: "GTX345".to_string(),
+                    }),
+                    valuation_scope: AvionicsValuationScope::Unit,
+                    suite_components: Vec::new(),
                 }],
             },
         )
@@ -17737,8 +18401,8 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(legacy_status, "unreviewed");
-        assert_ne!(linked.0, legacy_id);
+        assert_eq!(legacy_status, "approved");
+        assert_eq!(linked.0, legacy_id);
         assert_eq!(linked.1, "approved");
         assert_eq!(linked.2, "gtx345");
     }
@@ -17824,13 +18488,12 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                     manufacturer: "Avidyne".to_string(),
                     model: "IFD550".to_string(),
                     capabilities: vec!["GPS".to_string()],
-                    manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
-                    manufacturer_identifier: "IFD550".to_string(),
-                    identity_source_url: "https://www.avidyne.com/ifd550/".to_string(),
-                    identity_source_title: "Avidyne IFD550 product page".to_string(),
-                    identity_evidence_text:
-                        "Avidyne identifies IFD550 as its exact navigator model.".to_string(),
-                    grounded_claim_source_urls: Vec::new(),
+                    stable_identifier: Some(StableIdentifier {
+                        kind: "manufacturer_model_number".to_string(),
+                        value: "IFD550".to_string(),
+                    }),
+                    valuation_scope: AvionicsValuationScope::Unit,
+                    suite_components: Vec::new(),
                 }],
             },
         )
@@ -17869,7 +18532,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
     }
 
     #[tokio::test]
-    async fn new_product_review_rejects_an_uncurated_exact_source_origin_atomically() {
+    async fn human_product_review_does_not_require_a_curated_source_origin() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
         let aspect = batch_create_aspect("uncurated-origin", "Example Avionics", "NAV 100");
@@ -17882,7 +18545,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             .await
             .unwrap();
 
-        let error = resolve_listing_review(
+        resolve_listing_review(
             &db,
             user_id,
             listing_id,
@@ -17896,25 +18559,17 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                     manufacturer: "Example Avionics".to_string(),
                     model: "NAV 100".to_string(),
                     capabilities: vec!["GPS".to_string()],
-                    manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
-                    manufacturer_identifier: "NAV100".to_string(),
-                    identity_source_url: "https://products.example-avionics.test/nav100"
-                        .to_string(),
-                    identity_source_title: "Example Avionics NAV 100 product page".to_string(),
-                    identity_evidence_text:
-                        "Example Avionics identifies NAV 100 as its exact navigator model."
-                            .to_string(),
-                    grounded_claim_source_urls: Vec::new(),
+                    stable_identifier: Some(StableIdentifier {
+                        kind: "manufacturer_model_number".to_string(),
+                        value: "NAV100".to_string(),
+                    }),
+                    valuation_scope: AvionicsValuationScope::Unit,
+                    suite_components: Vec::new(),
                 }],
             },
         )
         .await
-        .expect_err("new product approval requires a curated exact source origin");
-        assert!(matches!(
-            error,
-            ReviewError::Conflict(message)
-                if message.contains("could not be bound to a current active exact manufacturer source origin")
-        ));
+        .expect("authenticated human admission is source-free");
         let model_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM avionics_models")
             .fetch_one(pool)
             .await
@@ -17933,13 +18588,13 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(model_count_after, model_count_before);
-        assert_eq!(link_count, 0);
-        assert_eq!(review_count, 1);
+        assert_eq!(model_count_after, model_count_before + 1);
+        assert_eq!(link_count, 1);
+        assert_eq!(review_count, 0);
     }
 
     #[tokio::test]
-    async fn existing_identity_cross_collision_persists_alias_without_resolving_listing() {
+    async fn exact_product_tokens_remain_scoped_to_distinct_human_manufacturer_namespaces() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
         let approved_id = insert_approved_product(&db, "GTX 345", "GTX345", "Transponder").await;
@@ -17970,23 +18625,6 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         )
         .await
         .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO aircraft_sale_listing_avionics (
-              aircraft_sale_listing_id, avionics_model_id, source,
-              source_notes, source_confidence, configuration_action
-            ) VALUES (
-              ?, ?, 'listing_review',
-              'Previously corroborated exact Garmin GTX 345 association',
-              'high', 'installed'
-            )
-            "#,
-        )
-        .bind(listing_id)
-        .bind(approved_id)
-        .execute(pool)
-        .await
-        .unwrap();
         let aspect = PendingReviewAspect::avionics(
             "alias-collision",
             "avionics_identity",
@@ -18010,7 +18648,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             .fetch_one(pool)
             .await
             .unwrap();
-        let error = resolve_listing_review(
+        resolve_listing_review(
             &db,
             user_id,
             listing_id,
@@ -18024,73 +18662,49 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                     manufacturer: "Garmin International".to_string(),
                     model: "GTX 345".to_string(),
                     capabilities: vec!["Transponder".to_string()],
-                    manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
-                    manufacturer_identifier: "GTX345".to_string(),
-                    identity_source_url: "https://www.garmin.com/en-US/p/140949/".to_string(),
-                    identity_source_title: "Garmin GTX 345 product page".to_string(),
-                    identity_evidence_text:
-                        "Garmin identifies GTX 345 as the exact manufacturer model number."
-                            .to_string(),
-                    grounded_claim_source_urls: Vec::new(),
+                    stable_identifier: Some(StableIdentifier {
+                        kind: "manufacturer_model_number".to_string(),
+                        value: "GTX345".to_string(),
+                    }),
+                    valuation_scope: AvionicsValuationScope::Unit,
+                    suite_components: Vec::new(),
                 }],
             },
         )
         .await
-        .unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                ReviewError::Conflict(message) if message.contains("human alias review")
-            ),
-            "unexpected resolution error: {error:?}"
+        .expect(
+            "human manufacturer namespaces are not implicitly aliased by shared product tokens",
         );
-
-        let pending_alias: (String, String, i64) = sqlx::query_as(
-            r#"
-            SELECT candidate_basis, review_status, matched_avionics_model_id
-            FROM avionics_manufacturer_alias_candidates
-            WHERE avionics_manufacturer_id = ?
-            "#,
+        let pending_alias_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM avionics_manufacturer_alias_candidates WHERE avionics_manufacturer_id = ?",
         )
         .bind(alternate_manufacturer_id)
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(pending_alias.0, "exact_stable_identifier");
-        assert_eq!(pending_alias.1, "pending");
-        assert_eq!(pending_alias.2, approved_id);
         let model_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM avionics_models")
             .fetch_one(pool)
             .await
             .unwrap();
-        let retained_review: String = sqlx::query_scalar(
-            "SELECT review_payload_sha256 FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
-        )
-        .bind(listing_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        let retained_link_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ? AND avionics_model_id = ?",
+        let created_link_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ? AND avionics_model_id <> ?",
         )
         .bind(listing_id)
         .bind(approved_id)
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(model_count_after, model_count_before);
-        assert_eq!(retained_review, staged.review_payload_sha256);
-        assert_eq!(retained_link_count, 1);
+        assert_eq!(pending_alias_count, 0);
+        assert_eq!(model_count_after, model_count_before + 1);
+        assert_eq!(created_link_count, 1);
     }
 
     #[tokio::test]
-    async fn same_batch_cross_identity_stable_id_collision_stages_alias_atomically() {
+    async fn same_batch_product_tokens_are_scoped_to_exact_manufacturer_identities() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
-        let (alpha_manufacturer_id, alpha_identity_id) =
-            insert_evidence_backed_manufacturer(&db, "Alpha Avionics", "alphaavionics").await;
-        let (beta_manufacturer_id, beta_identity_id) =
-            insert_evidence_backed_manufacturer(&db, "Beta Avionics", "betaavionics").await;
+        insert_evidence_backed_manufacturer(&db, "Alpha Avionics", "alphaavionics").await;
+        insert_evidence_backed_manufacturer(&db, "Beta Avionics", "betaavionics").await;
         let aspects = vec![
             batch_create_aspect("alpha-unit", "Alpha Avionics", "Shared 100"),
             batch_create_aspect("beta-unit", "Beta Avionics", "Shared 100"),
@@ -18098,7 +18712,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         let staged = stage_pending_review(&db, listing_id, None, &aspects)
             .await
             .unwrap();
-        let error = resolve_listing_review(
+        resolve_listing_review(
             &db,
             user_id,
             listing_id,
@@ -18118,37 +18732,13 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             },
         )
         .await
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ReviewError::Conflict(message)
-                if message.contains("cross-manufacturer product collisions")
-                    && message.contains("exact_stable_identifier")
-        ));
-
-        let (expected_source_manufacturer_id, expected_target_identity_id) =
-            if alpha_identity_id > beta_identity_id {
-                (alpha_manufacturer_id, beta_identity_id)
-            } else {
-                (beta_manufacturer_id, alpha_identity_id)
-            };
+        .expect("identical model identifiers from distinct manufacturers are distinct products");
         let pool = sqlite_pool(&db);
-        let candidate: (i64, i64, String, Option<i64>, String) = sqlx::query_as(
-            r#"
-            SELECT avionics_manufacturer_id,
-                   candidate_manufacturer_identity_id,
-                   candidate_basis, matched_avionics_model_id, review_status
-            FROM avionics_manufacturer_alias_candidates
-            "#,
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(candidate.0, expected_source_manufacturer_id);
-        assert_eq!(candidate.1, expected_target_identity_id);
-        assert_eq!(candidate.2, "exact_stable_identifier");
-        assert_eq!(candidate.3, None);
-        assert_eq!(candidate.4, "pending");
+        let candidate_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM avionics_manufacturer_alias_candidates")
+                .fetch_one(pool)
+                .await
+                .unwrap();
         let product_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM avionics_models")
             .fetch_one(pool)
             .await
@@ -18160,20 +18750,13 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .fetch_one(pool)
         .await
         .unwrap();
-        let retained_review: String = sqlx::query_scalar(
-            "SELECT review_payload_sha256 FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
-        )
-        .bind(listing_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(product_count, 0);
-        assert_eq!(link_count, 0);
-        assert_eq!(retained_review, staged.review_payload_sha256);
+        assert_eq!(candidate_count, 0);
+        assert_eq!(product_count, 2);
+        assert_eq!(link_count, 2);
     }
 
     #[tokio::test]
-    async fn same_batch_cross_identity_product_name_collision_stages_alias() {
+    async fn same_model_name_from_distinct_manufacturers_does_not_create_an_alias() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
         insert_evidence_backed_manufacturer(&db, "Alpha Avionics", "alphaavionics").await;
@@ -18189,7 +18772,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         )
         .await
         .unwrap();
-        let error = resolve_listing_review(
+        resolve_listing_review(
             &db,
             user_id,
             listing_id,
@@ -18214,26 +18797,19 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             },
         )
         .await
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ReviewError::Conflict(message)
-                if message.contains("cross-manufacturer product collisions")
-                    && message.contains("exact_product_name")
-        ));
+        .expect("human-reviewed manufacturer namespaces scope model names");
         let pool = sqlite_pool(&db);
-        let basis: String = sqlx::query_scalar(
-            "SELECT candidate_basis FROM avionics_manufacturer_alias_candidates",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(basis, "exact_product_name");
+        let alias_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM avionics_manufacturer_alias_candidates")
+                .fetch_one(pool)
+                .await
+                .unwrap();
         let product_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM avionics_models")
             .fetch_one(pool)
             .await
             .unwrap();
-        assert_eq!(product_count, 0);
+        assert_eq!(alias_count, 0);
+        assert_eq!(product_count, 2);
     }
 
     #[tokio::test]
@@ -18283,7 +18859,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             ReviewError::Conflict(message)
                 if message.contains("same evidence-backed manufacturer identity")
                     && message.contains("first-unit / second-unit")
-                    && message.contains("exact_stable_identifier")
+                    && message.contains("manufacturer identity")
         ));
         let pool = sqlite_pool(&db);
         let alias_count: i64 =
@@ -18435,13 +19011,12 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                 manufacturer: "Garmin".to_string(),
                 model: "GTX 345".to_string(),
                 capabilities: vec!["Transponder".to_string()],
-                manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
-                manufacturer_identifier: "GTX345".to_string(),
-                identity_source_url: "https://www.garmin.com/en-US/p/140949/".to_string(),
-                identity_source_title: "Garmin GTX 345 product page".to_string(),
-                identity_evidence_text: "Garmin identifies GTX 345 as the model number."
-                    .to_string(),
-                grounded_claim_source_urls: Vec::new(),
+                stable_identifier: Some(StableIdentifier {
+                    kind: "manufacturer_model_number".to_string(),
+                    value: "GTX345".to_string(),
+                }),
+                valuation_scope: AvionicsValuationScope::Unit,
+                suite_components: Vec::new(),
             }],
         };
         // Regression for the paid-call ordering bug: this exact immutable
@@ -18672,7 +19247,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .unwrap();
         assert_eq!(
             association,
-            ("listing_review".to_string(), Some("high".to_string()))
+            ("human_review".to_string(), Some("high".to_string()))
         );
     }
 
@@ -18844,7 +19419,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             (
                 corrected_id,
                 3,
-                "listing_review".to_string(),
+                "human_review".to_string(),
                 Some("high".to_string())
             )
         );
@@ -19950,5 +20525,179 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .await
         .unwrap();
         assert_eq!(retained_hash, staged.review_payload_sha256);
+    }
+
+    #[tokio::test]
+    async fn aspect_scoped_human_create_saves_only_one_product_without_source_attestation() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let staged = stage_pending_review(
+            &db,
+            listing_id,
+            None,
+            &[
+                batch_create_aspect("create-one", "BendixKing", "KX 155"),
+                batch_create_aspect("leave-one", "Garmin", "G5"),
+            ],
+        )
+        .await
+        .unwrap();
+        let restaged = create_human_product_for_aspect_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &CreateHumanAvionicsProductRequest {
+                expected_review_payload_sha256: staged.review_payload_sha256,
+                expected_catalog_revision_sha256: staged.catalog_revision_sha256,
+                aspect_id: "create-one".into(),
+                unreviewed_avionics_model_id: None,
+                manufacturer: "BendixKing".to_string(),
+                model: "KX 155".to_string(),
+                capabilities: vec!["NAV".to_string(), "COM".to_string()],
+                stable_identifier: None,
+                valuation_scope: AvionicsValuationScope::Unit,
+                suite_components: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the unrelated aspect remains pending");
+        assert_eq!(restaged.pending_aspect_count, 1);
+
+        let product: (
+            i64,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            r#"
+                SELECT model.id, model.verification_method,
+                       model.verified_by_user_id, model.identity_source_url,
+                       model.identity_source_title, model.identity_evidence_text
+                FROM avionics_models model
+                JOIN avionics_manufacturers manufacturer
+                  ON manufacturer.id = model.avionics_manufacturer_id
+                WHERE model.catalog_status = 'approved'
+                  AND manufacturer.normalized_name = ?
+                  AND model.normalized_name = ?
+                "#,
+        )
+        .bind(normalize_avionics_manufacturer_name("BendixKing"))
+        .bind(normalize_avionics_model_name("KX 155"))
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(product.1, "human");
+        assert_eq!(product.2, user_id);
+        assert_eq!((product.3, product.4, product.5), (None, None, None));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+            )
+            .bind(product.0)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT avionics_model_id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+            )
+            .bind(listing_id)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap(),
+            product.0
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_can_replace_existing_approved_product_suite_structure_atomically() {
+        let db = test_db().await;
+        let (user_id, _) = insert_listing(&db).await;
+        let suite_id = insert_approved_product(&db, "G1000", "G1000", "Flight Display").await;
+        let pfd_id = insert_approved_product(&db, "GDU 1040", "GDU1040", "Flight Display").await;
+        let adc_id = insert_approved_product(&db, "GDC 74A", "GDC74A", "Air Data Computer").await;
+        attest_approved_product_for_current_policy_reuse(&db, suite_id).await;
+        let revision = approved_catalog_revision_sha256(&db).await.unwrap();
+        let suite_revision = update_approved_product_structure(
+            &db,
+            user_id,
+            suite_id,
+            &UpdateAvionicsProductStructureRequest {
+                expected_catalog_revision_sha256: revision.clone(),
+                valuation_scope: AvionicsValuationScope::IntegratedSuite,
+                suite_components: vec![
+                    ReviewSuiteComponent {
+                        avionics_model_id: pfd_id,
+                        quantity: 2,
+                    },
+                    ReviewSuiteComponent {
+                        avionics_model_id: adc_id,
+                        quantity: 1,
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
+        let state: (String, i64, Option<String>) = sqlx::query_as(
+            "SELECT valuation_scope, structure_verified_by_user_id, structure_reviewed_at FROM avionics_models WHERE id = ?",
+        )
+        .bind(suite_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(state.0, "integrated_suite");
+        assert_eq!(state.1, user_id);
+        assert!(state.2.is_some());
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT component_model_id, quantity FROM avionics_suite_components WHERE suite_model_id = ? ORDER BY component_model_id",
+            )
+            .bind(suite_id)
+            .fetch_all(sqlite_pool(&db))
+            .await
+            .unwrap(),
+            vec![(pfd_id, 2), (adc_id, 1)]
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+            )
+            .bind(suite_id)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap(),
+            0
+        );
+        assert_ne!(suite_revision, revision);
+
+        let unit_revision = update_approved_product_structure(
+            &db,
+            user_id,
+            suite_id,
+            &UpdateAvionicsProductStructureRequest {
+                expected_catalog_revision_sha256: suite_revision.clone(),
+                valuation_scope: AvionicsValuationScope::Unit,
+                suite_components: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(unit_revision, suite_revision);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM avionics_suite_components WHERE suite_model_id = ?",
+            )
+            .bind(suite_id)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap(),
+            0
+        );
     }
 }

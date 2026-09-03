@@ -125,7 +125,7 @@ SELECT CASE
       AND (
         contract_version IS NOT 1
         OR contract_fingerprint IS NOT
-          '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819'
+          '63cae87c0bc5081f0018855535d9a9c7ac9e457f7e8972f6d29ccabdb790b1a7'
       )
   ) THEN 0
   WHEN EXISTS (
@@ -139,7 +139,7 @@ SELECT CASE
         ), 256))) FROM (
           SELECT object_key, definition
           FROM reference_catalog_cutover_owned_objects ORDER BY object_key
-        )) <> '0b0c2e65ef87d0fd7a7762948cd09dcef32707687ea55921c30fcaea62f9a3ba'
+        )) <> 'aa69fc0ffa2c9e01e1c565ee7696b384eba70ed22ebe8897d503fc355b69390f'
   ) THEN 0
   WHEN NOT EXISTS (
     SELECT 1 FROM schema_migration_contracts
@@ -152,7 +152,7 @@ SELECT CASE
         ), 256))) FROM (
           SELECT object_key, definition
           FROM reference_catalog_cutover_owned_objects ORDER BY object_key
-        )) <> '2e4f2cb9ab443550681d24447d23395bb52c0c51b6b87ca02556c630c0c2313c'
+        )) <> 'c9f2f6020b5da0b65fc2bfbf20c1995563e3de280e7267ef0c0f6fbdfa997961'
     OR EXISTS (
       SELECT 1 FROM listing_verification_run_items
       WHERE status = 'pending_reference'
@@ -1124,7 +1124,7 @@ SELECT CASE WHEN
       ), 256))) FROM (
         SELECT object_key, definition
         FROM reference_catalog_cutover_post_objects ORDER BY object_key
-      )) <> '0b0c2e65ef87d0fd7a7762948cd09dcef32707687ea55921c30fcaea62f9a3ba'
+      )) <> 'aa69fc0ffa2c9e01e1c565ee7696b384eba70ed22ebe8897d503fc355b69390f'
   OR EXISTS (
     SELECT 1 FROM sqlite_schema
     WHERE name IN (
@@ -1153,7 +1153,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819', CURRENT_TIMESTAMP
+  '63cae87c0bc5081f0018855535d9a9c7ac9e457f7e8972f6d29ccabdb790b1a7', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 

@@ -815,7 +815,7 @@ fn preserved_link_is_eligible(link: &ExistingLinkRow) -> bool {
         && link.source_confidence.as_deref() == Some("high")
         && matches!(
             link.source.as_str(),
-            "listing" | "listing_explicit_count" | "listing_review"
+            "listing" | "listing_explicit_count" | "listing_review" | "human_review"
         )
         && link.installed_catalog_status.as_deref() == Some("approved")
         && match link.configuration_action.as_str() {
@@ -838,6 +838,12 @@ fn validate_preserved_link_authorizations(
     catalog_product_fingerprints: &HashMap<i64, String>,
     active_collision_catalog_rows: &[ActiveCollisionCatalogFingerprintRow],
 ) -> ReviewResult<()> {
+    // An authenticated reviewer owns this exact association decision. It is
+    // deliberately independent of the mutable automated product-reuse and
+    // capture-bound authorization records.
+    if link.source == "human_review" {
+        return Ok(());
+    }
     if link.source == "listing_explicit_count" {
         let exact_reuse_is_current = current_manufacturer_reuse_authorization(
             listing_id,
@@ -2532,11 +2538,13 @@ mod tests {
         .await
         .unwrap();
         if approved {
-            sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
-                .bind(model_id)
-                .execute(pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated' WHERE id = ?",
+            )
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
             let mut transaction = pool.begin().await.unwrap();
             assert!(
                 refresh_reuse_attestation_sqlite(
@@ -2615,7 +2623,7 @@ mod tests {
             r#"
             UPDATE avionics_models
             SET manufacturer_identifier_kind = 'manufacturer_part_number',
-                catalog_status = 'approved'
+                catalog_status = 'approved', verification_method = 'automated'
             WHERE id = ?
             "#,
         )
@@ -3218,6 +3226,77 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(usage_count, 0);
+    }
+
+    #[tokio::test]
+    async fn automatic_apply_preserves_a_disjoint_human_review_link_without_machine_authority() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "GNS 430W", "GNS430W", true).await;
+        let pool = pool(&fixture.db);
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'human_review', NULL, 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            unrelated_preserved_avionics_blocker(
+                &fixture.db,
+                fixture.listing_id,
+                &BTreeSet::new(),
+            )
+            .await
+            .unwrap(),
+            None,
+            "human review is the authority for this exact association",
+        );
+        let residual = pending_aspect("residual:after-human-review", "Unknown audio panel");
+        let result = apply_automated_avionics_review(
+            &fixture.db,
+            &request(&fixture, Vec::new(), vec![residual]),
+        )
+        .await
+        .expect("automatic work on other aspects must preserve a human decision");
+        assert_eq!(
+            (result.accepted_link_count, result.preserved_link_count),
+            (0, 1)
+        );
+
+        let stored: (i64, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT link.id, link.source, link.source_notes
+            FROM aircraft_sale_listing_avionics link
+            WHERE link.aircraft_sale_listing_id = ? AND link.avionics_model_id = ?
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, (link_id, "human_review".to_string(), None));
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(authorization_count, 0);
     }
 
     #[tokio::test]

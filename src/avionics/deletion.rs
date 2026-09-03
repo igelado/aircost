@@ -1010,6 +1010,7 @@ mod tests {
             r#"
             UPDATE avionics_models
             SET catalog_status = 'approved',
+                verification_method = 'automated',
                 catalog_reviewed_at = CURRENT_TIMESTAMP
             WHERE id = ?
             "#,

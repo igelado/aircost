@@ -34,7 +34,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 1
         OR contract_fingerprint IS DISTINCT FROM
-          '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819'
+          '63cae87c0bc5081f0018855535d9a9c7ac9e457f7e8972f6d29ccabdb790b1a7'
       )
   ) THEN
     RAISE EXCEPTION 'reference catalog cutover contract marker mismatch';
@@ -282,8 +282,8 @@ BEGIN
     ))
     INTO actual_object_count, actual_definition_digest
     FROM pg_temp.reference_catalog_schema_owned_objects;
-    IF actual_object_count <> 804
-       OR actual_definition_digest <> 'ba236136f4f31173a4a5d71c8d8a5be5' THEN
+    IF actual_object_count <> 813
+       OR actual_definition_digest <> '2398147ef3fa8ed8e4825690b2c47e60' THEN
       RAISE EXCEPTION
         'reference catalog canonical schema owned-object mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
@@ -569,14 +569,44 @@ CREATE TABLE IF NOT EXISTS avionics_manufacturer_identities (
   canonical_name TEXT NOT NULL CHECK (BTRIM(canonical_name) <> ''),
   normalized_identity_key TEXT NOT NULL UNIQUE
     CHECK (normalized_identity_key ~ '^[a-z0-9]+$'),
-  identity_evidence_kind TEXT NOT NULL
-    CHECK (identity_evidence_kind = 'authoritative_reference'),
-  identity_source_url TEXT NOT NULL CHECK (BTRIM(identity_source_url) <> ''),
-  identity_source_title TEXT NOT NULL CHECK (BTRIM(identity_source_title) <> ''),
-  identity_evidence_text TEXT NOT NULL CHECK (BTRIM(identity_evidence_text) <> ''),
-  identity_confidence TEXT NOT NULL CHECK (identity_confidence = 'very_high'),
+  verification_method TEXT NOT NULL
+    CHECK (verification_method IN ('automated', 'human')),
+  verified_by_user_id BIGINT REFERENCES users(id) ON DELETE RESTRICT,
+  identity_evidence_kind TEXT
+    CHECK (
+      identity_evidence_kind IS NULL
+      OR identity_evidence_kind = 'authoritative_reference'
+    ),
+  identity_source_url TEXT,
+  identity_source_title TEXT,
+  identity_evidence_text TEXT,
+  identity_confidence TEXT
+    CHECK (identity_confidence IS NULL OR identity_confidence = 'very_high'),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CHECK (LOWER(identity_source_url) LIKE 'https://%')
+  CHECK (
+    (
+      verification_method = 'automated'
+      AND verified_by_user_id IS NULL
+      AND identity_evidence_kind = 'authoritative_reference'
+      AND identity_confidence = 'very_high'
+      AND identity_source_url IS NOT NULL
+      AND BTRIM(identity_source_url) <> ''
+      AND LOWER(identity_source_url) LIKE 'https://%'
+      AND identity_source_title IS NOT NULL
+      AND BTRIM(identity_source_title) <> ''
+      AND identity_evidence_text IS NOT NULL
+      AND BTRIM(identity_evidence_text) <> ''
+    )
+    OR (
+      verification_method = 'human'
+      AND verified_by_user_id IS NOT NULL
+      AND identity_evidence_kind IS NULL
+      AND identity_confidence IS NULL
+      AND identity_source_url IS NULL
+      AND identity_source_title IS NULL
+      AND identity_evidence_text IS NULL
+    )
+  )
 );
 
 -- An authority row grants only one exact HTTPS origin. It does not grant a
@@ -772,10 +802,36 @@ CREATE TABLE IF NOT EXISTS avionics_manufacturer_identity_memberships (
   )),
   normalized_name_key TEXT NOT NULL
     CHECK (normalized_name_key ~ '^[a-z0-9]+$'),
-  evidence_source_url TEXT NOT NULL CHECK (BTRIM(evidence_source_url) <> ''),
-  evidence_source_title TEXT NOT NULL CHECK (BTRIM(evidence_source_title) <> ''),
-  evidence_text TEXT NOT NULL CHECK (BTRIM(evidence_text) <> ''),
-  evidence_confidence TEXT NOT NULL CHECK (evidence_confidence = 'very_high'),
+  verification_method TEXT NOT NULL
+    CHECK (verification_method IN ('automated', 'human')),
+  verified_by_user_id BIGINT REFERENCES users(id) ON DELETE RESTRICT,
+  evidence_source_url TEXT,
+  evidence_source_title TEXT,
+  evidence_text TEXT,
+  evidence_confidence TEXT
+    CHECK (evidence_confidence IS NULL OR evidence_confidence = 'very_high'),
+  CHECK (
+    (
+      verification_method = 'automated'
+      AND verified_by_user_id IS NULL
+      AND evidence_source_url IS NOT NULL
+      AND BTRIM(evidence_source_url) <> ''
+      AND evidence_source_title IS NOT NULL
+      AND BTRIM(evidence_source_title) <> ''
+      AND evidence_text IS NOT NULL
+      AND BTRIM(evidence_text) <> ''
+      AND evidence_confidence = 'very_high'
+    )
+    OR (
+      verification_method = 'human'
+      AND verified_by_user_id IS NOT NULL
+      AND membership_basis = 'deterministic_exact'
+      AND evidence_source_url IS NULL
+      AND evidence_source_title IS NULL
+      AND evidence_text IS NULL
+      AND evidence_confidence IS NULL
+    )
+  ),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -821,15 +877,24 @@ BEGIN
       AND normalization.stored_name_key
         = manufacturer_key.canonical_manufacturer_key
       AND (
-        NEW.membership_basis = 'authoritative_alias'
+        (
+          NEW.verification_method = 'automated'
+          AND NEW.membership_basis = 'authoritative_alias'
+        )
         OR (
           NEW.normalized_name_key = identity.normalized_identity_key
           AND (
-            NEW.membership_basis = 'authoritative_primary'
+            (
+              NEW.verification_method = 'automated'
+              AND NEW.membership_basis = 'authoritative_primary'
+            )
             OR (
               NEW.membership_basis = 'deterministic_exact'
-              AND NEW.evidence_source_url =
-                'urn:aircost:deterministic:avionics-manufacturer-normalization:v1'
+              AND (
+                NEW.verification_method = 'human'
+                OR NEW.evidence_source_url =
+                  'urn:aircost:deterministic:avionics-manufacturer-normalization:v1'
+              )
             )
           )
         )
@@ -904,6 +969,12 @@ CREATE TABLE IF NOT EXISTS avionics_models (
   normalized_name TEXT NOT NULL,
   catalog_status TEXT NOT NULL DEFAULT 'unreviewed'
     CHECK (catalog_status IN ('unreviewed', 'approved', 'rejected')),
+  verification_method TEXT
+    CHECK (
+      verification_method IS NULL
+      OR verification_method IN ('automated', 'human')
+    ),
+  verified_by_user_id BIGINT REFERENCES users(id) ON DELETE RESTRICT,
   manufacturer_identifier_kind TEXT
     CHECK (
       manufacturer_identifier_kind IS NULL
@@ -931,6 +1002,8 @@ CREATE TABLE IF NOT EXISTS avionics_models (
   value_source TEXT,
   valuation_scope TEXT NOT NULL DEFAULT 'unit'
     CHECK (valuation_scope IN ('unit', 'integrated_suite')),
+  structure_verified_by_user_id BIGINT REFERENCES users(id) ON DELETE RESTRICT,
+  structure_reviewed_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CHECK (
@@ -950,6 +1023,17 @@ CREATE TABLE IF NOT EXISTS avionics_models (
   CHECK (
     catalog_status = 'unreviewed'
     OR (catalog_reviewed_at IS NOT NULL AND BTRIM(catalog_reviewed_at) <> '')
+  ),
+  CHECK (
+    (
+      catalog_status = 'approved'
+      AND verification_method IS NOT NULL
+    )
+    OR (
+      catalog_status <> 'approved'
+      AND verification_method IS NULL
+      AND verified_by_user_id IS NULL
+    )
   ),
   CHECK (
     catalog_status <> 'approved'
@@ -972,20 +1056,42 @@ CREATE TABLE IF NOT EXISTS avionics_models (
       AND BTRIM(manufacturer_identifier) <> ''
       AND normalized_manufacturer_identifier IS NOT NULL
       AND BTRIM(normalized_manufacturer_identifier) <> ''
-      AND identity_source_url IS NOT NULL
-      AND BTRIM(identity_source_url) <> ''
-      AND identity_source_title IS NOT NULL
-      AND BTRIM(identity_source_title) <> ''
-      AND identity_evidence_text IS NOT NULL
-      AND BTRIM(identity_evidence_text) <> ''
-      AND identity_evidence_kind = 'authoritative_reference'
-      AND identity_confidence = 'very_high'
       AND catalog_reviewed_at IS NOT NULL
       AND BTRIM(catalog_reviewed_at) <> ''
-      AND LOWER(identity_source_url) NOT LIKE '%/listing/%'
-      AND LOWER(identity_source_url) NOT LIKE '%/listings/%'
-      AND LOWER(identity_source_url) NOT LIKE '%/aircraft-for-sale/%'
-      AND LOWER(identity_source_url) NOT LIKE '%/classifieds/%'
+      AND (
+        (
+          verification_method = 'automated'
+          AND verified_by_user_id IS NULL
+          AND identity_source_url IS NOT NULL
+          AND BTRIM(identity_source_url) <> ''
+          AND identity_source_title IS NOT NULL
+          AND BTRIM(identity_source_title) <> ''
+          AND identity_evidence_text IS NOT NULL
+          AND BTRIM(identity_evidence_text) <> ''
+          AND identity_evidence_kind = 'authoritative_reference'
+          AND identity_confidence = 'very_high'
+          AND LOWER(identity_source_url) NOT LIKE '%/listing/%'
+          AND LOWER(identity_source_url) NOT LIKE '%/listings/%'
+          AND LOWER(identity_source_url) NOT LIKE '%/aircraft-for-sale/%'
+          AND LOWER(identity_source_url) NOT LIKE '%/classifieds/%'
+        )
+        OR (
+          verification_method = 'human'
+          AND verified_by_user_id IS NOT NULL
+        )
+      )
+    )
+  ),
+  CHECK (
+    (
+      structure_verified_by_user_id IS NULL
+      AND structure_reviewed_at IS NULL
+    )
+    OR (
+      catalog_status = 'approved'
+      AND structure_verified_by_user_id IS NOT NULL
+      AND structure_reviewed_at IS NOT NULL
+      AND BTRIM(structure_reviewed_at) <> ''
     )
   ),
   CHECK (
@@ -2662,6 +2768,8 @@ AS $function$
 BEGIN
   IF OLD.catalog_status = 'approved' AND (
     NEW.catalog_status IS DISTINCT FROM OLD.catalog_status
+    OR NEW.verification_method IS DISTINCT FROM OLD.verification_method
+    OR NEW.verified_by_user_id IS DISTINCT FROM OLD.verified_by_user_id
     OR NEW.avionics_manufacturer_id IS DISTINCT FROM OLD.avionics_manufacturer_id
     OR NEW.name IS DISTINCT FROM OLD.name
     OR NEW.normalized_name IS DISTINCT FROM OLD.normalized_name
@@ -2669,9 +2777,18 @@ BEGIN
     OR NEW.manufacturer_identifier IS DISTINCT FROM OLD.manufacturer_identifier
     OR NEW.normalized_manufacturer_identifier
       IS DISTINCT FROM OLD.normalized_manufacturer_identifier
+    OR (
+      NEW.structure_reviewed_at IS NOT NULL
+      AND NEW.valuation_scope = 'integrated_suite'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM avionics_suite_components suite_link
+        WHERE suite_link.suite_model_id = OLD.id
+      )
+    )
   ) THEN
     RAISE EXCEPTION
-      'approved avionics product cannot be demoted or rewrite canonical identity';
+      'approved avionics product identity, verification provenance, and reviewed suite structure are protected';
   END IF;
   RETURN NEW;
 END;
@@ -2823,7 +2940,9 @@ BEGIN
     IF NEW.suite_model_id IS DISTINCT FROM OLD.suite_model_id
        AND NOT EXISTS (
          SELECT 1 FROM avionics_models model
-         WHERE model.id = NEW.suite_model_id AND model.catalog_status = 'approved'
+         WHERE model.id = NEW.suite_model_id
+           AND model.catalog_status = 'approved'
+           AND model.valuation_scope = 'integrated_suite'
        )
        AND NOT EXISTS (
          SELECT 1
@@ -2840,7 +2959,9 @@ BEGIN
     IF NEW.component_model_id IS DISTINCT FROM OLD.component_model_id
        AND NOT EXISTS (
          SELECT 1 FROM avionics_models model
-         WHERE model.id = NEW.component_model_id AND model.catalog_status = 'approved'
+         WHERE model.id = NEW.component_model_id
+           AND model.catalog_status = 'approved'
+           AND model.valuation_scope = 'unit'
        )
        AND NOT EXISTS (
          SELECT 1
@@ -2852,16 +2973,20 @@ BEGIN
            AND survivor.catalog_status = 'unreviewed'
            AND legacy.catalog_status = 'unreviewed'
        ) THEN
-      RAISE EXCEPTION 'avionics suite membership requires an approved component catalog entry';
+      RAISE EXCEPTION 'avionics suite membership requires an approved unit component catalog entry';
     END IF;
   ELSIF NOT EXISTS (
     SELECT 1 FROM avionics_models model
-    WHERE model.id = NEW.suite_model_id AND model.catalog_status = 'approved'
+    WHERE model.id = NEW.suite_model_id
+      AND model.catalog_status = 'approved'
+      AND model.valuation_scope = 'integrated_suite'
   ) OR NOT EXISTS (
     SELECT 1 FROM avionics_models model
-    WHERE model.id = NEW.component_model_id AND model.catalog_status = 'approved'
+    WHERE model.id = NEW.component_model_id
+      AND model.catalog_status = 'approved'
+      AND model.valuation_scope = 'unit'
   ) THEN
-    RAISE EXCEPTION 'avionics suite membership requires approved catalog entries';
+    RAISE EXCEPTION 'avionics suite membership requires an approved integrated suite and approved unit component';
   END IF;
   RETURN NEW;
 END;
@@ -5016,7 +5141,7 @@ BEGIN
           link.quantity <= 0
           OR link.source_confidence IS DISTINCT FROM 'high'
           OR link.source NOT IN (
-            'listing', 'listing_explicit_count', 'listing_review'
+            'listing', 'listing_explicit_count', 'listing_review', 'human_review'
           )
         )
     )
@@ -10966,8 +11091,8 @@ BEGIN
   ))
   INTO actual_object_count, actual_definition_digest
   FROM pg_temp.reference_catalog_schema_owned_objects;
-  IF actual_object_count <> 804
-     OR actual_definition_digest <> 'ba236136f4f31173a4a5d71c8d8a5be5' THEN
+  IF actual_object_count <> 813
+     OR actual_definition_digest <> '2398147ef3fa8ed8e4825690b2c47e60' THEN
     RAISE EXCEPTION
       'reference catalog canonical schema post-state mismatch (% objects, digest %)',
       actual_object_count, actual_definition_digest;
@@ -11012,7 +11137,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819',
+  '63cae87c0bc5081f0018855535d9a9c7ac9e457f7e8972f6d29ccabdb790b1a7',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

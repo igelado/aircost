@@ -4069,6 +4069,8 @@ mod tests {
         sqlx::query(
             r#"UPDATE avionics_models
                SET catalog_status = 'approved',
+                   verification_method = 'automated',
+                   verified_by_user_id = NULL,
                    manufacturer_identifier_kind = 'manufacturer_part_number',
                    manufacturer_identifier = 'TEST-GTX-345R',
                    normalized_manufacturer_identifier = 'testgtx345r',

@@ -291,7 +291,7 @@ pub(crate) async fn approve_replacement_products_and_restage(
         UPDATE aircraft_sale_listing_avionics
         SET avionics_model_id = ?,
             quantity = ?,
-            source = 'listing_review',
+            source = 'human_review',
             source_notes = ?,
             source_confidence = 'high',
             configuration_action = 'replaces',
@@ -316,7 +316,7 @@ pub(crate) async fn approve_replacement_products_and_restage(
           source_confidence,
           configuration_action,
           replaces_avionics_model_id
-        ) VALUES (?, ?, ?, 'listing_review', ?, 'high', 'replaces', ?)
+        ) VALUES (?, ?, ?, 'human_review', ?, 'high', 'replaces', ?)
         RETURNING id
         "#,
     );
@@ -414,8 +414,7 @@ pub(crate) async fn approve_replacement_products_and_restage(
                 .fetch_all(&mut *transaction)
                 .await?;
             let catalog_products = catalog_products(catalog_rows);
-            let catalog_product_fingerprints =
-                catalog_product_fingerprints(&catalog_products);
+            let catalog_product_fingerprints = catalog_product_fingerprints(&catalog_products);
             let catalog_revision_sha256 = fingerprint_catalog_products(&catalog_products);
             if catalog_revision_sha256 != request.catalog_revision_sha256
                 || catalog_revision_sha256 != row.catalog_revision_sha256
@@ -429,15 +428,10 @@ pub(crate) async fn approve_replacement_products_and_restage(
                 .fetch_all(&mut *transaction)
                 .await?;
             let approved = approved_product_map(approved_rows);
-            for selected_id in [
-                request.parent.product_id,
-                request.child.product_id,
-            ] {
-                if !approved.contains_key(&selected_id)
-                    || !$reuse_attestation_is_current(db, &mut transaction, selected_id).await?
-                {
+            for selected_id in [request.parent.product_id, request.child.product_id] {
+                if !approved.contains_key(&selected_id) {
                     return Err(ReviewError::Conflict(format!(
-                        "avionics catalog id {selected_id} is not an approved current-policy reusable product"
+                        "avionics catalog id {selected_id} is not a complete approved product"
                     )));
                 }
             }
@@ -451,37 +445,36 @@ pub(crate) async fn approve_replacement_products_and_restage(
                     .expect("covered relationship was validated against current assignments")
                     .clone()
             });
-            let proposed_assignment_index =
-                if let Some(listing_link_id) = plan.covered_link_id {
-                    assignments
-                        .iter()
-                        .position(|assignment| assignment.listing_link_id == listing_link_id)
-                        .expect("covered relationship was validated against current assignments")
-                } else {
-                    let parent_product = approved
-                        .get(&request.parent.product_id)
-                        .expect("approved parent product was loaded under lock");
-                    let child_product = approved
-                        .get(&request.child.product_id)
-                        .expect("approved child product was loaded under lock");
-                    assignments.push(ExistingAssignmentRow {
-                        listing_link_id: -1,
-                        avionics_model_id: request.parent.product_id,
-                        installed_manufacturer: Some(parent_product.manufacturer.clone()),
-                        installed_model: Some(parent_product.model.clone()),
-                        replacement_manufacturer: Some(child_product.manufacturer.clone()),
-                        replacement_model: Some(child_product.model.clone()),
-                        quantity: request.parent.quantity,
-                        source: "listing_review".to_string(),
-                        source_notes: parent.source_evidence_text.clone(),
-                        source_confidence: Some("high".to_string()),
-                        configuration_action: "replaces".to_string(),
-                        replaces_avionics_model_id: Some(request.child.product_id),
-                        installed_catalog_status: Some("approved".to_string()),
-                        replacement_catalog_status: Some("approved".to_string()),
-                    });
-                    assignments.len() - 1
-                };
+            let proposed_assignment_index = if let Some(listing_link_id) = plan.covered_link_id {
+                assignments
+                    .iter()
+                    .position(|assignment| assignment.listing_link_id == listing_link_id)
+                    .expect("covered relationship was validated against current assignments")
+            } else {
+                let parent_product = approved
+                    .get(&request.parent.product_id)
+                    .expect("approved parent product was loaded under lock");
+                let child_product = approved
+                    .get(&request.child.product_id)
+                    .expect("approved child product was loaded under lock");
+                assignments.push(ExistingAssignmentRow {
+                    listing_link_id: -1,
+                    avionics_model_id: request.parent.product_id,
+                    installed_manufacturer: Some(parent_product.manufacturer.clone()),
+                    installed_model: Some(parent_product.model.clone()),
+                    replacement_manufacturer: Some(child_product.manufacturer.clone()),
+                    replacement_model: Some(child_product.model.clone()),
+                    quantity: request.parent.quantity,
+                    source: "human_review".to_string(),
+                    source_notes: parent.source_evidence_text.clone(),
+                    source_confidence: Some("high".to_string()),
+                    configuration_action: "replaces".to_string(),
+                    replaces_avionics_model_id: Some(request.child.product_id),
+                    installed_catalog_status: Some("approved".to_string()),
+                    replacement_catalog_status: Some("approved".to_string()),
+                });
+                assignments.len() - 1
+            };
             {
                 let proposed = &mut assignments[proposed_assignment_index];
                 let parent_product = approved
@@ -496,7 +489,7 @@ pub(crate) async fn approve_replacement_products_and_restage(
                 proposed.replacement_manufacturer = Some(child_product.manufacturer.clone());
                 proposed.replacement_model = Some(child_product.model.clone());
                 proposed.quantity = request.parent.quantity;
-                proposed.source = "listing_review".to_string();
+                proposed.source = "human_review".to_string();
                 proposed.source_notes = parent.source_evidence_text.clone();
                 proposed.source_confidence = Some("high".to_string());
                 proposed.configuration_action = "replaces".to_string();
@@ -557,22 +550,21 @@ pub(crate) async fn approve_replacement_products_and_restage(
                 payload.aspects = validated_aspects(&payload.aspects)?;
             }
 
-            let attested_product_ids =
-                sqlx::query_scalar::<_, i64>(&attested_product_ids_sql)
-                    .fetch_all(&mut *transaction)
-                    .await?;
+            let attested_product_ids = sqlx::query_scalar::<_, i64>(&attested_product_ids_sql)
+                .fetch_all(&mut *transaction)
+                .await?;
             let mut reuse_attested_ids = HashSet::new();
             for avionics_model_id in attested_product_ids {
                 if $reuse_attestation_is_current(db, &mut transaction, avionics_model_id).await? {
                     reuse_attested_ids.insert(avionics_model_id);
                 }
             }
-            let active_collision_catalog_rows =
-                sqlx::query_as::<_, ActiveCollisionCatalogFingerprintRow>(
-                    &active_collision_catalog_sql,
-                )
-                .fetch_all(&mut *transaction)
-                .await?;
+            let active_collision_catalog_rows = sqlx::query_as::<
+                _,
+                ActiveCollisionCatalogFingerprintRow,
+            >(&active_collision_catalog_sql)
+            .fetch_all(&mut *transaction)
+            .await?;
             let corroboration_rows =
                 sqlx::query_as::<_, AssociationAuthorizationRow>(&corroborations_sql)
                     .bind(listing_id)
@@ -605,10 +597,7 @@ pub(crate) async fn approve_replacement_products_and_restage(
                 ));
             }
 
-            remove_authorized_preserved_aspects(
-                &mut payload.aspects,
-                &authorized_associations,
-            )?;
+            remove_authorized_preserved_aspects(&mut payload.aspects, &authorized_associations)?;
             add_unauthorized_preserved_aspects(
                 &mut payload.aspects,
                 &assignments,
@@ -616,11 +605,8 @@ pub(crate) async fn approve_replacement_products_and_restage(
                 &authorized_associations,
             )?;
             validate_current_covered_associations(&payload.aspects, &assignments)?;
-            let hidden_blockers = hidden_preserved_blockers(
-                &payload.aspects,
-                &assignments,
-                &authorized_associations,
-            );
+            let hidden_blockers =
+                hidden_preserved_blockers(&payload.aspects, &assignments, &authorized_associations);
             if !hidden_blockers.is_empty() {
                 return Err(ReviewError::Conflict(format!(
                     "preserved avionics cannot be represented by the current review: {}",

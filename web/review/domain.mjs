@@ -53,6 +53,78 @@ export function useExistingProductRequest(
   };
 }
 
+export function createHumanVerifiedProductRequest(
+  reviewPayloadSha256,
+  catalogRevisionSha256,
+  aspectId,
+  product,
+) {
+  const request = {
+    review_payload_sha256: reviewPayloadSha256,
+    catalog_revision_sha256: catalogRevisionSha256,
+    aspect_id: aspectId,
+    manufacturer: String(product?.manufacturer ?? "").trim(),
+    model: String(product?.model ?? "").trim(),
+    capabilities: Array.isArray(product?.capabilities)
+      ? product.capabilities.map((value) => String(value).trim()).filter(Boolean)
+      : [],
+    valuation_scope: product?.valuationScope === "integrated_suite"
+      ? "integrated_suite"
+      : "unit",
+    suite_components: product?.valuationScope === "integrated_suite"
+      && Array.isArray(product?.suiteComponents)
+      ? product.suiteComponents.map((component) => ({
+        avionics_model_id: component.avionicsModelId,
+        quantity: component.quantity,
+      }))
+      : [],
+  };
+  if (Number.isSafeInteger(product?.unreviewedAvionicsModelId)
+    && product.unreviewedAvionicsModelId > 0
+    && product?.promoteCandidate === true) {
+    request.unreviewed_avionics_model_id = product.unreviewedAvionicsModelId;
+  }
+  const identifierKind = String(product?.stableIdentifierKind ?? "").trim();
+  const identifierValue = String(product?.stableIdentifierValue ?? "").trim();
+  if (identifierKind && identifierValue) {
+    request.stable_identifier = {
+      kind: identifierKind,
+      value: identifierValue,
+    };
+  }
+  return request;
+}
+
+export function canSaveHumanProductIndividually(aspect, aspects = [], action) {
+  if (
+    !aspect
+    || typeof aspect !== "object"
+    || !["use_verified_product", "create_verified_product"].includes(action)
+    || !Array.isArray(aspect.allowed_actions)
+    || !aspect.allowed_actions.includes(action)
+    || typeof aspect.kind !== "string"
+    || !aspect.kind.startsWith("avionics")
+    || aspect.kind === "avionics_reuse_attestation"
+    || !/^avionics:\d+:primary$/.test(String(aspect.id ?? ""))
+    || aspect.configuration_action !== "installed"
+    || !Number.isSafeInteger(aspect.quantity)
+    || aspect.quantity <= 0
+    || aspect.replacement_aspect_id !== null
+      && aspect.replacement_aspect_id !== undefined
+    || aspect.replacement_product !== null
+      && aspect.replacement_product !== undefined
+  ) {
+    return false;
+  }
+  const aspectId = String(aspect.id);
+  return !aspects.some((candidate) => (
+    candidate !== aspect
+    && candidate?.replacement_aspect_id !== null
+    && candidate?.replacement_aspect_id !== undefined
+    && String(candidate.replacement_aspect_id) === aspectId
+  ));
+}
+
 export function discardAvionicsObservationRequest(
   reviewPayloadSha256,
   aspectId,

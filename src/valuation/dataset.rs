@@ -858,7 +858,7 @@ async fn load_equipment(db: &AppDb) -> Result<LoadedEquipment, ValuationError> {
         JOIN avionics_manufacturers manufacturer
           ON manufacturer.id = model.avionics_manufacturer_id
         WHERE link.source IN (
-            'listing', 'listing_explicit_count', 'listing_review'
+            'listing', 'listing_explicit_count', 'listing_review', 'human_review'
           )
           AND link.configuration_action IN ('installed', 'replaces')
           AND link.source_confidence = 'high'
@@ -2029,7 +2029,9 @@ mod tests {
         ensure_test_manufacturer_identity(&db, manufacturer_id)
             .await
             .unwrap();
-        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+        sqlx::query(
+            "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated', verified_by_user_id = NULL WHERE id = ?",
+        )
             .bind(model_id)
             .execute(pool)
             .await
@@ -2377,7 +2379,9 @@ mod tests {
         ensure_test_manufacturer_identity(&db, manufacturer_id)
             .await
             .unwrap();
-        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+        sqlx::query(
+            "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated', verified_by_user_id = NULL WHERE id = ?",
+        )
             .bind(approved_id)
             .execute(pool)
             .await
