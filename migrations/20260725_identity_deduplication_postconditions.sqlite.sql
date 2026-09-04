@@ -202,21 +202,48 @@ CREATE TABLE IF NOT EXISTS avionics_manufacturer_identities (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   canonical_name TEXT NOT NULL,
   normalized_identity_key TEXT NOT NULL UNIQUE,
-  identity_evidence_kind TEXT NOT NULL
-    CHECK (identity_evidence_kind = 'authoritative_reference'),
-  identity_source_url TEXT NOT NULL,
-  identity_source_title TEXT NOT NULL,
-  identity_evidence_text TEXT NOT NULL,
-  identity_confidence TEXT NOT NULL CHECK (identity_confidence = 'very_high'),
+  verification_method TEXT NOT NULL
+    CHECK (verification_method IN ('automated', 'human')),
+  verified_by_user_id INTEGER REFERENCES users(id) ON DELETE RESTRICT,
+  identity_evidence_kind TEXT
+    CHECK (
+      identity_evidence_kind IS NULL
+      OR identity_evidence_kind = 'authoritative_reference'
+    ),
+  identity_source_url TEXT,
+  identity_source_title TEXT,
+  identity_evidence_text TEXT,
+  identity_confidence TEXT
+    CHECK (identity_confidence IS NULL OR identity_confidence = 'very_high'),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CHECK (length(trim(canonical_name)) > 0),
   CHECK (length(normalized_identity_key) > 0),
   CHECK (normalized_identity_key = lower(normalized_identity_key)),
   CHECK (normalized_identity_key NOT GLOB '*[^a-z0-9]*'),
-  CHECK (length(trim(identity_source_url)) > 0),
-  CHECK (length(trim(identity_source_title)) > 0),
-  CHECK (length(trim(identity_evidence_text)) > 0),
-  CHECK (lower(identity_source_url) LIKE 'https://%')
+  CHECK (
+    (
+      verification_method = 'automated'
+      AND verified_by_user_id IS NULL
+      AND identity_evidence_kind = 'authoritative_reference'
+      AND identity_confidence = 'very_high'
+      AND identity_source_url IS NOT NULL
+      AND length(trim(identity_source_url)) > 0
+      AND lower(identity_source_url) LIKE 'https://%'
+      AND identity_source_title IS NOT NULL
+      AND length(trim(identity_source_title)) > 0
+      AND identity_evidence_text IS NOT NULL
+      AND length(trim(identity_evidence_text)) > 0
+    )
+    OR (
+      verification_method = 'human'
+      AND verified_by_user_id IS NOT NULL
+      AND identity_evidence_kind IS NULL
+      AND identity_confidence IS NULL
+      AND identity_source_url IS NULL
+      AND identity_source_title IS NULL
+      AND identity_evidence_text IS NULL
+    )
+  )
 );
 
 CREATE TABLE IF NOT EXISTS avionics_manufacturer_identity_memberships (
@@ -228,17 +255,40 @@ CREATE TABLE IF NOT EXISTS avionics_manufacturer_identity_memberships (
     'deterministic_exact', 'authoritative_primary', 'authoritative_alias'
   )),
   normalized_name_key TEXT NOT NULL,
-  evidence_source_url TEXT NOT NULL,
-  evidence_source_title TEXT NOT NULL,
-  evidence_text TEXT NOT NULL,
-  evidence_confidence TEXT NOT NULL CHECK (evidence_confidence = 'very_high'),
+  verification_method TEXT NOT NULL
+    CHECK (verification_method IN ('automated', 'human')),
+  verified_by_user_id INTEGER REFERENCES users(id) ON DELETE RESTRICT,
+  evidence_source_url TEXT,
+  evidence_source_title TEXT,
+  evidence_text TEXT,
+  evidence_confidence TEXT
+    CHECK (evidence_confidence IS NULL OR evidence_confidence = 'very_high'),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CHECK (length(normalized_name_key) > 0),
   CHECK (normalized_name_key = lower(normalized_name_key)),
   CHECK (normalized_name_key NOT GLOB '*[^a-z0-9]*'),
-  CHECK (length(trim(evidence_source_url)) > 0),
-  CHECK (length(trim(evidence_source_title)) > 0),
-  CHECK (length(trim(evidence_text)) > 0)
+  CHECK (
+    (
+      verification_method = 'automated'
+      AND verified_by_user_id IS NULL
+      AND evidence_source_url IS NOT NULL
+      AND length(trim(evidence_source_url)) > 0
+      AND evidence_source_title IS NOT NULL
+      AND length(trim(evidence_source_title)) > 0
+      AND evidence_text IS NOT NULL
+      AND length(trim(evidence_text)) > 0
+      AND evidence_confidence = 'very_high'
+    )
+    OR (
+      verification_method = 'human'
+      AND verified_by_user_id IS NOT NULL
+      AND membership_basis = 'deterministic_exact'
+      AND evidence_source_url IS NULL
+      AND evidence_source_title IS NULL
+      AND evidence_text IS NULL
+      AND evidence_confidence IS NULL
+    )
+  )
 );
 
 CREATE INDEX IF NOT EXISTS idx_avionics_manufacturer_identity_memberships_group
@@ -323,12 +373,13 @@ END;
 -- their approval contract supplies the authoritative evidence. Unreviewed
 -- legacy spellings never enter the curated identity list by themselves.
 INSERT INTO avionics_manufacturer_identities (
-  canonical_name, normalized_identity_key, identity_evidence_kind,
+  canonical_name, normalized_identity_key, verification_method,
+  identity_evidence_kind,
   identity_source_url, identity_source_title, identity_evidence_text,
   identity_confidence
 )
 SELECT manufacturer.name, manufacturer_key.canonical_manufacturer_key,
-       'authoritative_reference', model.identity_source_url,
+       'automated', 'authoritative_reference', model.identity_source_url,
        model.identity_source_title, model.identity_evidence_text, 'very_high'
 FROM avionics_models model
 JOIN avionics_manufacturers manufacturer
@@ -350,7 +401,8 @@ ON CONFLICT (normalized_identity_key) DO NOTHING;
 
 INSERT INTO avionics_manufacturer_identity_memberships (
   avionics_manufacturer_id, avionics_manufacturer_identity_id,
-  membership_basis, normalized_name_key, evidence_source_url,
+  membership_basis, normalized_name_key, verification_method,
+  evidence_source_url,
   evidence_source_title, evidence_text, evidence_confidence
 )
 SELECT manufacturer_key.avionics_manufacturer_id, identity.id,
@@ -369,7 +421,7 @@ SELECT manufacturer_key.avionics_manufacturer_id, identity.id,
          ) THEN 'authoritative_primary'
          ELSE 'deterministic_exact'
        END,
-       manufacturer_key.canonical_manufacturer_key,
+       manufacturer_key.canonical_manufacturer_key, 'automated',
        CASE
          WHEN manufacturer_key.avionics_manufacturer_id = (
            SELECT approved_model.avionics_manufacturer_id

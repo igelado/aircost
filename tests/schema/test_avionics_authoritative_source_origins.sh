@@ -26,11 +26,12 @@ sqlite3 -bail "$wrong_domain_database" \
   ".read $repository_root/schema/sqlite.sql"
 sqlite3 -bail "$wrong_domain_database" <<'SQL'
 INSERT INTO avionics_manufacturer_identities (
-  canonical_name, normalized_identity_key, identity_evidence_kind,
+  canonical_name, normalized_identity_key, verification_method,
+  identity_evidence_kind,
   identity_source_url, identity_source_title, identity_evidence_text,
   identity_confidence
 ) VALUES (
-  'Garmin', 'garmin', 'authoritative_reference',
+  'Garmin', 'garmin', 'automated', 'authoritative_reference',
   'https://garmin.example/about',
   'Unrelated Garmin-looking identity fixture',
   'This fixture must not authorize any Garmin source origin.',
@@ -46,11 +47,12 @@ sqlite3 -bail "$wrong_identity_database" \
   ".read $repository_root/schema/sqlite.sql"
 sqlite3 -bail "$wrong_identity_database" <<'SQL'
 INSERT INTO avionics_manufacturer_identities (
-  canonical_name, normalized_identity_key, identity_evidence_kind,
+  canonical_name, normalized_identity_key, verification_method,
+  identity_evidence_kind,
   identity_source_url, identity_source_title, identity_evidence_text,
   identity_confidence
 ) VALUES (
-  'Honeywell', 'garmin', 'authoritative_reference',
+  'Honeywell', 'garmin', 'automated', 'authoritative_reference',
   'https://www.garmin.com/en-US/p/588901/',
   'Contradictory manufacturer identity fixture',
   'This fixture must not authorize any Garmin source origin.',
@@ -67,11 +69,12 @@ VALUES ('origin-reviewer@example.test', 'Origin Reviewer', 'origin-reviewer');
 INSERT INTO avionics_manufacturers (name, normalized_name)
 VALUES ('Garmin', 'garmin');
 INSERT INTO avionics_manufacturer_identities (
-  canonical_name, normalized_identity_key, identity_evidence_kind,
+  canonical_name, normalized_identity_key, verification_method,
+  identity_evidence_kind,
   identity_source_url, identity_source_title, identity_evidence_text,
   identity_confidence
 ) VALUES (
-  '  gArMiN  ', 'garmin', 'authoritative_reference',
+  '  gArMiN  ', 'garmin', 'automated', 'authoritative_reference',
   'https://www.garmin.com/en-US/p/588901/',
   'Garmin G1000 NXi | Integrated Flight Deck',
   'The Garmin G1000 NXi is an advanced integrated flight deck family designed and manufactured by Garmin',
@@ -79,11 +82,12 @@ INSERT INTO avionics_manufacturer_identities (
 );
 INSERT INTO avionics_manufacturer_identity_memberships (
   avionics_manufacturer_id, avionics_manufacturer_identity_id,
-  membership_basis, normalized_name_key, evidence_source_url,
+  membership_basis, normalized_name_key, verification_method,
+  evidence_source_url,
   evidence_source_title, evidence_text, evidence_confidence
 )
 SELECT manufacturer.id, identity.id, 'authoritative_primary', 'garmin',
-       identity.identity_source_url, identity.identity_source_title,
+       'automated', identity.identity_source_url, identity.identity_source_title,
        identity.identity_evidence_text, 'very_high'
 FROM avionics_manufacturers manufacturer
 JOIN avionics_manufacturer_identities identity
