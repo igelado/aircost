@@ -80,43 +80,46 @@ VALUES
   ('Aircraft Radio Corporation', 'aircraft radio');
 INSERT INTO avionics_types (name, normalized_name) VALUES ('Navigator', 'navigator');
 INSERT INTO avionics_manufacturer_identities (
-  canonical_name, normalized_identity_key, identity_evidence_kind,
+  canonical_name, normalized_identity_key, verification_method,
+  identity_evidence_kind,
   identity_source_url, identity_source_title, identity_evidence_text,
   identity_confidence
 ) VALUES (
-  'Acme Aero', 'acmeaero', 'authoritative_reference',
+  'Acme Aero', 'acmeaero', 'automated', 'authoritative_reference',
   'https://manufacturer.example/about', 'Acme manufacturer profile',
   'The manufacturer identifies Acme Aero as its product brand.', 'very_high'
 );
 INSERT INTO avionics_manufacturer_identities (
-  canonical_name, normalized_identity_key, identity_evidence_kind,
+  canonical_name, normalized_identity_key, verification_method,
+  identity_evidence_kind,
   identity_source_url, identity_source_title, identity_evidence_text,
   identity_confidence
 ) VALUES
   (
-    'Garmin', 'garmin', 'authoritative_reference',
+    'Garmin', 'garmin', 'automated', 'authoritative_reference',
     'https://manufacturer.example/garmin', 'Garmin manufacturer profile',
     'The manufacturer identifies Garmin as its product brand.', 'very_high'
   ),
   (
-    'Forged Garmin', 'garminforged', 'authoritative_reference',
+    'Forged Garmin', 'garminforged', 'automated', 'authoritative_reference',
     'https://manufacturer.example/forged', 'Forged manufacturer profile',
     'Evidence fixture for a forged stored normalization.', 'very_high'
   ),
   (
-    'Aircraft Radio', 'aircraftradio', 'authoritative_reference',
+    'Aircraft Radio', 'aircraftradio', 'automated', 'authoritative_reference',
     'https://manufacturer.example/aircraft-radio', 'Aircraft Radio profile',
     'The manufacturer identifies its full corporate display name.', 'very_high'
   );
 INSERT INTO avionics_manufacturer_identity_memberships (
   avionics_manufacturer_id, avionics_manufacturer_identity_id,
-  membership_basis, normalized_name_key, evidence_source_url,
+  membership_basis, normalized_name_key, verification_method,
+  evidence_source_url,
   evidence_source_title, evidence_text, evidence_confidence
 )
 SELECT manufacturer.id, identity.id,
        CASE WHEN manufacturer.normalized_name = 'acme aero'
          THEN 'authoritative_primary' ELSE 'deterministic_exact' END,
-       'acmeaero',
+       'acmeaero', 'automated',
        CASE WHEN manufacturer.normalized_name = 'acme aero'
          THEN 'https://manufacturer.example/about'
          ELSE 'urn:aircost:deterministic:avionics-manufacturer-normalization:v1' END,
@@ -132,11 +135,12 @@ WHERE manufacturer.normalized_name IN ('acme aero', 'acme-aero')
   AND identity.normalized_identity_key = 'acmeaero';
 INSERT INTO avionics_manufacturer_identity_memberships (
   avionics_manufacturer_id, avionics_manufacturer_identity_id,
-  membership_basis, normalized_name_key, evidence_source_url,
+  membership_basis, normalized_name_key, verification_method,
+  evidence_source_url,
   evidence_source_title, evidence_text, evidence_confidence
 )
 SELECT manufacturer.id, identity.id, 'authoritative_primary',
-       identity.normalized_identity_key,
+       identity.normalized_identity_key, 'automated',
        identity.identity_source_url, identity.identity_source_title,
        identity.identity_evidence_text, 'very_high'
 FROM avionics_manufacturers manufacturer, avionics_manufacturer_identities identity
@@ -161,7 +165,8 @@ FROM avionics_manufacturers WHERE normalized_name = 'acme aero';
 INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id)
 SELECT model.id, type.id FROM avionics_models model, avionics_types type
 WHERE model.name = 'NavOne 100' AND type.normalized_name = 'navigator';
-UPDATE avionics_models SET catalog_status = 'approved'
+UPDATE avionics_models
+SET catalog_status = 'approved', verification_method = 'automated'
 WHERE name = 'NavOne 100';
 
 -- Same canonical product through a punctuation-only manufacturer alias.
@@ -218,7 +223,8 @@ FROM avionics_manufacturers WHERE normalized_name = 'acme aero';
 INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id)
 SELECT model.id, type.id FROM avionics_models model, avionics_types type
 WHERE model.name = 'Sku Product' AND type.normalized_name = 'navigator';
-UPDATE avionics_models SET catalog_status = 'approved'
+UPDATE avionics_models
+SET catalog_status = 'approved', verification_method = 'automated'
 WHERE name = 'Sku Product';
 
 -- A third approved product supports complete listing action-graph tests.
@@ -238,7 +244,8 @@ FROM avionics_manufacturers WHERE normalized_name = 'acme aero';
 INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id)
 SELECT model.id, type.id FROM avionics_models model, avionics_types type
 WHERE model.name = 'Aux Product' AND type.normalized_name = 'navigator';
-UPDATE avionics_models SET catalog_status = 'approved'
+UPDATE avionics_models
+SET catalog_status = 'approved', verification_method = 'automated'
 WHERE name = 'Aux Product';
 
 -- Raw and persisted product identity keys must agree before approval.
@@ -400,20 +407,20 @@ test "$(sqlite3 "$test_database" \
 test "$(sqlite3 "$test_database" \
   "SELECT deterministic_name_key || ':' || stored_name_key || ':' || uses_supported_ascii FROM avionics_manufacturer_normalization_contract WHERE avionics_manufacturer_id=(SELECT id FROM avionics_manufacturers WHERE normalized_name='aircraft radio')")" = "aircraftradio:aircraftradio:1"
 expect_failure "$test_database" \
-  "INSERT INTO avionics_manufacturer_identity_memberships (avionics_manufacturer_id,avionics_manufacturer_identity_id,membership_basis,normalized_name_key,evidence_source_url,evidence_source_title,evidence_text,evidence_confidence) SELECT manufacturer.id,identity.id,'authoritative_primary','garminforged',identity.identity_source_url,identity.identity_source_title,identity.identity_evidence_text,'very_high' FROM avionics_manufacturers manufacturer,avionics_manufacturer_identities identity WHERE manufacturer.normalized_name='garmin-forged' AND identity.normalized_identity_key='garminforged'" \
+  "INSERT INTO avionics_manufacturer_identity_memberships (avionics_manufacturer_id,avionics_manufacturer_identity_id,membership_basis,normalized_name_key,verification_method,evidence_source_url,evidence_source_title,evidence_text,evidence_confidence) SELECT manufacturer.id,identity.id,'authoritative_primary','garminforged','automated',identity.identity_source_url,identity.identity_source_title,identity.identity_evidence_text,'very_high' FROM avionics_manufacturers manufacturer,avionics_manufacturer_identities identity WHERE manufacturer.normalized_name='garmin-forged' AND identity.normalized_identity_key='garminforged'" \
   "manufacturer membership cannot trust a forged stored normalization"
 expect_failure "$test_database" \
-  "UPDATE avionics_models SET catalog_status='approved' WHERE name='GTX 345'" \
+  "UPDATE avionics_models SET catalog_status='approved',verification_method='automated' WHERE name='GTX 345'" \
   "approved product names require deterministic raw-to-stored normalization"
 expect_failure "$test_database" \
-  "UPDATE avionics_models SET catalog_status='approved' WHERE name='GTX 345R'" \
+  "UPDATE avionics_models SET catalog_status='approved',verification_method='automated' WHERE name='GTX 345R'" \
   "approved manufacturer identifiers require deterministic raw-to-stored normalization"
 
 # SQLite can defer an otherwise immediate child FK and preinsert a capability
 # row for a not-yet-existing product. Direct approval must still be rejected;
 # staged unreviewed -> approved UPDATE is the only catalog admission path.
 expect_failure "$test_database" \
-  "PRAGMA defer_foreign_keys=ON; BEGIN; INSERT INTO avionics_model_types (avionics_model_id,avionics_type_id) SELECT 900001,id FROM avionics_types WHERE normalized_name='navigator'; INSERT INTO avionics_models (id,avionics_manufacturer_id,name,normalized_name,catalog_status,manufacturer_identifier_kind,manufacturer_identifier,normalized_manufacturer_identifier,identity_source_url,identity_source_title,identity_evidence_text,identity_evidence_kind,identity_confidence,catalog_reviewed_at) SELECT 900001,id,'GTX 345','direct-forged-key','approved','manufacturer_model_number','DIRECT-100','direct-forged-identifier','https://manufacturer.example/direct-forged','Direct forged fixture','Manufacturer identifies the product and identifier.','authoritative_reference','very_high',CURRENT_TIMESTAMP FROM avionics_manufacturers WHERE normalized_name='acme aero'; COMMIT;" \
+  "PRAGMA defer_foreign_keys=ON; BEGIN; INSERT INTO avionics_model_types (avionics_model_id,avionics_type_id) SELECT 900001,id FROM avionics_types WHERE normalized_name='navigator'; INSERT INTO avionics_models (id,avionics_manufacturer_id,name,normalized_name,catalog_status,verification_method,manufacturer_identifier_kind,manufacturer_identifier,normalized_manufacturer_identifier,identity_source_url,identity_source_title,identity_evidence_text,identity_evidence_kind,identity_confidence,catalog_reviewed_at) SELECT 900001,id,'GTX 345','direct-forged-key','approved','automated','manufacturer_model_number','DIRECT-100','direct-forged-identifier','https://manufacturer.example/direct-forged','Direct forged fixture','Manufacturer identifies the product and identifier.','authoritative_reference','very_high',CURRENT_TIMESTAMP FROM avionics_manufacturers WHERE normalized_name='acme aero'; COMMIT;" \
   "deferred foreign keys cannot bypass staged avionics approval"
 test "$(sqlite3 "$test_database" \
   "SELECT count(*) FROM avionics_models WHERE id=900001")" = "0"
@@ -443,10 +450,10 @@ test "$(sqlite3 "$test_database" \
   "SELECT count(*) FROM avionics_manufacturer_canonical_keys WHERE canonical_manufacturer_key='mutablekeyco'")" = "0"
 
 expect_failure "$test_database" \
-  "UPDATE avionics_models SET catalog_status='approved' WHERE name='Nav-One 100'" \
+  "UPDATE avionics_models SET catalog_status='approved',verification_method='automated' WHERE name='Nav-One 100'" \
   "manufacturer aliases must not approve the same canonical product twice"
 expect_failure "$test_database" \
-  "UPDATE avionics_models SET catalog_status='approved' WHERE name='NavTwo'" \
+  "UPDATE avionics_models SET catalog_status='approved',verification_method='automated' WHERE name='NavTwo'" \
   "manufacturer aliases must not approve the same canonical identifier twice"
 expect_failure "$test_database" \
   "UPDATE avionics_models SET identity_evidence_text='changed' WHERE name='NavOne 100'" \
@@ -595,7 +602,7 @@ sqlite3 -bail "$upgrade_database" \
   "INSERT INTO avionics_model_types (avionics_model_id,avionics_type_id) SELECT model.id,type.id FROM avionics_models model,avionics_types type WHERE model.normalized_name='seeded navigator' AND type.normalized_name='upgrade navigator'" \
   "DROP TRIGGER IF EXISTS avionics_models_canonical_identity_validate_update" \
   "DROP TRIGGER IF EXISTS avionics_models_canonical_identity_sync_update" \
-  "UPDATE avionics_models SET catalog_status='approved' WHERE normalized_name='seeded navigator'" \
+  "UPDATE avionics_models SET catalog_status='approved',verification_method='automated' WHERE normalized_name='seeded navigator'" \
   "INSERT INTO aircraft_sale_listings (aircraft_model_variant_id,created_by_user_id,source_url,model_year,asking_price_usd,registration_number,airframe_hours) SELECT placeholder.aircraft_model_variant_id,user.id,'https://listing.example/invalid',2020,100000,'N11111',100 FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder,users user WHERE placeholder.singleton_id=1" \
   "INSERT INTO aircraft_sale_listings (aircraft_model_variant_id,created_by_user_id,source_url,model_year,asking_price_usd,registration_number,airframe_hours) SELECT placeholder.aircraft_model_variant_id,user.id,'https://listing.example/invalid-verified',2020,100000,'N22222',100 FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder,users user WHERE placeholder.singleton_id=1" \
   "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id,avionics_model_id,source,source_confidence) SELECT listing.id,model.id,'listing','medium' FROM aircraft_sale_listings listing,avionics_models model" \
@@ -622,20 +629,23 @@ DROP TRIGGER avionics_manufacturer_membership_validate_insert;
 INSERT INTO avionics_manufacturers (name,normalized_name)
 VALUES ('Garmin','forged-garmin-key');
 INSERT INTO avionics_manufacturer_identities (
-  canonical_name,normalized_identity_key,identity_evidence_kind,
+  canonical_name,normalized_identity_key,verification_method,
+  identity_evidence_kind,
   identity_source_url,identity_source_title,identity_evidence_text,
   identity_confidence
 ) VALUES (
-  'Forged Garmin','forgedgarminkey','authoritative_reference',
+  'Forged Garmin','forgedgarminkey','automated','authoritative_reference',
   'https://manufacturer.example/forged','Forged fixture',
   'A deliberately corrupt pre-v6 identity fixture.','very_high'
 );
 INSERT INTO avionics_manufacturer_identity_memberships (
   avionics_manufacturer_id,avionics_manufacturer_identity_id,
-  membership_basis,normalized_name_key,evidence_source_url,
+  membership_basis,normalized_name_key,verification_method,
+  evidence_source_url,
   evidence_source_title,evidence_text,evidence_confidence
 )
 SELECT manufacturer.id,identity.id,'authoritative_primary','forgedgarminkey',
+       'automated',
        identity.identity_source_url,identity.identity_source_title,
        identity.identity_evidence_text,'very_high'
 FROM avionics_manufacturers manufacturer,avionics_manufacturer_identities identity
@@ -650,20 +660,22 @@ sqlite3 -bail "$invalid_product_database" <<SQL
 .read $repository_root/tests/schema/reference_catalog_pre_cutover.sqlite.sql
 INSERT INTO avionics_manufacturers (name,normalized_name) VALUES ('Garmin','garmin');
 INSERT INTO avionics_manufacturer_identities (
-  canonical_name,normalized_identity_key,identity_evidence_kind,
+  canonical_name,normalized_identity_key,verification_method,
+  identity_evidence_kind,
   identity_source_url,identity_source_title,identity_evidence_text,
   identity_confidence
 ) VALUES (
-  'Garmin','garmin','authoritative_reference',
+  'Garmin','garmin','automated','authoritative_reference',
   'https://manufacturer.example/garmin','Garmin profile',
   'The manufacturer identifies its product brand.','very_high'
 );
 INSERT INTO avionics_manufacturer_identity_memberships (
   avionics_manufacturer_id,avionics_manufacturer_identity_id,
-  membership_basis,normalized_name_key,evidence_source_url,
+  membership_basis,normalized_name_key,verification_method,
+  evidence_source_url,
   evidence_source_title,evidence_text,evidence_confidence
 )
-SELECT manufacturer.id,identity.id,'authoritative_primary','garmin',
+SELECT manufacturer.id,identity.id,'authoritative_primary','garmin','automated',
        identity.identity_source_url,identity.identity_source_title,
        identity.identity_evidence_text,'very_high'
 FROM avionics_manufacturers manufacturer,avionics_manufacturer_identities identity;
@@ -685,7 +697,9 @@ INSERT INTO avionics_model_types (avionics_model_id,avionics_type_id)
 SELECT model.id,type.id FROM avionics_models model,avionics_types type;
 DROP TRIGGER avionics_models_canonical_identity_validate_update;
 DROP TRIGGER avionics_models_canonical_identity_sync_update;
-UPDATE avionics_models SET catalog_status='approved';
+DROP TRIGGER avionics_models_approved_concrete_model_update;
+UPDATE avionics_models
+SET catalog_status='approved',verification_method='automated';
 SQL
 expect_migration_failure "$invalid_product_database" \
   "v6 rejects pre-existing approved products with forged normalization keys"

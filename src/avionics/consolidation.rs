@@ -374,6 +374,7 @@ struct ModelRow {
     identity_evidence_kind: String,
     identity_confidence: Option<String>,
     catalog_reviewed_at: Option<String>,
+    valuation_scope: String,
     approved_manufacturer_identity_id: Option<i64>,
     approved_canonical_product_key: Option<String>,
     approved_identifier_kind: Option<String>,
@@ -546,6 +547,7 @@ const MODEL_SQL: &str = r#"
       model.identity_evidence_kind,
       model.identity_confidence,
       model.catalog_reviewed_at,
+      model.valuation_scope,
       approved_identity.avionics_manufacturer_identity_id
         AS approved_manufacturer_identity_id,
       approved_identity.canonical_product_key
@@ -695,7 +697,7 @@ fn approved_catalog_revision_from_state(state: &CatalogState) -> String {
             .iter()
             .filter(|membership| membership.avionics_model_id == model.id)
         {
-            rows.push(CatalogFingerprintRow {
+            let fingerprint_row = |suite_link: Option<&SuiteLinkRow>| CatalogFingerprintRow {
                 id: model.id,
                 manufacturer: model.manufacturer.clone(),
                 model: model.model.clone(),
@@ -709,7 +711,24 @@ fn approved_catalog_revision_from_state(state: &CatalogState) -> String {
                 identity_source_url: model.identity_source_url.clone(),
                 identity_source_title: model.identity_source_title.clone(),
                 identity_evidence_text: model.identity_evidence_text.clone(),
-            });
+                valuation_scope: model.valuation_scope.clone(),
+                suite_component_model_id: suite_link.map(|link| link.component_model_id),
+                suite_component_quantity: suite_link.map(|link| link.quantity),
+            };
+            let suite_links = state
+                .suite_links
+                .iter()
+                .filter(|link| link.suite_model_id == model.id)
+                .collect::<Vec<_>>();
+            if suite_links.is_empty() {
+                rows.push(fingerprint_row(None));
+            } else {
+                rows.extend(
+                    suite_links
+                        .into_iter()
+                        .map(|suite_link| fingerprint_row(Some(suite_link))),
+                );
+            }
         }
     }
     fingerprint_approved_catalog_rows(rows)
@@ -1013,6 +1032,13 @@ fn merged_listing_source(rows: &[ListingLinkRow]) -> String {
         .collect::<BTreeSet<_>>();
     if sources.len() == 1 {
         return sources.into_iter().next().unwrap_or_default().to_string();
+    }
+    if sources.contains("human_review")
+        && sources
+            .iter()
+            .all(|source| matches!(*source, "listing" | "listing_review" | "human_review"))
+    {
+        return "human_review".to_string();
     }
     if sources
         .iter()
@@ -2748,7 +2774,7 @@ fn reference_strength(state: &CatalogState, model_id: i64) -> CanonicalLegacyRef
         global_reference_count,
         reviewer_confirmed_listing_reference_count: listing_rows
             .iter()
-            .filter(|row| row.source == "listing_review")
+            .filter(|row| row.source == "human_review")
             .count(),
         high_confidence_listing_reference_count: listing_rows
             .iter()
@@ -3111,6 +3137,7 @@ async fn consolidate_avionics_models_internal(
     let approve_survivor = db.sql(
         r#"UPDATE avionics_models
            SET catalog_status = 'approved', catalog_reviewed_at = CURRENT_TIMESTAMP,
+               verification_method = 'automated', verified_by_user_id = NULL,
                updated_at = CURRENT_TIMESTAMP
            WHERE id = ? AND catalog_status = 'unreviewed'
              AND EXISTS (
@@ -4034,6 +4061,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn consolidation_preserves_human_authority_and_machine_authority_as_distinct_sources() {
+        let mut listing = listing_link(1, 10, 20, "installed", None);
+        let mut machine = listing_link(2, 10, 21, "installed", None);
+        machine.source = "listing_review".to_string();
+        assert_eq!(
+            merged_listing_source(&[listing.clone(), machine]),
+            "listing_review"
+        );
+
+        listing.source = "human_review".to_string();
+        let extracted = listing_link(3, 10, 22, "installed", None);
+        assert_eq!(merged_listing_source(&[listing, extracted]), "human_review");
+    }
+
     fn identity_test_model(
         id: i64,
         manufacturer_identity_id: Option<i64>,
@@ -4057,6 +4099,7 @@ mod tests {
             identity_evidence_kind: "unreviewed".to_string(),
             identity_confidence: None,
             catalog_reviewed_at: None,
+            valuation_scope: "unit".to_string(),
             approved_manufacturer_identity_id: None,
             approved_canonical_product_key: None,
             approved_identifier_kind: None,
@@ -5593,7 +5636,8 @@ mod tests {
                    identity_evidence_kind='authoritative_reference',
                    identity_confidence='very_high',
                    catalog_reviewed_at=CURRENT_TIMESTAMP,
-                   catalog_status='approved'
+                   catalog_status='approved',
+                   verification_method='automated'
                WHERE id=?"#,
         )
         .bind(approved_id)
@@ -5927,7 +5971,8 @@ mod tests {
                        identity_evidence_kind='authoritative_reference',
                        identity_confidence='very_high',
                        catalog_reviewed_at=CURRENT_TIMESTAMP,
-                       catalog_status='approved'
+                       catalog_status='approved',
+                       verification_method='automated'
                    WHERE id=?"#,
             )
             .bind(model_id)

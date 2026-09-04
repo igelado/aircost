@@ -4473,6 +4473,11 @@ fn review_product_from_observation(
         model: model.to_string(),
         capabilities: capabilities.to_vec(),
         stable_identifier: None,
+        valuation_scope: crate::listing::review::AvionicsValuationScope::Unit,
+        suite_components: Vec::new(),
+        verification_method: None,
+        verified_by_user_id: None,
+        reviewed_at: None,
         identity_source_url: None,
         identity_source_title: None,
         identity_evidence_text: None,
@@ -4489,6 +4494,11 @@ fn review_product_from_identity(identity: &ApprovedAvionicsIdentity) -> ReviewPr
             kind: identity.manufacturer_identifier_kind.clone(),
             value: identity.manufacturer_identifier.clone(),
         }),
+        valuation_scope: crate::listing::review::AvionicsValuationScope::Unit,
+        suite_components: Vec::new(),
+        verification_method: None,
+        verified_by_user_id: None,
+        reviewed_at: None,
         identity_source_url: Some(identity.evidence_url.clone()),
         identity_source_title: Some(identity.evidence_title.clone()),
         identity_evidence_text: Some(identity.evidence.clone()),
@@ -4512,6 +4522,11 @@ fn review_product_from_candidate(candidate: &AvionicsReviewCatalogCandidate) -> 
         model: candidate.model.clone(),
         capabilities: candidate.avionics_types.clone(),
         stable_identifier,
+        valuation_scope: crate::listing::review::AvionicsValuationScope::Unit,
+        suite_components: Vec::new(),
+        verification_method: None,
+        verified_by_user_id: None,
+        reviewed_at: None,
         identity_source_url: None,
         identity_source_title: None,
         identity_evidence_text: None,
@@ -10943,7 +10958,9 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE avionics_models SET catalog_status = 'unreviewed' WHERE id = ?")
+        sqlx::query(
+            "UPDATE avionics_models SET catalog_status = 'unreviewed', verification_method = NULL, verified_by_user_id = NULL WHERE id = ?",
+        )
             .bind(fixture.model_id)
             .execute(pool)
             .await
@@ -11897,7 +11914,6 @@ mod tests {
             evidence_title: "GTX 345R installation manual".to_string(),
             evidence: "The manual identifies the model and part number.".to_string(),
             reason: "Authoritative manufacturer manual.".to_string(),
-            grounded_claim_source_urls: Vec::new(),
             verified_local_reuse_proof: None,
         }
     }
@@ -11935,6 +11951,8 @@ mod tests {
             r#"
             UPDATE avionics_models
             SET catalog_status = 'approved',
+                verification_method = 'automated',
+                verified_by_user_id = NULL,
                 manufacturer_identifier_kind = 'manufacturer_part_number',
                 manufacturer_identifier = ?,
                 normalized_manufacturer_identifier = ?,
@@ -14108,7 +14126,7 @@ mod tests {
             INSERT INTO aircraft_sale_listing_avionics (
               aircraft_sale_listing_id, avionics_model_id, source, source_notes,
               source_confidence
-            ) VALUES (?, ?, 'listing_review', 'explicitly installed suite', 'high')
+            ) VALUES (?, ?, 'human_review', 'explicitly installed suite', 'high')
             "#,
             listing_id,
             suite_id
@@ -14260,7 +14278,7 @@ mod tests {
 
         execute_query!(
             &db,
-            "UPDATE aircraft_sale_listing_avionics SET source = 'listing_review' WHERE aircraft_sale_listing_id = ?",
+            "UPDATE aircraft_sale_listing_avionics SET source = 'human_review' WHERE aircraft_sale_listing_id = ?",
             listing_id
         )
         .expect("reviewer authority should replace automatic provenance");

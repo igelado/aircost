@@ -401,7 +401,7 @@ END;
 const REFERENCE_CATALOG_CUTOVER_MIGRATION: &str = "20260819_reference_catalog_cutover";
 const REFERENCE_CATALOG_CUTOVER_CONTRACT_VERSION: i64 = 1;
 const REFERENCE_CATALOG_CUTOVER_CONTRACT_FINGERPRINT: &str =
-    "45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819";
+    "63cae87c0bc5081f0018855535d9a9c7ac9e457f7e8972f6d29ccabdb790b1a7";
 const REFERENCE_CATALOG_CUTOVER_SQLITE_MIGRATION_SQL: &str =
     include_str!("../migrations/20260819_reference_catalog_cutover.sqlite.sql");
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL: &str =
@@ -621,7 +621,7 @@ const REFERENCE_CATALOG_CUTOVER_RETIRED_ROUTINES: &[&str] = &[
 ];
 const REFERENCE_CATALOG_CUTOVER_SQLITE_OBJECT_COUNT: i64 = 215;
 const REFERENCE_CATALOG_CUTOVER_SQLITE_DEFINITION_DIGEST: &str =
-    "0b0c2e65ef87d0fd7a7762948cd09dcef32707687ea55921c30fcaea62f9a3ba";
+    "aa69fc0ffa2c9e01e1c565ee7696b384eba70ed22ebe8897d503fc355b69390f";
 const REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES: &[&str] = &[
     "aircraft_reference_fact_set_attestations:sqlite_autoindex_aircraft_reference_fact_set_attestations_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:fact_set_kind:0:BINARY:1,2:-1::0:BINARY:0",
     "aircraft_reference_prices:sqlite_autoindex_aircraft_reference_prices_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:price_kind:0:BINARY:1,2:4:currency:0:BINARY:1,3:-1::0:BINARY:0",
@@ -633,9 +633,9 @@ const REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES: &[&str] = &[
     "official_dollar_normalization_facts:sqlite_autoindex_official_dollar_normalization_facts_1:1:u:0:0:7:evidence_claim_id:0:BINARY:1,1:-1::0:BINARY:0",
     "official_dollar_normalization_facts:sqlite_autoindex_official_dollar_normalization_facts_2:1:u:0:0:1:source_year:0:BINARY:1,1:2:target_year:0:BINARY:1,2:-1::0:BINARY:0",
 ];
-const REFERENCE_CATALOG_CUTOVER_POSTGRES_OBJECT_COUNT: i64 = 804;
+const REFERENCE_CATALOG_CUTOVER_POSTGRES_OBJECT_COUNT: i64 = 813;
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_DEFINITION_DIGEST: &str =
-    "ba236136f4f31173a4a5d71c8d8a5be5";
+    "2398147ef3fa8ed8e4825690b2c47e60";
 const SQLITE_SERIAL_SCHEME_INSERT_TRIGGER: &str = r#"
 CREATE TRIGGER aircraft_serial_schemes_require_approval
 BEFORE INSERT ON aircraft_serial_number_schemes
@@ -19116,7 +19116,9 @@ mod tests {
         ensure_test_manufacturer_identity(db, manufacturer_id)
             .await
             .unwrap();
-        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+        sqlx::query(
+            "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated', verified_by_user_id = NULL WHERE id = ?",
+        )
             .bind(model_id)
             .execute(pool)
             .await

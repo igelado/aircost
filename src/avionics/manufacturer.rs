@@ -59,11 +59,13 @@ pub struct ManufacturerIdentity {
     pub id: i64,
     pub canonical_name: String,
     pub normalized_identity_key: String,
-    pub identity_evidence_kind: String,
-    pub identity_source_url: String,
-    pub identity_source_title: String,
-    pub identity_evidence_text: String,
-    pub identity_confidence: String,
+    pub verification_method: String,
+    pub verified_by_user_id: Option<i64>,
+    pub identity_evidence_kind: Option<String>,
+    pub identity_source_url: Option<String>,
+    pub identity_source_title: Option<String>,
+    pub identity_evidence_text: Option<String>,
+    pub identity_confidence: Option<String>,
 }
 
 #[derive(Clone, Debug, FromRow, PartialEq, Eq, Serialize)]
@@ -72,10 +74,12 @@ pub struct ManufacturerIdentityMembership {
     pub avionics_manufacturer_identity_id: i64,
     pub membership_basis: String,
     pub normalized_name_key: String,
-    pub evidence_source_url: String,
-    pub evidence_source_title: String,
-    pub evidence_text: String,
-    pub evidence_confidence: String,
+    pub verification_method: String,
+    pub verified_by_user_id: Option<i64>,
+    pub evidence_source_url: Option<String>,
+    pub evidence_source_title: Option<String>,
+    pub evidence_text: Option<String>,
+    pub evidence_confidence: Option<String>,
 }
 
 /// Exact source origins admitted for one already-curated manufacturer claim.
@@ -129,6 +133,15 @@ pub(crate) struct ManufacturerProductAdmission<'a> {
     /// Additional server-accepted structured claim sources (for example,
     /// collision adjudications) that authorized this write.
     pub additional_evidence_source_urls: &'a [String],
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HumanManufacturerProductAdmission<'a> {
+    pub manufacturer: &'a str,
+    pub model: &'a str,
+    pub manufacturer_identifier_kind: &'a str,
+    pub manufacturer_identifier: &'a str,
+    pub verified_by_user_id: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -836,11 +849,12 @@ macro_rules! admit_manufacturer_product_scope {
                     let insert_identity = $db.sql(
                         r#"INSERT INTO avionics_manufacturer_identities (
                              canonical_name, normalized_identity_key,
+                             verification_method, verified_by_user_id,
                              identity_evidence_kind,
                              identity_source_url, identity_source_title,
                              identity_evidence_text, identity_confidence
                            ) VALUES (
-                             ?, ?, 'authoritative_reference',
+                             ?, ?, 'automated', NULL, 'authoritative_reference',
                              ?, ?, ?, 'very_high'
                            )
                            RETURNING id"#,
@@ -860,9 +874,10 @@ macro_rules! admit_manufacturer_product_scope {
                      avionics_manufacturer_id,
                      avionics_manufacturer_identity_id,
                      membership_basis, normalized_name_key,
+                     verification_method, verified_by_user_id,
                      evidence_source_url, evidence_source_title,
                      evidence_text, evidence_confidence
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, 'very_high')"#,
+                   ) VALUES (?, ?, ?, ?, 'automated', NULL, ?, ?, ?, 'very_high')"#,
             );
             let (basis, source_url, source_title, evidence_text) = if new_identity {
                 (
@@ -894,12 +909,14 @@ macro_rules! admit_manufacturer_product_scope {
                      avionics_manufacturer_id,
                      avionics_manufacturer_identity_id,
                      membership_basis, normalized_name_key,
+                     verification_method, verified_by_user_id,
                      evidence_source_url, evidence_source_title,
                      evidence_text, evidence_confidence
                    )
                    SELECT manufacturer_key.avionics_manufacturer_id, ?,
                           'deterministic_exact',
                           manufacturer_key.canonical_manufacturer_key,
+                          'automated', NULL,
                           'urn:aircost:deterministic:avionics-manufacturer-normalization:v1',
                           'Aircost exact manufacturer normalization v1',
                           'The stored manufacturer spelling has the same exact deterministic normalization key as this evidence-backed identity.',
@@ -949,129 +966,155 @@ pub(crate) async fn admit_manufacturer_product_scope_postgres(
     Ok(admit_manufacturer_product_scope!(db, transaction, request))
 }
 
-macro_rules! stage_batch_manufacturer_alias_collision {
-    (
-        $db:expr,
-        $transaction:expr,
-        $avionics_manufacturer_id:expr,
-        $candidate_manufacturer_identity_id:expr,
-        $candidate_basis:expr
-    ) => {{
-        let avionics_manufacturer_id = $avionics_manufacturer_id;
-        let candidate_manufacturer_identity_id = $candidate_manufacturer_identity_id;
-        let candidate_basis = $candidate_basis;
-        if avionics_manufacturer_id <= 0 || candidate_manufacturer_identity_id <= 0 {
+macro_rules! admit_human_manufacturer_product_scope {
+    ($db:expr, $transaction:expr, $request:expr) => {{
+        let request = $request;
+        if request.verified_by_user_id <= 0 {
             return Err(ManufacturerIdentityError::Validation(
-                "batch alias collision requires positive manufacturer and identity IDs".to_string(),
+                "human manufacturer admission requires a positive reviewer user id".to_string(),
+            ));
+        }
+        let normalized_manufacturer =
+            normalize_avionics_manufacturer_name(request.manufacturer.trim());
+        let canonical_product_key =
+            compact_identity_key(&normalize_avionics_model_name(request.model.trim()));
+        let canonical_identifier_key =
+            normalize_avionics_identifier(request.manufacturer_identifier.trim());
+        if normalized_manufacturer.is_empty()
+            || canonical_product_key.is_empty()
+            || canonical_identifier_key.is_empty()
+        {
+            return Err(ManufacturerIdentityError::Validation(
+                "human manufacturer product admission requires deterministic manufacturer, product, and identifier keys"
+                    .to_string(),
             ));
         }
         if !matches!(
-            candidate_basis,
-            "exact_stable_identifier" | "exact_product_name"
+            request.manufacturer_identifier_kind.trim(),
+            "manufacturer_part_number" | "manufacturer_model_number" | "sku"
         ) {
             return Err(ManufacturerIdentityError::Validation(format!(
-                "unsupported batch alias collision basis {candidate_basis:?}"
+                "unsupported manufacturer identifier kind {:?}",
+                request.manufacturer_identifier_kind.trim()
             )));
         }
-        let select_source_identity = $db.sql(
+
+        let insert_manufacturer = $db.sql(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES (?, ?) ON CONFLICT (normalized_name) DO NOTHING",
+        );
+        sqlx::query(&insert_manufacturer)
+            .bind(request.manufacturer.trim())
+            .bind(normalized_manufacturer.as_str())
+            .execute(&mut **$transaction)
+            .await?;
+        let select_manufacturer =
+            $db.sql("SELECT id FROM avionics_manufacturers WHERE normalized_name = ?");
+        let manufacturer_id: i64 = sqlx::query_scalar(&select_manufacturer)
+            .bind(normalized_manufacturer.as_str())
+            .fetch_one(&mut **$transaction)
+            .await?;
+
+        let select_effective_membership = $db.sql(
             r#"SELECT avionics_manufacturer_identity_id
                FROM avionics_manufacturer_effective_memberships
                WHERE avionics_manufacturer_id = ?"#,
         );
-        let source_identity_id: i64 = sqlx::query_scalar(&select_source_identity)
-            .bind(avionics_manufacturer_id)
-            .fetch_optional(&mut **$transaction)
-            .await?
-            .ok_or_else(|| {
-                ManufacturerIdentityError::Conflict(format!(
-                    "batch alias source manufacturer {avionics_manufacturer_id} has no effective identity"
-                ))
-            })?;
-        let select_target_identity = $db.sql(
-            r#"SELECT avionics_manufacturer_identity_id
-               FROM avionics_manufacturer_effective_identities
-               WHERE identity_id = ?"#,
-        );
-        let target_identity_id: i64 = sqlx::query_scalar(&select_target_identity)
-            .bind(candidate_manufacturer_identity_id)
-            .fetch_optional(&mut **$transaction)
-            .await?
-            .ok_or_else(|| {
-                ManufacturerIdentityError::Conflict(format!(
-                    "batch alias target identity {candidate_manufacturer_identity_id} has no effective root"
-                ))
-            })?;
-        if source_identity_id == target_identity_id {
-            return Err(ManufacturerIdentityError::Conflict(format!(
-                "batch alias collision cannot target the source manufacturer's own effective identity {source_identity_id}"
-            )));
+        let existing_effective_identity: Option<i64> =
+            sqlx::query_scalar(&select_effective_membership)
+                .bind(manufacturer_id)
+                .fetch_optional(&mut **$transaction)
+                .await?;
+        {
+            let effective_identity_id = if let Some(identity_id) = existing_effective_identity {
+                identity_id
+            } else {
+                let insert_identity = $db.sql(
+                    r#"INSERT INTO avionics_manufacturer_identities (
+                         canonical_name, normalized_identity_key,
+                         verification_method, verified_by_user_id,
+                         identity_evidence_kind, identity_source_url,
+                         identity_source_title, identity_evidence_text,
+                         identity_confidence
+                       ) VALUES (?, ?, 'human', ?, NULL, NULL, NULL, NULL, NULL)
+                       ON CONFLICT (normalized_identity_key) DO NOTHING"#,
+                );
+                sqlx::query(&insert_identity)
+                    .bind(request.manufacturer.trim())
+                    .bind(normalized_manufacturer.as_str())
+                    .bind(request.verified_by_user_id)
+                    .execute(&mut **$transaction)
+                    .await?;
+                let select_identity = $db.sql(
+                    "SELECT id FROM avionics_manufacturer_identities WHERE normalized_identity_key = ?",
+                );
+                let identity_id: i64 = sqlx::query_scalar(&select_identity)
+                    .bind(normalized_manufacturer.as_str())
+                    .fetch_one(&mut **$transaction)
+                    .await?;
+                let insert_membership = $db.sql(
+                    r#"INSERT INTO avionics_manufacturer_identity_memberships (
+                         avionics_manufacturer_id,
+                         avionics_manufacturer_identity_id,
+                         membership_basis, normalized_name_key,
+                         verification_method, verified_by_user_id,
+                         evidence_source_url, evidence_source_title,
+                         evidence_text, evidence_confidence
+                       ) VALUES (
+                         ?, ?, 'deterministic_exact', ?, 'human', ?,
+                         NULL, NULL, NULL, NULL
+                       )
+                       ON CONFLICT (avionics_manufacturer_id) DO NOTHING"#,
+                );
+                sqlx::query(&insert_membership)
+                    .bind(manufacturer_id)
+                    .bind(identity_id)
+                    .bind(normalized_manufacturer.as_str())
+                    .bind(request.verified_by_user_id)
+                    .execute(&mut **$transaction)
+                    .await?;
+                sqlx::query_scalar(&select_effective_membership)
+                    .bind(manufacturer_id)
+                    .fetch_one(&mut **$transaction)
+                    .await?
+            };
+            ManufacturerProductAdmissionOutcome::Admitted(AdmittedManufacturerProductScope {
+                avionics_manufacturer_id: manufacturer_id,
+                avionics_manufacturer_identity_id: effective_identity_id,
+                normalized_manufacturer,
+                canonical_product_key,
+                canonical_identifier_key,
+            })
         }
-        let (reason, confidence) = match candidate_basis {
-            "exact_stable_identifier" => (
-                "Two products proposed in the same listing-review batch under distinct evidence-backed manufacturer identities share an exact stable manufacturer identifier kind and value.",
-                "high",
-            ),
-            "exact_product_name" => (
-                "Two products proposed in the same listing-review batch under distinct evidence-backed manufacturer identities share an exact canonical product name.",
-                "medium",
-            ),
-            _ => unreachable!("batch alias basis was validated"),
-        };
-        let insert_candidate = $db.sql(
-            r#"INSERT INTO avionics_manufacturer_alias_candidates (
-                 avionics_manufacturer_id,
-                 candidate_manufacturer_identity_id,
-                 candidate_basis, matched_avionics_model_id,
-                 reason, confidence
-               ) VALUES (?, ?, ?, NULL, ?, ?)
-               ON CONFLICT DO NOTHING"#,
-        );
-        sqlx::query(&insert_candidate)
-            .bind(avionics_manufacturer_id)
-            .bind(target_identity_id)
-            .bind(candidate_basis)
-            .bind(reason)
-            .bind(confidence)
-            .execute(&mut **$transaction)
-            .await?
-            .rows_affected()
     }};
 }
 
-pub(crate) async fn stage_batch_manufacturer_alias_collision_sqlite(
+pub(crate) async fn admit_human_manufacturer_product_scope_sqlite(
     db: &AppDb,
     transaction: &mut Transaction<'_, Sqlite>,
-    avionics_manufacturer_id: i64,
-    candidate_manufacturer_identity_id: i64,
-    candidate_basis: &str,
-) -> ManufacturerIdentityResult<u64> {
-    Ok(stage_batch_manufacturer_alias_collision!(
+    request: &HumanManufacturerProductAdmission<'_>,
+) -> ManufacturerIdentityResult<ManufacturerProductAdmissionOutcome> {
+    Ok(admit_human_manufacturer_product_scope!(
         db,
         transaction,
-        avionics_manufacturer_id,
-        candidate_manufacturer_identity_id,
-        candidate_basis
+        request
     ))
 }
 
-pub(crate) async fn stage_batch_manufacturer_alias_collision_postgres(
+pub(crate) async fn admit_human_manufacturer_product_scope_postgres(
     db: &AppDb,
     transaction: &mut Transaction<'_, Postgres>,
-    avionics_manufacturer_id: i64,
-    candidate_manufacturer_identity_id: i64,
-    candidate_basis: &str,
-) -> ManufacturerIdentityResult<u64> {
-    Ok(stage_batch_manufacturer_alias_collision!(
+    request: &HumanManufacturerProductAdmission<'_>,
+) -> ManufacturerIdentityResult<ManufacturerProductAdmissionOutcome> {
+    Ok(admit_human_manufacturer_product_scope!(
         db,
         transaction,
-        avionics_manufacturer_id,
-        candidate_manufacturer_identity_id,
-        candidate_basis
+        request
     ))
 }
 
 fn identity_select_sql() -> &'static str {
     r#"SELECT id, canonical_name, normalized_identity_key,
+              verification_method, verified_by_user_id,
               identity_evidence_kind, identity_source_url,
               identity_source_title, identity_evidence_text,
               identity_confidence
@@ -1081,7 +1124,8 @@ fn identity_select_sql() -> &'static str {
 
 fn membership_select_sql() -> &'static str {
     r#"SELECT avionics_manufacturer_id, avionics_manufacturer_identity_id,
-              membership_basis, normalized_name_key, evidence_source_url,
+              membership_basis, normalized_name_key,
+              verification_method, verified_by_user_id, evidence_source_url,
               evidence_source_title, evidence_text, evidence_confidence
        FROM avionics_manufacturer_identity_memberships
        WHERE avionics_manufacturer_id = ?"#
@@ -1113,6 +1157,7 @@ pub async fn ensure_manufacturer_identity(
     let membership_sql = db.sql(membership_select_sql());
     let identity_by_key_sql = db.sql(
         r#"SELECT id, canonical_name, normalized_identity_key,
+                  verification_method, verified_by_user_id,
                   identity_evidence_kind, identity_source_url,
                   identity_source_title, identity_evidence_text,
                   identity_confidence
@@ -1121,28 +1166,32 @@ pub async fn ensure_manufacturer_identity(
     );
     let insert_identity_sql = db.sql(
         r#"INSERT INTO avionics_manufacturer_identities (
-             canonical_name, normalized_identity_key, identity_evidence_kind,
+             canonical_name, normalized_identity_key,
+             verification_method, verified_by_user_id, identity_evidence_kind,
              identity_source_url, identity_source_title,
              identity_evidence_text, identity_confidence
-           ) VALUES (?, ?, 'authoritative_reference', ?, ?, ?, 'very_high')
+           ) VALUES (?, ?, 'automated', NULL, 'authoritative_reference', ?, ?, ?, 'very_high')
            RETURNING id"#,
     );
     let insert_membership_sql = db.sql(
         r#"INSERT INTO avionics_manufacturer_identity_memberships (
              avionics_manufacturer_id, avionics_manufacturer_identity_id,
-             membership_basis, normalized_name_key, evidence_source_url,
+             membership_basis, normalized_name_key,
+             verification_method, verified_by_user_id, evidence_source_url,
              evidence_source_title, evidence_text, evidence_confidence
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'very_high')"#,
+           ) VALUES (?, ?, ?, ?, 'automated', NULL, ?, ?, ?, 'very_high')"#,
     );
     let insert_exact_memberships_sql = db.sql(
         r#"INSERT INTO avionics_manufacturer_identity_memberships (
              avionics_manufacturer_id, avionics_manufacturer_identity_id,
-             membership_basis, normalized_name_key, evidence_source_url,
+             membership_basis, normalized_name_key,
+             verification_method, verified_by_user_id, evidence_source_url,
              evidence_source_title, evidence_text, evidence_confidence
            )
            SELECT manufacturer_key.avionics_manufacturer_id, ?,
                   'deterministic_exact',
                   manufacturer_key.canonical_manufacturer_key,
+                  'automated', NULL,
                   'urn:aircost:deterministic:avionics-manufacturer-normalization:v1',
                   'Aircost exact manufacturer normalization v1',
                   'The stored manufacturer spelling has the same exact deterministic normalization key as this identity.',
@@ -1159,11 +1208,13 @@ pub async fn ensure_manufacturer_identity(
         DatabaseBackend::Sqlite(_) => db.sql(
             r#"INSERT INTO avionics_manufacturer_identities (
                  canonical_name, normalized_identity_key,
+                 verification_method, verified_by_user_id,
                  identity_evidence_kind, identity_source_url,
                  identity_source_title, identity_evidence_text,
                  identity_confidence
                )
-               SELECT '', '', 'authoritative_reference', '', '', '', 'very_high'
+               SELECT '', '', 'automated', NULL,
+                      'authoritative_reference', '', '', '', 'very_high'
                WHERE 0"#,
         ),
         DatabaseBackend::Postgres(_) => db.sql(
@@ -1514,9 +1565,13 @@ pub async fn approve_manufacturer_alias_candidate(
     let insert_membership_sql = db.sql(
         r#"INSERT INTO avionics_manufacturer_identity_memberships (
              avionics_manufacturer_id, avionics_manufacturer_identity_id,
-             membership_basis, normalized_name_key, evidence_source_url,
+             membership_basis, normalized_name_key,
+             verification_method, verified_by_user_id, evidence_source_url,
              evidence_source_title, evidence_text, evidence_confidence
-           ) VALUES (?, ?, 'authoritative_alias', ?, ?, ?, ?, 'very_high')"#,
+           ) VALUES (
+             ?, ?, 'authoritative_alias', ?, 'automated', NULL,
+             ?, ?, ?, 'very_high'
+           )"#,
     );
     let insert_merge_sql = db.sql(
         r#"INSERT INTO avionics_manufacturer_identity_merges (
@@ -2071,7 +2126,9 @@ mod tests {
         .execute(pool(db))
         .await
         .unwrap();
-        sqlx::query("UPDATE avionics_models SET catalog_status='approved' WHERE id=?")
+        sqlx::query(
+            "UPDATE avionics_models SET catalog_status='approved', verification_method='automated', verified_by_user_id=NULL WHERE id=?",
+        )
             .bind(model_id)
             .execute(pool(db))
             .await
@@ -2396,7 +2453,7 @@ mod tests {
                 .unwrap_err();
         assert!(demotion
             .to_string()
-            .contains("approved avionics product cannot be demoted"));
+            .contains("approved avionics product identity, verification provenance"));
         assert!(
             finalize_approved_manufacturer_identity_merge(&db, candidate.id)
                 .await

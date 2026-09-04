@@ -12,8 +12,10 @@ import {
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
   canSaveAvionicsDiscardIndividually,
+  canSaveHumanProductIndividually,
   canonicalProductSelectionConflicts,
   characterLimitState,
+  createHumanVerifiedProductRequest,
   describeAircraftIdentity,
   describeProductAssociationOutcome,
   describeResolvedListingOutcome,
@@ -165,6 +167,59 @@ test("builds one hash-bound request for an independently saved product decision"
   );
 });
 
+test("builds a source-free human product request with explicit suite structure", () => {
+  assert.deepEqual(
+    createHumanVerifiedProductRequest(
+      "a".repeat(64),
+      "b".repeat(64),
+      "avionics:7:primary",
+      {
+        unreviewedAvionicsModelId: 735,
+        promoteCandidate: true,
+        manufacturer: " Garmin ",
+        model: " G1000 ",
+        capabilities: ["Flight Display", "Navigation"],
+        stableIdentifierKind: "manufacturer_model_number",
+        stableIdentifierValue: " G1000 ",
+        valuationScope: "integrated_suite",
+        suiteComponents: [
+          { avionicsModelId: 8, quantity: 2 },
+          { avionicsModelId: 9, quantity: 1 },
+        ],
+      },
+    ),
+    {
+      review_payload_sha256: "a".repeat(64),
+      catalog_revision_sha256: "b".repeat(64),
+      aspect_id: "avionics:7:primary",
+      unreviewed_avionics_model_id: 735,
+      manufacturer: "Garmin",
+      model: "G1000",
+      capabilities: ["Flight Display", "Navigation"],
+      stable_identifier: {
+        kind: "manufacturer_model_number",
+        value: "G1000",
+      },
+      valuation_scope: "integrated_suite",
+      suite_components: [
+        { avionics_model_id: 8, quantity: 2 },
+        { avionics_model_id: 9, quantity: 1 },
+      ],
+    },
+  );
+  const unit = createHumanVerifiedProductRequest("review", "catalog", "aspect", {
+    manufacturer: "Garmin",
+    model: "G1000 NXi",
+    capabilities: ["Flight Display"],
+    valuationScope: "unit",
+    suiteComponents: [{ avionicsModelId: 8, quantity: 1 }],
+  });
+  assert.deepEqual(unit.suite_components, []);
+  assert.equal("stable_identifier" in unit, false);
+  assert.equal("identity_source_url" in unit, false);
+  assert.equal("identity_evidence_text" in unit, false);
+});
+
 test("builds one hash-bound catalog-independent observation discard request", () => {
   assert.deepEqual(
     discardAvionicsObservationRequest(
@@ -229,6 +284,38 @@ test("allows individual discard only for an independent raw installed aspect", (
     replacementChild,
     { ...independent, replacement_aspect_id: replacementChild.id },
   ]), false, "a referenced replacement child uses complete review");
+});
+
+test("allows source-free human select or create only for an independent primary occurrence", () => {
+  const independent = {
+    id: "avionics:3:primary",
+    kind: "avionics_identity",
+    configuration_action: "installed",
+    configuration_action_editable: false,
+    quantity: 1,
+    allowed_actions: ["use_verified_product", "create_verified_product", "discard"],
+  };
+  assert.equal(
+    canSaveHumanProductIndividually(independent, [independent], "use_verified_product"),
+    true,
+    "a covered ordinary occurrence may receive an accountable human association",
+  );
+  assert.equal(
+    canSaveHumanProductIndividually(independent, [independent], "create_verified_product"),
+    true,
+  );
+  assert.equal(canSaveHumanProductIndividually({
+    ...independent,
+    kind: "avionics_reuse_attestation",
+  }, [], "use_verified_product"), false);
+  assert.equal(canSaveHumanProductIndividually({
+    ...independent,
+    replacement_aspect_id: "avionics:3:replacement",
+  }, [], "create_verified_product"), false);
+  assert.equal(canSaveHumanProductIndividually({
+    ...independent,
+    id: "avionics:3:replacement",
+  }, [], "use_verified_product"), false);
 });
 
 test("builds a hash-bound avionics correction without replacing source evidence", () => {

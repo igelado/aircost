@@ -3741,6 +3741,11 @@ fn review_product_from_approved(approved: &ApprovedAvionicsIdentity) -> ReviewPr
             kind: approved.manufacturer_identifier_kind.clone(),
             value: approved.manufacturer_identifier.clone(),
         }),
+        valuation_scope: crate::listing::review::AvionicsValuationScope::Unit,
+        suite_components: Vec::new(),
+        verification_method: None,
+        verified_by_user_id: None,
+        reviewed_at: None,
         identity_source_url: Some(approved.evidence_url.clone()),
         identity_source_title: Some(approved.evidence_title.clone()),
         identity_evidence_text: Some(approved.evidence.clone()),
@@ -5680,7 +5685,6 @@ mod tests {
             evidence_title: "GNX 375".to_string(),
             evidence: "Manufacturer evidence identifies the product.".to_string(),
             reason: "verified exact product".to_string(),
-            grounded_claim_source_urls: Vec::new(),
             verified_local_reuse_proof: None,
         };
         let attempt = approved_attempt(
@@ -5715,7 +5719,6 @@ mod tests {
             evidence_title: "GNX 375".to_string(),
             evidence: "Grounded manufacturer evidence identifies the product.".to_string(),
             reason: "freshly curated exact product".to_string(),
-            grounded_claim_source_urls: vec!["https://www.garmin.com/gnx375".to_string()],
             verified_local_reuse_proof: None,
         };
 
@@ -7313,7 +7316,6 @@ mod tests {
             evidence_title: "GNX 375".to_string(),
             evidence: "Manufacturer product evidence".to_string(),
             reason: "Verified GPS capability".to_string(),
-            grounded_claim_source_urls: Vec::new(),
             verified_local_reuse_proof: None,
         };
         let transponder = ApprovedAvionicsIdentity {
@@ -8463,6 +8465,13 @@ mod tests {
                 .await
                 .unwrap();
             } else if invalid_product == "suite_membership" {
+                sqlx::query(
+                    "UPDATE avionics_models SET valuation_scope = 'integrated_suite' WHERE id = ?",
+                )
+                .bind(product_id)
+                .execute(pool)
+                .await
+                .unwrap();
                 let component_id =
                     seed_approved_named_product_for_manufacturer_with_identifier_kind(
                         &db,
@@ -11106,7 +11115,9 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+        sqlx::query(
+            "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated', verified_by_user_id = NULL WHERE id = ?",
+        )
             .bind(product_id)
             .execute(pool)
             .await

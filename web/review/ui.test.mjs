@@ -25,13 +25,15 @@ test("provides an accessible render target for pipeline backlog categories", () 
   assert.doesNotMatch(indexHtml, /review-pipeline-(?:aircraft|avionics|gemini)-count/);
 });
 
-test("separates catalog identity from reusable product source status", () => {
+test("labels global OEM source work as automation maintenance", () => {
   assert.match(
     indexHtml,
-    /<th>Product<\/th>\s*<th>Catalog identity<\/th>\s*<th>Reusable source<\/th>/,
+    /<th>Product<\/th>\s*<th>Catalog identity<\/th>\s*<th>OEM automation source<\/th>/,
   );
-  assert.match(indexHtml, /Products needing source check/);
-  assert.match(indexHtml, /Ready after source check/);
+  assert.match(indexHtml, /OEM source automation/);
+  assert.match(indexHtml, /not a prerequisite for a reviewer to approve an individual listing association/);
+  assert.match(indexHtml, /Verify OEM source for automation/);
+  assert.doesNotMatch(reviewJs, /Review product/);
 });
 
 test("prepares preserved product references before reading the product queue", () => {
@@ -69,7 +71,7 @@ test("keeps listing verification disabled while a correction is unsaved", () => 
 
 test("names the three workflows by acceptance and residual-review purpose", () => {
   assert.match(indexHtml, /id="review-mode-pipeline"[^>]*>Automatic acceptance<\/button>/);
-  assert.match(indexHtml, /id="review-mode-product"[^>]*>Known avionics products<\/button>/);
+  assert.match(indexHtml, /id="review-mode-product"[^>]*>OEM source automation<\/button>/);
   assert.match(indexHtml, /id="review-mode-listing"[^>]*>Manual review<\/button>/);
   assert.match(
     indexHtml,
@@ -158,40 +160,50 @@ test("routes aspect-scoped whole-review failures back to the affected card", () 
   assert.match(reviewJs, /showAspectResolutionError\(error\)/);
 });
 
-test("selects a non-reusable approved product only for inline source verification", () => {
-  assert.match(reviewJs, /value\.catalog\?\.reuse_eligible \?\? value\.reuse_eligible/);
-  assert.match(reviewJs, /product\.reuseEligible === false/);
-  assert.match(reviewJs, /Reusable source verification required/);
-  assert.match(reviewJs, /allowUnattested: typeof onSelect !== "function"/);
-  assert.match(reviewJs, /can be selected for inline verification/);
-  assert.match(appCss, /\.review-catalog-result\.not-reusable/);
+test("allows accountable source-free human selection of every approved product", () => {
+  assert.match(reviewJs, /Approved catalog product selected\. Saving this association records the accountable human verification\./);
+  assert.match(reviewJs, /status: "approved"/);
+  assert.match(reviewJs, /Save this human-verified match now/);
+  assert.doesNotMatch(reviewJs, /product\.reuseEligible === false/);
+  assert.doesNotMatch(appCss, /\.review-catalog-result\.not-reusable/);
 });
 
-test("attests a selected catalog product inline without rebuilding listing forms", () => {
-  assert.match(reviewJs, /function inlineProductAttestationControls\(key, product\)/);
+test("creates and saves a source-free human-verified product from one card", () => {
   assert.match(
     reviewJs,
-    /\/api\/review\/avionics\/products\/\$\{productId\}\/attest/,
+    /\/api\/review\/listings\/\$\{review\.listing_id\}\/avionics\/create/,
   );
-  assert.match(reviewJs, /identity_source_url: attestation\.sourceUrl/);
-  assert.match(reviewJs, /const responseReview = result\?\.review/);
-  assert.match(reviewJs, /api\(`\/api\/review\/listings\/\$\{review\.listing_id\}`\)/);
+  assert.match(reviewJs, /createHumanVerifiedProductRequest\(/);
+  assert.match(reviewJs, /Create and use product for this entry/);
+  assert.match(reviewJs, /Stable identifier kind \(optional\)/);
+  assert.doesNotMatch(reviewJs, /draft\.create\.identitySourceUrl/);
+  assert.doesNotMatch(reviewJs, /draft\.create\.identityEvidenceText/);
+});
+
+test("distinguishes integrated suites from units without double-valuing components", () => {
+  assert.match(reviewJs, /\["integrated_suite", "Integrated suite"\]/);
+  assert.match(reviewJs, /The suite is valued once/);
+  assert.match(reviewJs, /Catalog component rows are descriptive and are not valued again/);
+  assert.match(reviewJs, /Suites and individual units remain distinct catalog products/);
+  assert.match(reviewJs, /An integrated suite cannot contain another suite/);
+  assert.match(appCss, /\.review-suite-component/);
+});
+
+test("edits an existing approved product structure behind an optimistic reviewer boundary", () => {
+  assert.match(indexHtml, /id="review-product-structure-editor"/);
+  assert.match(indexHtml, /This is a source-free human catalog decision/);
+  assert.match(indexHtml, /separate from both OEM automation and approval of any listing association/);
+  assert.match(reviewJs, /function renderExistingProductStructureEditor\(\)/);
+  assert.match(reviewJs, /function searchExistingProductStructureComponents/);
   assert.match(
     reviewJs,
-    /responseReview === null \|\| responseReview === undefined[\s\S]*?Promise\.resolve\(\{ review: responseReview \}\)/,
+    /\/api\/review\/avionics\/products\/\$\{selected\.id\}\/structure/,
   );
-  assert.match(
-    reviewJs,
-    /state\.currentReview\.catalog_revision_sha256 = refreshedReview\.catalog_revision_sha256/,
-  );
-  assert.match(reviewJs, /renderSelectedCatalogProduct\(selected, draft\.catalogProduct, key\)/);
-  const handler = reviewJs.match(
-    /async function attestInlineCatalogProduct\(event, key\) \{[\s\S]*?\n\}\n\nasync function loadSelectedProductEvidence/,
-  )?.[0] ?? "";
-  assert.notEqual(handler, "");
-  assert.doesNotMatch(handler, /renderReview\(/);
-  assert.doesNotMatch(handler, /initializeDrafts\(|state\.drafts\.clear\(/);
-  assert.match(appCss, /\.review-inline-attestation/);
+  assert.match(reviewJs, /catalog_revision_sha256: selected\.catalogRevision/);
+  assert.match(reviewJs, /valuation_scope: draft\.valuationScope/);
+  assert.match(reviewJs, /suite_components: draft\.valuationScope === "integrated_suite"/);
+  assert.match(reviewJs, /G1000 and G1000 NXi remain separate products/);
+  assert.match(appCss, /\.review-existing-structure-form/);
 });
 
 test("brings the product review workspace into view from a queue row action", () => {

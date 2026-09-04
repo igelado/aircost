@@ -90,11 +90,12 @@ a suite and its components are not counted twice. Only approved installed
 contribution values in the valuation year's nominal dollars can contribute to
 the delta; a missing or differently denominated value stops valuation instead
 of invoking an inferred inflation adjustment.
-Automatic listing associations contribute only when every installed and
-replacement endpoint has current exact capture-bound authorization. A single
-missing or stale automatic authorization excludes the whole listing rather
-than silently valuing a partial panel; reviewer-confirmed `listing_review`
-associations are the explicit row-free authority.
+Automatic listing associations, including hash-bound `listing_review` links,
+contribute only when every installed and replacement endpoint has current exact
+capture-bound authorization. A single missing or stale automatic authorization
+excludes the whole listing rather than silently valuing a partial panel;
+reviewer-confirmed `human_review` associations are the explicit row-free
+authority.
 
 After the model produces a market estimate, the serving adapter removes its
 learned identity/configuration anchor and rescales the aircraft estimate and

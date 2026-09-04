@@ -276,8 +276,8 @@ identity confidence. A listing cannot contain the same canonical product twice
 or install and replace the same product. Ready or verified listing associations
 are immutable. A transition to `ready` additionally requires positive quantity,
 approved endpoints, high confidence, and `listing`,
-`listing_explicit_count`, or `listing_review` provenance for every avionics
-link.
+`listing_explicit_count`, `listing_review`, or `human_review` provenance for
+every avionics link.
 
 `aircraft_sale_listing_avionics_link_authorizations` records the current authority
 for each exact installed or replacement endpoint. A link is authorized either
@@ -291,13 +291,14 @@ chronology, and exact decoded evidence. This read boundary is required because
 SQLite cannot compute the checkpoint SHA-256 in a trigger. The latter
 authorization does not confer reuse authority on any other listing. Neither
 form stores a provider dossier or duplicates listing evidence.
-Automatic `listing` and `listing_explicit_count` links require a current row
-for the installed endpoint and, for `replaces` or `removes`, a second current
-row for the replacement endpoint. `listing_review` is the explicit human
-authority and therefore remains row-free. Deleting any authorization from a
-surviving ready or verified listing atomically quarantines and unverifies the
-listing with `avionics_authorization_invalidated`; authorization is live
-publication authority, not historical audit evidence.
+Automatic `listing`, `listing_explicit_count`, and hash-bound `listing_review`
+links require a current row for the installed endpoint and, for `replaces` or
+`removes`, a second current row for the replacement endpoint. `human_review`
+is the explicit reviewer authority and therefore remains row-free. Deleting
+any authorization from a surviving ready or verified listing atomically
+quarantines and unverifies the listing with
+`avionics_authorization_invalidated`; authorization is live publication
+authority, not historical audit evidence.
 Publication revalidates the full hash-level authority state inside the same
 writer-locked SQLite or serializable PostgreSQL transaction that changes the
 listing to `ready`; the structural ready trigger is an additional row-shape
@@ -446,9 +447,14 @@ Listings are created through either the web API or plugin submission path:
 Review resolution is a separate lifecycle. Every ordinary extracted avionics
 aspect offers three actions, and the reviewer must submit exactly one: use an
 existing approved product, create a verified product, or discard the
-observation with a reason. Creation requires one or more canonical capabilities, a stable
-manufacturer identifier kind and value, and an authoritative source URL,
-title, and evidence text. An unlinked observation receives an explicit legacy
+observation with a reason. Selecting an approved product is itself an
+accountable, listing-scoped human verification; it does not require a global
+OEM source attestation. Creation requires manufacturer, model, one or more
+canonical capabilities, and an explicit unit or integrated-suite valuation
+scope. A stable manufacturer identifier is optional; when omitted, the server
+derives a manufacturer model-number identifier from the reviewed model. Human
+creation stores the reviewer and review time but no invented OEM URL, title, or
+excerpt. An unlinked observation receives an explicit legacy
 promotion target only when its normalized identity selects exactly one catalog
 row and that row is `unreviewed`. An aspect covering an existing legacy listing
 association can instead expose that exact row by its covered catalog ID. In
@@ -458,15 +464,32 @@ model collisions, global references, and exact cross-listing coverage are
 rechecked under lock. A corrected manufacturer/model creates a separate
 approved identity and leaves the old candidate and unrelated links untouched.
 
-An independent ordinary installed aspect may commit its existing-product
-decision before the rest of the review. The aspect-scoped transaction preserves
-unrelated link IDs, removes only the resolved aspect, rewrites the pending
-payload and hash for the residual work, and returns the refreshed review. If no
-aspect remains, the server immediately runs the same canonical FAA, aircraft,
-avionics-graph, and listing-readiness finalizer used after complete review. Its
-response distinguishes a completed review from an actually `ready`, verified
-listing and returns the exact finalization error after a committed last-aspect
-decision, avoiding an unsafe retry of the already-applied association.
+Integrated suites and individual units are distinct catalog identities. A
+suite creation decision must name at least one approved unit component with a
+positive quantity; units cannot contain components, suites cannot contain
+other suites, and duplicate component rows are rejected. A selected suite is
+valued once. Its component rows describe catalog composition and are not
+additional listing occurrences unless the listing explicitly names those
+units separately. Review therefore never treats Garmin G1000 and G1000 NXi as
+aliases or infers unobserved components from either name.
+
+A reviewer may also correct the valuation scope and complete component set of
+an existing approved product through a catalog-revision-guarded structure
+update. This is a source-free human catalog decision. It neither attests an OEM
+source nor approves any listing association, and it changes only the selected
+catalog product.
+
+An independent ordinary installed aspect may commit its existing-product or
+human-created-product decision before the rest of the review. The aspect-scoped
+transaction preserves unrelated link IDs, removes only the resolved aspect,
+rewrites the pending payload and hash for the residual work, and returns the
+refreshed review. The UI preserves unsaved decisions for the remaining cards
+and reports a rejected decision on the exact card. If no aspect remains, the
+server immediately runs the same canonical FAA, aircraft, avionics-graph, and
+listing-readiness finalizer used after complete review. Its response
+distinguishes a completed review from an actually `ready`, verified listing and
+returns the exact finalization error after a committed last-aspect decision,
+avoiding an unsafe retry of the already-applied association.
 
 An independent raw installed aspect may also commit a manual discard before the
 rest of the review. The same transaction writes an immutable occurrence
@@ -475,8 +498,10 @@ and restages the residual review. Aspects that cover an existing association or
 participate in a replacement graph remain complete-review decisions so a
 partial commit cannot break configuration semantics.
 
-Hash-bound approved-product aspects use a product-centric workflow. One current
-OEM attestation is shared by every pending occurrence of that product. The
+Hash-bound approved-product aspects also support an OEM-source automation
+workflow. This is an optimization for deterministic bulk validation, not a
+prerequisite for listing-scoped human approval. One current OEM attestation is
+shared by every pending occurrence of that product. The
 deterministic source proof is bound to the complete manufacturer-scoped
 collision snapshot, and the write transaction rechecks both that snapshot and
 ownership of the hash-bound pending aspect. The attestation preflight accepts
@@ -512,8 +537,8 @@ may annotate the exact suggestion as a hash-bound attestation target only when
 manufacturer/model typography, capability subset, optional stable identifier,
 and independent installed-occurrence shape still match the live approved
 catalog. This changes neither the listing link nor the occurrence decision; it
-only makes the missing global product-source prerequisite visible to the Known
-avionics products workflow.
+only makes the optional automated OEM-source maintenance visible in the OEM
+source automation workflow.
 
 `source_evidence_text` and `source_confidence` are one paired occurrence-proof
 value: neither is retained without the other, and `observed_text` is never an
@@ -560,9 +585,10 @@ listing evidence, listing-specific persistence, and listing-specific
 enrichment failures become `quarantined`. If a new pending bundle appears
 while post-review enrichment is running, that bundle wins: the listing remains
 `pending_review` instead of becoming a stranded quarantined review.
-Reviewer-accepted listing associations are stored with
-high installation confidence and a `listing_review` source, which is eligible
-where valuation reads otherwise accept high-confidence `listing` evidence.
+Reviewer-accepted listing associations are stored with high installation
+confidence and a `human_review` source, which is eligible where valuation reads
+otherwise accept high-confidence `listing` evidence. `listing_review` remains
+the separate hash-bound machine-authorization source.
 Network enrichment is intentionally not held inside the review transaction.
 
 The listing insert path deliberately keeps code generic. If a Cessna, Cirrus, or
@@ -1010,7 +1036,7 @@ legacy links that do not match any usable retained observation are also staged,
 including their exact installed and replacement roles, so stale imported links
 cannot bypass review. If no usable retained observations exist, those
 approved/high links are preserved rather than rejected without evidence.
-Associations with `listing_review` provenance are never reopened by this
+Associations with `human_review` provenance are never reopened by this
 backfill. Retained extraction evidence is staged only as a complete
 evidence/confidence pair. Notes copied from unmatched legacy installed or
 replacement links are not occurrence evidence and are never copied into the
@@ -1934,15 +1960,15 @@ WHERE type = 'table'
 ```
 
 The contract must be version `1` with fingerprint
-`45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819`.
+`63cae87c0bc5081f0018855535d9a9c7ac9e457f7e8972f6d29ccabdb790b1a7`.
 The fingerprint is the SHA-256 of this newline-terminated manifest:
 
 ```text
 20260819_reference_catalog_cutover:v1
-sqlite-old:239:2e4f2cb9ab443550681d24447d23395bb52c0c51b6b87ca02556c630c0c2313c
-sqlite-post:215:0b0c2e65ef87d0fd7a7762948cd09dcef32707687ea55921c30fcaea62f9a3ba
+sqlite-old:239:c9f2f6020b5da0b65fc2bfbf20c1995563e3de280e7267ef0c0f6fbdfa997961
+sqlite-post:215:aa69fc0ffa2c9e01e1c565ee7696b384eba70ed22ebe8897d503fc355b69390f
 postgres-old:927:59b835f2713977662774deea8dc53e4a
-postgres-post:804:ba236136f4f31173a4a5d71c8d8a5be5
+postgres-post:813:2398147ef3fa8ed8e4825690b2c47e60
 ```
 
 Its `installed_at` value records the first successful installation and remains

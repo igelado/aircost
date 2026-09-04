@@ -24,8 +24,10 @@ import {
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
   canSaveAvionicsDiscardIndividually,
+  canSaveHumanProductIndividually,
   characterLimitState,
   canonicalProductSelectionConflicts,
+  createHumanVerifiedProductRequest,
   describeAircraftIdentity,
   describeProductAssociationOutcome,
   describeResolvedListingOutcome,
@@ -106,6 +108,8 @@ const state = {
   productBusy: false,
   productBusyProductId: null,
   productActionSequence: 0,
+  productStructureSearchTimer: null,
+  productStructureSearchSequence: 0,
   detailRequestSequence: 0,
   currentReview: null,
   drafts: new Map(),
@@ -234,6 +238,8 @@ function collectElements() {
     reviewProductTitleCount: "#review-product-title-count",
     reviewProductEvidenceCount: "#review-product-evidence-count",
     reviewProductAttest: "#review-product-attest",
+    reviewProductStructureEditor: "#review-product-structure-editor",
+    reviewProductStructureMessage: "#review-product-structure-message",
     reviewProductRecover: "#review-product-recover",
     reviewProductValidate: "#review-product-validate",
     reviewProductActionMessage: "#review-product-action-message",
@@ -445,12 +451,12 @@ function setQueueMode(mode, { load = true } = {}) {
   elements.reviewQueueTitle.textContent = pipelineMode
     ? "Automatic acceptance"
     : productMode
-      ? "Known avionics products"
+      ? "OEM source automation"
       : "Residual manual review";
   elements.reviewQueueDescription.textContent = pipelineMode
     ? "Run safe checks across non-ready listings. Only unambiguous, source-supported identities are accepted."
     : productMode
-      ? "Maintain one reusable manufacturer source per catalog identity, then validate only eligible exact occurrences locally."
+      ? "Maintain manufacturer sources used by automated bulk checks. Individual human listing approvals do not require this dossier."
       : "Resolve only the aircraft and avionics evidence that automatic acceptance left pending.";
   for (const metric of document.querySelectorAll(".review-product-only-metric")) {
     metric.classList.toggle("is-hidden", !productMode);
@@ -464,7 +470,7 @@ function setQueueMode(mode, { load = true } = {}) {
     elements.reviewPendingLabel.textContent = "Total pending";
     elements.reviewAspectLabel.textContent = "Ready locally";
     elements.reviewReasonLabel.textContent = "Needs source recovery";
-    elements.reviewAttestationLabel.textContent = "Products needing source check";
+    elements.reviewAttestationLabel.textContent = "Products needing OEM maintenance";
     elements.reviewManualLabel.textContent = "Manual or ambiguous";
     if (state.productGroups.length) {
       renderProductQueue();
@@ -1399,10 +1405,10 @@ function productQueueRow(group) {
   const identityCell = queueTextCell("Catalog identity", "Verified");
   identityCell.classList.add("review-status-current");
   const sourceCell = queueTextCell(
-    "Reusable source",
+    "OEM automation source",
     group?.attestation_status === "current"
       ? "Current"
-      : "Source check required",
+      : "Maintenance required",
   );
   sourceCell.classList.add(
     group?.attestation_status === "current" ? "review-status-current" : "review-status-required",
@@ -1419,8 +1425,8 @@ function productQueueRow(group) {
   button.dataset.reviewProductId = String(productId ?? "");
   button.disabled = productId === null || state.productBusy;
   button.textContent = group?.attestation_status === "current"
-    ? "Validate associations"
-    : "Review product";
+    ? "Run automated validation"
+    : "Maintain OEM source";
   actionCell.append(button);
   row.append(
     productCell,
@@ -1441,7 +1447,7 @@ function productGroupPendingSummary(group) {
     summary.readyLocal ? `${summary.readyLocal} ready` : null,
     summary.needsSourceRecovery ? `${summary.needsSourceRecovery} need source text` : null,
     summary.productAttestationRequired
-      ? `${summary.productAttestationRequired} ready after source check`
+      ? `${summary.productAttestationRequired} ready after OEM check`
       : null,
     summary.manualOrAmbiguous ? `${summary.manualOrAmbiguous} manual` : null,
   ].filter(nonBlank).join(" · ");
@@ -1494,6 +1500,11 @@ async function openProductReview(productId) {
     return { status: "busy" };
   }
   const sequence = ++state.productDetailRequestSequence;
+  if (state.productStructureSearchTimer !== null) {
+    window.clearTimeout(state.productStructureSearchTimer);
+    state.productStructureSearchTimer = null;
+  }
+  state.productStructureSearchSequence += 1;
   elements.reviewProductWorkspace.classList.remove("is-hidden");
   elements.reviewProductActionMessage.textContent = "Loading product associations…";
   elements.reviewProductWorkspace.focus({ preventScroll: true });
@@ -1511,7 +1522,9 @@ async function openProductReview(productId) {
       product: detail.product,
       attestationStatus: detail.attestationStatus,
       catalogRevision: detail.catalogRevision,
+      structureDraft: productStructureDraft(detail.product),
     };
+    elements.reviewProductStructureMessage.textContent = "";
     state.productAssociations = detail.associations;
     renderSelectedProduct();
     return { status: "loaded" };
@@ -1553,10 +1566,11 @@ function renderSelectedProduct() {
   ].filter(nonBlank).join(" · ");
   const current = selected.attestationStatus === "current";
   elements.reviewProductStatus.textContent = current
-    ? "Reusable source current"
-    : "Reusable source check required";
+    ? "OEM automation source current"
+    : "OEM automation source maintenance required";
   elements.reviewProductStatus.classList.toggle("is-current", current);
   elements.reviewProductAttestationForm.classList.toggle("is-hidden", current);
+  renderExistingProductStructureEditor();
   const autoVerifiable = autoVerifiableProductAssociations(
     state.productAssociations,
     selected.attestationStatus,
@@ -1577,7 +1591,7 @@ function renderSelectedProduct() {
     || autoVerifiable.length === 0
     || state.productBusy;
   elements.reviewProductValidate.textContent = autoVerifiable.length > 0
-    ? `Apply to ${autoVerifiable.length} eligible unique ${pluralize(autoVerifiable.length, "occurrence")}`
+    ? `Automatically apply to ${autoVerifiable.length} eligible unique ${pluralize(autoVerifiable.length, "occurrence")}`
     : "No eligible unique occurrences";
   elements.reviewProductRecover.disabled = !current
     || summary.needsSourceRecovery === 0
@@ -1594,7 +1608,331 @@ function renderSelectedProduct() {
   renderProductAssociationRows();
   elements.reviewProductActionMessage.textContent = current
     ? productAssociationActionSummary(summary)
-    : "The catalog identity is verified. Complete one reusable manufacturer-source check before validating ready associations.";
+    : "This OEM source is needed only for automated bulk validation. Reviewers can still approve each listing association directly from its avionics card.";
+}
+
+function productStructureDraft(product) {
+  const normalized = normalizedProduct(product);
+  return {
+    valuationScope: normalized?.valuationScope || "unit",
+    suiteComponents: normalizedSuiteComponents(normalized?.suiteComponents),
+  };
+}
+
+function productStructureValidation(selected, draft) {
+  if (!selected || !draft) {
+    return { valid: false, message: "Select a catalog product first." };
+  }
+  if (draft.valuationScope === "unit") {
+    return { valid: true, message: "This catalog product is one independently valued unit." };
+  }
+  if (draft.valuationScope !== "integrated_suite") {
+    return { valid: false, message: "Select a valid product kind." };
+  }
+  if (!Array.isArray(draft.suiteComponents) || draft.suiteComponents.length === 0) {
+    return { valid: false, message: "An integrated suite requires at least one approved unit component." };
+  }
+  const componentIds = new Set();
+  for (const component of draft.suiteComponents) {
+    const componentId = positiveInteger(component?.avionicsModelId);
+    if (componentId === null || positiveInteger(component?.quantity) === null) {
+      return { valid: false, message: "Every component needs a positive ID and whole-number quantity." };
+    }
+    if (componentId === selected.id) {
+      return { valid: false, message: "A suite cannot contain itself." };
+    }
+    if (component?.valuationScope === "integrated_suite") {
+      return { valid: false, message: "A suite cannot contain another integrated suite." };
+    }
+    if (componentIds.has(componentId)) {
+      return { valid: false, message: `Catalog component ${componentId} appears more than once.` };
+    }
+    componentIds.add(componentId);
+  }
+  return {
+    valid: true,
+    message: `${draft.suiteComponents.length} explicit ${pluralize(draft.suiteComponents.length, "component")} will describe this suite without adding separate listing value.`,
+  };
+}
+
+function renderExistingProductStructureEditor() {
+  const container = elements.reviewProductStructureEditor;
+  if (!container) {
+    return;
+  }
+  container.replaceChildren();
+  const selected = state.selectedProduct;
+  if (!selected) {
+    return;
+  }
+  const draft = selected.structureDraft
+    || (selected.structureDraft = productStructureDraft(selected.product));
+  const form = document.createElement("form");
+  form.className = "review-existing-structure-form";
+  const scopeLabel = document.createElement("label");
+  const scopeCaption = document.createElement("span");
+  scopeCaption.textContent = "Product kind";
+  const scope = document.createElement("select");
+  for (const [value, label] of [
+    ["unit", "Individual unit"],
+    ["integrated_suite", "Integrated suite"],
+  ]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    option.selected = draft.valuationScope === value;
+    scope.append(option);
+  }
+  scope.disabled = state.productBusy;
+  scope.addEventListener("change", () => {
+    draft.valuationScope = scope.value;
+    elements.reviewProductStructureMessage.textContent = "";
+    renderExistingProductStructureEditor();
+  });
+  scopeLabel.append(scopeCaption, scope);
+  form.append(scopeLabel);
+
+  if (draft.valuationScope === "integrated_suite") {
+    const components = document.createElement("div");
+    components.className = "review-existing-structure-components";
+    if (draft.suiteComponents.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "review-selection-empty";
+      empty.textContent = "No components recorded. Add the complete known component set before saving this suite.";
+      components.append(empty);
+    } else {
+      for (const component of draft.suiteComponents) {
+        components.append(existingProductStructureComponent(component, selected, draft));
+      }
+    }
+    const searchLabel = document.createElement("label");
+    const searchCaption = document.createElement("span");
+    searchCaption.textContent = "Add an approved unit";
+    const search = document.createElement("input");
+    search.type = "search";
+    search.placeholder = "Manufacturer, exact model, or identifier";
+    search.autocomplete = "off";
+    search.disabled = state.productBusy;
+    const results = document.createElement("div");
+    results.className = "review-catalog-results review-existing-structure-results";
+    const searchMessage = document.createElement("p");
+    searchMessage.className = "review-catalog-message";
+    searchMessage.textContent = "Search for explicit unit components; integrated suites cannot be nested.";
+    search.addEventListener("input", () => {
+      scheduleExistingProductStructureSearch(search.value, results, searchMessage);
+    });
+    searchLabel.append(searchCaption, search);
+    form.append(components, searchLabel, searchMessage, results);
+  }
+
+  const validation = productStructureValidation(selected, draft);
+  const validationMessage = document.createElement("p");
+  validationMessage.className = `review-decision-validation${validation.valid ? "" : " error"}`;
+  validationMessage.textContent = `${validation.message} G1000 and G1000 NXi remain separate products; this edit changes only catalog product ${selected.id}.`;
+  const save = document.createElement("button");
+  save.type = "submit";
+  save.className = "button";
+  save.disabled = !validation.valid || state.productBusy;
+  save.textContent = state.productBusy
+    ? "Saving human catalog decision…"
+    : "Save human catalog structure";
+  form.append(validationMessage, save);
+  form.addEventListener("submit", saveExistingProductStructure);
+  container.append(form);
+}
+
+function existingProductStructureComponent(component, selected, draft) {
+  const row = document.createElement("div");
+  row.className = "review-suite-component";
+  const identity = document.createElement("div");
+  const name = document.createElement("strong");
+  name.textContent = component.displayName || `Catalog unit ${component.avionicsModelId}`;
+  const metadata = document.createElement("span");
+  metadata.textContent = [`Catalog ID ${component.avionicsModelId}`, component.stableIdentifier]
+    .filter(nonBlank).join(" · ");
+  identity.append(name, metadata);
+  const quantityLabel = document.createElement("label");
+  const quantityCaption = document.createElement("span");
+  quantityCaption.textContent = "Quantity";
+  const quantity = document.createElement("input");
+  quantity.type = "number";
+  quantity.min = "1";
+  quantity.step = "1";
+  quantity.value = String(component.quantity);
+  quantity.disabled = state.productBusy;
+  quantity.addEventListener("input", () => {
+    component.quantity = Number.parseInt(quantity.value, 10);
+    const validation = productStructureValidation(selected, draft);
+    elements.reviewProductStructureMessage.textContent = validation.message;
+  });
+  quantityLabel.append(quantityCaption, quantity);
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "button subtle";
+  remove.textContent = "Remove";
+  remove.disabled = state.productBusy;
+  remove.addEventListener("click", () => {
+    draft.suiteComponents = draft.suiteComponents.filter(
+      (candidate) => candidate.avionicsModelId !== component.avionicsModelId,
+    );
+    elements.reviewProductStructureMessage.textContent = `${component.displayName} removed from the draft component set.`;
+    renderExistingProductStructureEditor();
+  });
+  row.append(identity, quantityLabel, remove);
+  return row;
+}
+
+function scheduleExistingProductStructureSearch(query, results, message) {
+  if (state.productStructureSearchTimer !== null) {
+    window.clearTimeout(state.productStructureSearchTimer);
+  }
+  const normalized = query.trim();
+  const sequence = ++state.productStructureSearchSequence;
+  if (normalized.length < 2) {
+    state.productStructureSearchTimer = null;
+    results.replaceChildren();
+    message.textContent = "Enter at least two characters to search approved units.";
+    return;
+  }
+  message.textContent = "Waiting to search approved units…";
+  state.productStructureSearchTimer = window.setTimeout(() => {
+    state.productStructureSearchTimer = null;
+    searchExistingProductStructureComponents(normalized, sequence, results, message);
+  }, CATALOG_SEARCH_DELAY_MS);
+}
+
+async function searchExistingProductStructureComponents(query, sequence, results, message) {
+  const selected = state.selectedProduct;
+  if (!selected) {
+    return;
+  }
+  const productId = selected.id;
+  results.setAttribute("aria-busy", "true");
+  message.textContent = "Searching approved units…";
+  try {
+    const params = new URLSearchParams({
+      search: query,
+      status: "approved",
+      limit: String(CATALOG_RESULT_LIMIT),
+      offset: "0",
+    });
+    const payload = await api(`/api/avionics?${params}`);
+    if (sequence !== state.productStructureSearchSequence
+      || state.selectedProduct?.id !== productId) {
+      return;
+    }
+    const items = Array.isArray(payload?.catalog?.items) ? payload.catalog.items : [];
+    results.replaceChildren(...items.map((item) => catalogResult(item, () => {
+      const current = state.selectedProduct;
+      const product = normalizedProduct(item);
+      if (!current || current.id !== productId || !product) {
+        return;
+      }
+      if (product.id === productId) {
+        message.textContent = "A suite cannot contain itself.";
+        message.classList.add("error");
+        return;
+      }
+      if (product.valuationScope !== "unit") {
+        message.textContent = "A suite cannot contain another integrated suite.";
+        message.classList.add("error");
+        return;
+      }
+      if (current.structureDraft.suiteComponents.some(
+        (component) => component.avionicsModelId === product.id,
+      )) {
+        message.textContent = `${product.displayName} is already a component.`;
+        message.classList.add("error");
+        return;
+      }
+      current.structureDraft.suiteComponents.push({
+        avionicsModelId: product.id,
+        displayName: product.displayName,
+        stableIdentifier: product.stableIdentifier,
+        valuationScope: product.valuationScope,
+        quantity: 1,
+      });
+      elements.reviewProductStructureMessage.textContent = `${product.displayName} added to the draft component set.`;
+      renderExistingProductStructureEditor();
+    })));
+    message.classList.remove("error");
+    message.textContent = items.length
+      ? `${items.length} approved ${pluralize(items.length, "product")} found. Choose only individual units.`
+      : "No approved avionics matched this search.";
+  } catch (error) {
+    if (sequence === state.productStructureSearchSequence
+      && state.selectedProduct?.id === productId) {
+      results.replaceChildren();
+      message.classList.add("error");
+      message.textContent = `Could not search catalog units: ${error.message}`;
+    }
+  } finally {
+    if (sequence === state.productStructureSearchSequence) {
+      results.setAttribute("aria-busy", "false");
+    }
+  }
+}
+
+async function saveExistingProductStructure(event) {
+  event.preventDefault();
+  const selected = state.selectedProduct;
+  const draft = selected?.structureDraft;
+  const validation = productStructureValidation(selected, draft);
+  if (!selected || !validation.valid || state.productBusy) {
+    elements.reviewProductStructureMessage.textContent = validation.message;
+    return;
+  }
+  const action = beginProductAction(selected);
+  elements.reviewProductStructureMessage.textContent = "Saving this source-free human catalog decision…";
+  try {
+    const payload = await api(`/api/review/avionics/products/${selected.id}/structure`, {
+      method: "POST",
+      body: JSON.stringify({
+        catalog_revision_sha256: selected.catalogRevision,
+        valuation_scope: draft.valuationScope,
+        suite_components: draft.valuationScope === "integrated_suite"
+          ? draft.suiteComponents.map((component) => ({
+            avionics_model_id: component.avionicsModelId,
+            quantity: component.quantity,
+          }))
+          : [],
+      }),
+    });
+    if (!productActionContextIsCurrent(action, state)) {
+      return;
+    }
+    const detail = payload?.avionics;
+    const catalogRevision = optionalText(payload?.catalog_revision_sha256);
+    if (!detail?.summary
+      || positiveInteger(detail.summary.id) !== selected.id
+      || !catalogRevision) {
+      throw new Error("The server returned an invalid catalog structure result.");
+    }
+    selected.product = {
+      ...detail.summary,
+      suite_components: detail.suite_components,
+      suite_memberships: detail.suite_memberships,
+    };
+    selected.catalogRevision = catalogRevision;
+    selected.structureDraft = productStructureDraft(selected.product);
+    renderSelectedProduct();
+    elements.reviewProductStructureMessage.textContent =
+      `Saved ${productKindLabel(normalizedProduct(selected.product))} structure for catalog product ${selected.id}.`;
+    await Promise.allSettled([
+      loadProductQueue({
+        quiet: true,
+        commitGuard: () => productActionContextIsCurrent(action, state),
+      }),
+      Promise.resolve(refreshAvionics?.()),
+    ]);
+  } catch (error) {
+    if (productActionContextIsCurrent(action, state)) {
+      elements.reviewProductStructureMessage.textContent =
+        `Could not save catalog structure: ${error.message}`;
+    }
+  } finally {
+    finishProductAction(action);
+  }
 }
 
 function productAssociationActionSummary(summary) {
@@ -1972,6 +2310,7 @@ function setProductBusy(busy) {
   setButtonBusy(elements.reviewProductAttest, busy);
   setButtonBusy(elements.reviewProductRecover, busy);
   setButtonBusy(elements.reviewProductValidate, busy);
+  renderExistingProductStructureEditor();
   const summary = summarizeProductAssociations(
     state.productAssociations,
     state.selectedProduct?.attestationStatus,
@@ -2246,25 +2585,25 @@ function initializeDrafts(review, preservedDrafts = null) {
       correction: avionicsObservationCorrectionDraft(aspect),
       catalogProduct: normalizedProduct(aspect.suggested_product),
       create: {
+        unreviewedAvionicsModelId: positiveInteger(aspect.proposed_product?.id),
+        promoteCandidate: positiveInteger(aspect.proposed_product?.id) !== null,
         manufacturer: proposed?.manufacturer || "",
         model: proposed?.model || "",
         capabilities: proposed?.capabilities || [],
-        manufacturerIdentifierKind: optionalText(
+        stableIdentifierKind: optionalText(
           sourceProduct?.stable_identifier?.kind
             ?? sourceProduct?.manufacturer_identifier_kind,
         ),
-        manufacturerIdentifier: optionalText(
+        stableIdentifierValue: optionalText(
           sourceProduct?.stable_identifier?.value
             ?? sourceProduct?.manufacturer_identifier,
         ),
-        identitySourceUrl: optionalText(sourceProduct?.identity_source_url),
-        identitySourceTitle: optionalText(sourceProduct?.identity_source_title),
-        identityEvidenceText: optionalText(sourceProduct?.identity_evidence_text),
+        valuationScope: productValuationScope(sourceProduct),
+        suiteComponents: normalizedSuiteComponents(sourceProduct?.suite_components),
       },
       discardReason: "",
       savingDecision: false,
       decisionError: "",
-      inlineAttestation: inlineAttestationDraft(normalizedProduct(aspect.suggested_product)),
     };
     const preserved = preservedDrafts?.get(key);
     if (preserved) {
@@ -2275,13 +2614,10 @@ function initializeDrafts(review, preservedDrafts = null) {
       draft.create = {
         ...preserved.create,
         capabilities: [...preserved.create.capabilities],
+        suiteComponents: normalizedSuiteComponents(preserved.create.suiteComponents),
       };
       draft.discardReason = preserved.discardReason;
       draft.decisionError = preserved.decisionError;
-      draft.inlineAttestation = {
-        ...preserved.inlineAttestation,
-        saving: false,
-      };
       draft.correction = {
         ...preserved.correction,
         saving: false,
@@ -2732,12 +3068,12 @@ function renderAspect(aspect, index, total) {
     const sourceStatus = document.createElement("p");
     sourceStatus.className = `review-catalog-message ${sourceCurrent ? "review-status-current" : "review-status-required"}`;
     sourceStatus.textContent = sourceCurrent
-      ? "Reusable manufacturer source is current."
-      : "Reusable manufacturer source check is still required in Known avionics products.";
+      ? "The OEM source is current for automated local validation."
+      : "OEM source maintenance is incomplete, so automated validation is unavailable. Human approval of this association remains available below.";
     const associationAction = document.createElement("button");
     associationAction.type = "button";
     associationAction.className = "button";
-    associationAction.textContent = "Validate this listing association locally";
+    associationAction.textContent = "Run automated evidence validation";
     associationAction.disabled = !sourceCurrent;
     associationAction.addEventListener("click", () => {
       validateExistingAssociation(key, associationAction);
@@ -2746,7 +3082,7 @@ function renderAspect(aspect, index, total) {
     associationHint.className = "review-catalog-message";
     associationHint.textContent = sourceCurrent
       ? "This operation uses only retained listing text and the verified local catalog."
-      : "Local association validation stays unavailable until the product source check is complete.";
+      : "Use the normal product-selection decision below to approve this association without an OEM source dossier.";
     context.append(sourceStatus, associationAction, associationHint);
   }
   const suggestedId = positiveInteger(aspect.suggested_product?.id);
@@ -3213,6 +3549,21 @@ function catalogSelectionControls(aspect, draft, key) {
 function createProductControls(draft, key) {
   const grid = document.createElement("div");
   grid.className = "review-create-product-grid";
+  const suiteEditor = document.createElement("section");
+  suiteEditor.className = "review-suite-editor";
+  const valuationScope = draftSelect(
+    "Product kind",
+    draft.create.valuationScope,
+    [
+      ["unit", "Individual unit"],
+      ["integrated_suite", "Integrated suite"],
+    ],
+    (value) => {
+      draft.create.valuationScope = value;
+      suiteEditor.classList.toggle("is-hidden", value !== "integrated_suite");
+      draftChanged(key);
+    },
+  );
   grid.append(
     draftInput("Manufacturer", draft.create.manufacturer, (value) => {
       draft.create.manufacturer = value;
@@ -3226,41 +3577,167 @@ function createProductControls(draft, key) {
       draft.create.capabilities = commaSeparatedValues(value);
       draftChanged(key);
     }, "text", true),
+    valuationScope,
     draftSelect(
-      "Manufacturer identifier kind",
-      draft.create.manufacturerIdentifierKind,
+      "Stable identifier kind (optional)",
+      draft.create.stableIdentifierKind,
       [
-        ["", "Select identifier kind"],
+        ["", "Derive from model"],
         ["manufacturer_part_number", "Manufacturer part number"],
         ["manufacturer_model_number", "Manufacturer model number"],
         ["sku", "SKU"],
       ],
       (value) => {
-        draft.create.manufacturerIdentifierKind = value;
+        draft.create.stableIdentifierKind = value;
         draftChanged(key);
       },
     ),
-    draftInput("Manufacturer identifier", draft.create.manufacturerIdentifier, (value) => {
-      draft.create.manufacturerIdentifier = value;
+    draftInput("Stable identifier value (optional)", draft.create.stableIdentifierValue, (value) => {
+      draft.create.stableIdentifierValue = value;
       draftChanged(key);
     }),
-    draftInput("Identity source URL", draft.create.identitySourceUrl, (value) => {
-      draft.create.identitySourceUrl = value;
-      draftChanged(key);
-    }, "url"),
-    draftInput("Identity source title", draft.create.identitySourceTitle, (value) => {
-      draft.create.identitySourceTitle = value;
-      draftChanged(key);
-    }, "text", false, REVIEW_PRODUCT_IDENTITY_LIMITS.sourceTitle),
-    draftTextarea("Identity evidence", draft.create.identityEvidenceText, (value) => {
-      draft.create.identityEvidenceText = value;
-      draftChanged(key);
-    }, REVIEW_PRODUCT_IDENTITY_LIMITS.evidenceText),
   );
+  if (draft.create.unreviewedAvionicsModelId !== null) {
+    const candidate = document.createElement("label");
+    candidate.className = "review-create-candidate review-control-wide";
+    const promote = document.createElement("input");
+    promote.type = "checkbox";
+    promote.checked = draft.create.promoteCandidate;
+    promote.addEventListener("change", () => {
+      draft.create.promoteCandidate = promote.checked;
+      draftChanged(key);
+    });
+    const copy = document.createElement("span");
+    copy.textContent = `Promote matched catalog candidate ${draft.create.unreviewedAvionicsModelId}; clear this when the corrected identity is a different product.`;
+    candidate.append(promote, copy);
+    grid.append(candidate);
+  }
   const capabilityHint = document.createElement("p");
   capabilityHint.className = "review-catalog-message";
   capabilityHint.textContent = `Allowed capabilities: ${allowedCapabilities().join(", ")}.`;
-  return [grid, capabilityHint];
+  renderSuiteComponentEditor(suiteEditor, draft, key);
+  suiteEditor.classList.toggle(
+    "is-hidden",
+    draft.create.valuationScope !== "integrated_suite",
+  );
+  return [grid, capabilityHint, suiteEditor];
+}
+
+function renderSuiteComponentEditor(container, draft, key) {
+  container.replaceChildren();
+  const heading = document.createElement("strong");
+  heading.textContent = "Integrated suite components";
+  const intro = document.createElement("p");
+  intro.textContent = "Add only known components of this catalog suite. The suite is valued once; these members describe its composition and are not valued again as separate units unless the listing explicitly observes them separately.";
+  const list = document.createElement("div");
+  list.className = "review-suite-component-list";
+  if (draft.create.suiteComponents.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "review-selection-empty";
+    empty.textContent = "No components added. An integrated suite requires at least one known unit.";
+    list.append(empty);
+  } else {
+    for (const component of draft.create.suiteComponents) {
+      list.append(editableSuiteComponent(component, draft, key, container));
+    }
+  }
+  const searchLabel = document.createElement("label");
+  const caption = document.createElement("span");
+  caption.textContent = "Add an approved unit";
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Manufacturer, exact model, or identifier";
+  search.autocomplete = "off";
+  searchLabel.append(caption, search);
+  const results = document.createElement("div");
+  results.className = "review-catalog-results";
+  const message = document.createElement("p");
+  message.className = "review-catalog-message";
+  message.textContent = "Components are explicit catalog units; integrated suites cannot be nested.";
+  search.addEventListener("input", () => {
+    scheduleCatalogSearch(
+      key,
+      search.value,
+      results,
+      list,
+      message,
+      {
+        scope: "suite-component",
+        onSelect: (product) => {
+          if (product?.valuationScope !== "unit") {
+            message.classList.add("error");
+            message.textContent = "An integrated suite cannot contain another suite.";
+            return;
+          }
+          if (positiveInteger(product.id) === draft.create.unreviewedAvionicsModelId) {
+            message.classList.add("error");
+            message.textContent = "An integrated suite cannot contain itself.";
+            return;
+          }
+          if (draft.create.suiteComponents.some(
+            (component) => component.avionicsModelId === product.id,
+          )) {
+            message.classList.add("error");
+            message.textContent = `${product.displayName} is already a component; edit its quantity above.`;
+            return;
+          }
+          draft.create.suiteComponents.push({
+            avionicsModelId: product.id,
+            displayName: product.displayName,
+            stableIdentifier: product.stableIdentifier,
+            valuationScope: product.valuationScope,
+            quantity: 1,
+          });
+          message.classList.remove("error");
+          message.textContent = `${product.displayName} added as one known component.`;
+          renderSuiteComponentEditor(container, draft, key);
+          draftChanged(key);
+        },
+      },
+    );
+  });
+  container.append(heading, intro, list, searchLabel, message, results);
+}
+
+function editableSuiteComponent(component, draft, key, editor) {
+  const row = document.createElement("div");
+  row.className = "review-suite-component";
+  const identity = document.createElement("div");
+  const name = document.createElement("strong");
+  name.textContent = component.displayName || `Catalog unit ${component.avionicsModelId}`;
+  const metadata = document.createElement("span");
+  metadata.textContent = [
+    `Catalog ID ${component.avionicsModelId}`,
+    component.stableIdentifier,
+    "Individual unit",
+  ].filter(nonBlank).join(" · ");
+  identity.append(name, metadata);
+  const quantityLabel = document.createElement("label");
+  const quantityCaption = document.createElement("span");
+  quantityCaption.textContent = "Quantity";
+  const quantity = document.createElement("input");
+  quantity.type = "number";
+  quantity.min = "1";
+  quantity.step = "1";
+  quantity.value = String(component.quantity);
+  quantity.addEventListener("input", () => {
+    component.quantity = Number.parseInt(quantity.value, 10);
+    draftChanged(key);
+  });
+  quantityLabel.append(quantityCaption, quantity);
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "button subtle";
+  remove.textContent = "Remove";
+  remove.addEventListener("click", () => {
+    draft.create.suiteComponents = draft.create.suiteComponents.filter(
+      (candidate) => candidate.avionicsModelId !== component.avionicsModelId,
+    );
+    renderSuiteComponentEditor(editor, draft, key);
+    draftChanged(key);
+  });
+  row.append(identity, quantityLabel, remove);
+  return row;
 }
 
 function discardControls(aspect, draft, key) {
@@ -3394,6 +3871,9 @@ function syncAspectView(key) {
   view.validation.textContent = validation.message;
   const individualSaveKind = individualAspectSaveKind(draft);
   const canSaveIndividually = individualSaveKind !== null;
+  if (validation.valid && !canSaveIndividually) {
+    view.validation.textContent = `${validation.message} ${coupledDecisionSaveMessage(draft)}`;
+  }
   view.saveControls.classList.toggle(
     "is-hidden",
     !canSaveIndividually && !nonBlank(draft.decisionError),
@@ -3413,7 +3893,9 @@ function syncAspectView(key) {
       : "Saving this entry…"
     : individualSaveKind === "discard"
       ? "Save discarded observation"
-      : "Save verified product for this entry";
+      : individualSaveKind === "create_verified_product"
+        ? "Create and use product for this entry"
+        : "Save verified product for this entry";
   view.saveResult.classList.toggle("error", nonBlank(draft.decisionError));
   view.saveResult.setAttribute("role", nonBlank(draft.decisionError) ? "alert" : "status");
   view.saveResult.textContent = draft.decisionError
@@ -3423,13 +3905,41 @@ function syncAspectView(key) {
       : canSaveIndividually
         ? individualSaveKind === "discard"
           ? "Save this discard now; every other unresolved entry and unsaved decision remains in place."
-          : "Save this match now; the listing review will retain every other unresolved entry."
+          : individualSaveKind === "create_verified_product"
+            ? "Create this human-verified product and save only this association now."
+            : "Save this human-verified match now; the listing review will retain every other unresolved entry."
         : "";
 }
 
+function coupledDecisionSaveMessage(draft) {
+  const aspect = draft?.aspect;
+  const participatesInReplacement = aspect?.replacement_aspect_id !== null
+      && aspect?.replacement_aspect_id !== undefined
+    || Array.from(state.drafts.values()).some((candidate) => (
+      candidate !== draft
+      && candidate.aspect?.replacement_aspect_id !== null
+      && candidate.aspect?.replacement_aspect_id !== undefined
+      && aspectKey(candidate.aspect.replacement_aspect_id) === aspectKey(aspect?.id)
+    ));
+  if (participatesInReplacement) {
+    return "This occurrence is coupled to a replacement decision; save the pair with Verify listing after both cards are ready.";
+  }
+  if (aspect?.kind === "avionics_reuse_attestation") {
+    return "This preserved-link automation aspect must be completed through its guarded association workflow.";
+  }
+  return "This occurrence cannot be detached safely; save it with Verify listing after every coupled card is ready.";
+}
+
 function individualAspectSaveKind(draft) {
-  if (draft?.action === "use_verified_product") {
-    return "use_verified_product";
+  if (
+    ["use_verified_product", "create_verified_product"].includes(draft?.action)
+    && canSaveHumanProductIndividually(
+      draft.aspect,
+      state.currentReview?.aspects,
+      draft.action,
+    )
+  ) {
+    return draft.action;
   }
   if (
     draft?.action === "discard"
@@ -3481,13 +3991,10 @@ function validateDraft(draft) {
     if (positiveInteger(draft.catalogProduct?.id) === null) {
       return { valid: false, message: "Select one approved avionics catalog product." };
     }
-    if (draft.catalogProduct.reuseEligible === false) {
-      return {
-        valid: false,
-        message: "This approved product is not reusable under the current policy. Verify its reusable manufacturer source below first.",
-      };
-    }
-    return validDraftResult(draft, "Verified catalog product selected.");
+    return validDraftResult(
+      draft,
+      "Approved catalog product selected. Saving this association records the accountable human verification.",
+    );
   }
   if (draft.action === "create_verified_product") {
     if (!nonBlank(draft.create.manufacturer) || !nonBlank(draft.create.model)) {
@@ -3506,33 +4013,63 @@ function validateDraft(draft) {
         message: `Use exact canonical capability names; unsupported: ${unsupported.join(", ")}.`,
       };
     }
-    if (![
+    const identifierKind = optionalText(draft.create.stableIdentifierKind);
+    const identifierValue = optionalText(draft.create.stableIdentifierValue);
+    if (Boolean(identifierKind) !== Boolean(identifierValue)) {
+      return {
+        valid: false,
+        message: "Provide both stable identifier kind and value, or leave both blank to derive the model number.",
+      };
+    }
+    if (identifierKind && ![
       "manufacturer_part_number",
       "manufacturer_model_number",
       "sku",
-    ].includes(draft.create.manufacturerIdentifierKind)) {
-      return { valid: false, message: "Select the manufacturer's identifier kind." };
+    ].includes(identifierKind)) {
+      return { valid: false, message: "Select a supported stable identifier kind." };
     }
-    if (!nonBlank(draft.create.manufacturerIdentifier)) {
-      return { valid: false, message: "Provide the manufacturer's stable identifier." };
+    if (![
+      "unit",
+      "integrated_suite",
+    ].includes(draft.create.valuationScope)) {
+      return { valid: false, message: "Select whether this product is a unit or integrated suite." };
     }
-    if (!nonBlank(draft.create.identitySourceUrl)) {
-      return { valid: false, message: "An authoritative identity source URL is required." };
+    if (draft.create.valuationScope === "integrated_suite") {
+      if (!Array.isArray(draft.create.suiteComponents)
+        || draft.create.suiteComponents.length === 0) {
+        return {
+          valid: false,
+          message: "An integrated suite requires at least one known component.",
+        };
+      }
+      const componentIds = new Set();
+      for (const component of draft.create.suiteComponents) {
+        const componentId = positiveInteger(component?.avionicsModelId);
+        if (componentId === null || positiveInteger(component?.quantity) === null) {
+          return {
+            valid: false,
+            message: "Every suite component needs a catalog product and positive whole-number quantity.",
+          };
+        }
+        if (component?.valuationScope === "integrated_suite") {
+          return { valid: false, message: "An integrated suite cannot contain another suite." };
+        }
+        if (componentIds.has(componentId)) {
+          return { valid: false, message: `Catalog component ${componentId} appears more than once.` };
+        }
+        if (draft.create.promoteCandidate
+          && componentId === draft.create.unreviewedAvionicsModelId) {
+          return { valid: false, message: "An integrated suite cannot contain itself." };
+        }
+        componentIds.add(componentId);
+      }
     }
-    if (!authoritativeIdentityUrl(draft.create.identitySourceUrl)) {
-      return {
-        valid: false,
-        message: "Identity source must be an absolute authoritative HTTPS URL, not a sale listing.",
-      };
-    }
-    const identitySourceValidation = reviewProductIdentitySourceValidation(
-      draft.create.identitySourceTitle,
-      draft.create.identityEvidenceText,
+    return validDraftResult(
+      draft,
+      draft.create.valuationScope === "integrated_suite"
+        ? "Human-verified suite identity and component membership are ready to save."
+        : "Human-verified unit identity is ready to save.",
     );
-    if (!identitySourceValidation.valid) {
-      return identitySourceValidation;
-    }
-    return validDraftResult(draft, "New verified product details are complete.");
   }
   if (draft.action === "discard") {
     const reasonValidation = discardReasonValidation(draft.discardReason);
@@ -3977,25 +4514,37 @@ async function saveIndividualAspectDecision(key) {
   syncAllAspectViews();
   updateProgress();
   const discarding = saveKind === "discard";
+  const creating = saveKind === "create_verified_product";
   setWorkspaceMessage(discarding
     ? "Saving only this discarded avionics observation…"
-    : `Saving only this avionics entry as catalog product ${productId}…`);
+    : creating
+      ? "Creating a human-verified catalog product and saving only this association…"
+      : `Saving only this avionics entry as catalog product ${productId}…`);
   try {
     const endpoint = discarding
       ? `/api/review/listings/${review.listing_id}/avionics/discard`
-      : `/api/review/listings/${review.listing_id}/avionics/use-existing`;
+      : creating
+        ? `/api/review/listings/${review.listing_id}/avionics/create`
+        : `/api/review/listings/${review.listing_id}/avionics/use-existing`;
     const request = discarding
       ? discardAvionicsObservationRequest(
         review.review_payload_sha256,
         draft.aspect.id,
         draft.discardReason,
       )
-      : useExistingProductRequest(
-        review.review_payload_sha256,
-        review.catalog_revision_sha256,
-        draft.aspect.id,
-        productId,
-      );
+      : creating
+        ? createHumanVerifiedProductRequest(
+          review.review_payload_sha256,
+          review.catalog_revision_sha256,
+          draft.aspect.id,
+          draft.create,
+        )
+        : useExistingProductRequest(
+          review.review_payload_sha256,
+          review.catalog_revision_sha256,
+          draft.aspect.id,
+          productId,
+        );
     const payload = await api(
       endpoint,
       {
@@ -4024,7 +4573,9 @@ async function saveIndividualAspectDecision(key) {
     renderReview();
     setWorkspaceMessage(discarding
       ? "Saved the discard for this entry. Review the remaining avionics entries."
-      : `Saved ${draft.catalogProduct.displayName} for this entry. Review the remaining avionics entries.`);
+      : creating
+        ? `Created and saved ${draft.create.manufacturer.trim()} ${draft.create.model.trim()} for this entry. Review the remaining avionics entries.`
+        : `Saved ${draft.catalogProduct.displayName} for this entry. Review the remaining avionics entries.`);
   } catch (error) {
     if (state.currentReview !== review || state.savingAspectKey !== key) {
       return;
@@ -4033,7 +4584,9 @@ async function saveIndividualAspectDecision(key) {
     draft.savingDecision = false;
     draft.decisionError = error?.message || (discarding
       ? "The server rejected this discard decision."
-      : "The server rejected this avionics decision.");
+      : creating
+        ? "The server rejected this product creation decision."
+        : "The server rejected this avionics decision.");
     if (isStaleError(error)) {
       markStale(error.message);
     } else {
@@ -4181,19 +4734,20 @@ function decisionFromDraft(draft) {
     };
   }
   if (draft.action === "create_verified_product") {
-    const decision = {
-      aspect_id: draft.aspect.id,
+    const {
+      review_payload_sha256: _reviewPayloadSha256,
+      catalog_revision_sha256: _catalogRevisionSha256,
+      ...decision
+    } = createHumanVerifiedProductRequest(
+      "whole-review",
+      "whole-review",
+      draft.aspect.id,
+      draft.create,
+    );
+    return {
       action: draft.action,
-      manufacturer: draft.create.manufacturer.trim(),
-      model: draft.create.model.trim(),
-      capabilities: draft.create.capabilities.slice(),
-      manufacturer_identifier_kind: draft.create.manufacturerIdentifierKind,
-      manufacturer_identifier: draft.create.manufacturerIdentifier.trim(),
-      identity_source_url: draft.create.identitySourceUrl.trim(),
-      identity_source_title: draft.create.identitySourceTitle.trim(),
-      identity_evidence_text: draft.create.identityEvidenceText.trim(),
+      ...decision,
     };
-    return decision;
   }
   return {
     aspect_id: draft.aspect.id,
@@ -4252,9 +4806,6 @@ async function searchCatalog(searchKey, key, query, results, selected, message, 
       return;
     }
     const items = Array.isArray(payload?.catalog?.items) ? payload.catalog.items : [];
-    const unavailableCount = items.filter(
-      (item) => normalizedProduct(item)?.reuseEligible === false,
-    ).length;
     results.replaceChildren(
       ...items.map((item) => catalogResult(item, () => {
         if (typeof onSelect === "function") {
@@ -4266,21 +4817,18 @@ async function searchCatalog(searchKey, key, query, results, selected, message, 
           return;
         }
         draft.catalogProduct = normalizedProduct(item);
-        draft.inlineAttestation = inlineAttestationDraft(draft.catalogProduct);
         draft.decisionError = "";
-        renderSelectedCatalogProduct(selected, draft.catalogProduct, key);
+        renderSelectedCatalogProduct(selected, draft.catalogProduct);
         message.textContent = `${draft.catalogProduct.displayName} selected.`;
         message.classList.remove("error");
         syncAllAspectViews();
         updateProgress();
-        loadSelectedProductEvidence(key, draft.catalogProduct.id, selected, message);
-      }, { allowUnattested: typeof onSelect !== "function" })),
+        loadSelectedProductDetails(key, draft.catalogProduct.id, selected, message);
+      })),
     );
     message.classList.remove("error");
     message.textContent = items.length
-      ? unavailableCount > 0
-        ? `${items.length} approved ${pluralize(items.length, "match")} found; ${unavailableCount} ${pluralize(unavailableCount, "product")} need reusable source verification${typeof onSelect === "function" ? " before selection" : " and can be selected for inline verification"}.`
-        : `${items.length} approved ${pluralize(items.length, "match")} found.`
+      ? `${items.length} approved ${pluralize(items.length, "match")} found. Suites and individual units remain distinct catalog products.`
       : "No approved avionics matched this search.";
   } catch (error) {
     if (state.catalogSearchSequences.get(searchKey) === sequence) {
@@ -4295,41 +4843,28 @@ async function searchCatalog(searchKey, key, query, results, selected, message, 
   }
 }
 
-function catalogResult(item, onSelect, { allowUnattested = false } = {}) {
+function catalogResult(item, onSelect) {
   const product = normalizedProduct(item);
   const button = document.createElement("button");
   button.type = "button";
   button.className = "review-catalog-result";
   button.disabled = !product
-    || positiveInteger(product.id) === null
-    || product.reuseEligible === false && !allowUnattested;
-  button.classList.toggle("not-reusable", product?.reuseEligible === false);
+    || positiveInteger(product.id) === null;
   const title = document.createElement("strong");
   title.textContent = product?.displayName || "Unknown catalog product";
   const metadata = document.createElement("span");
   metadata.textContent = [
+    productKindLabel(product),
     product?.stableIdentifier,
     product?.capabilities.join(", "),
-    product?.reuseEligible === false
-      ? "Reusable source verification required"
-      : "",
   ].filter(nonBlank).join(" · ") || "Approved catalog entry";
-  if (product?.reuseEligible === false) {
-    button.title = allowUnattested
-      ? "Select this product to verify its reusable manufacturer source here."
-      : "Verify this product before assigning it to this field.";
-  }
   button.append(title, metadata);
   button.addEventListener("click", onSelect);
   return button;
 }
 
-function renderSelectedCatalogProduct(container, product, key = null) {
+function renderSelectedCatalogProduct(container, product) {
   container.replaceChildren();
-  container.classList.toggle(
-    "has-inline-attestation",
-    product?.reuseEligible === false && key !== null,
-  );
   if (!product || positiveInteger(product.id) === null) {
     const empty = document.createElement("p");
     empty.className = "review-selection-empty";
@@ -4345,276 +4880,18 @@ function renderSelectedCatalogProduct(container, product, key = null) {
   const metadata = document.createElement("span");
   metadata.textContent = [
     `Catalog ID ${product.id}`,
+    productKindLabel(product),
     product.stableIdentifier,
   ].filter(nonBlank).join(" · ");
   container.append(eyebrow, title, metadata, renderAvionicsChips(product.capabilities));
-  if (product.reuseEligible === false) {
-    const warning = document.createElement("p");
-    warning.className = "review-product-reuse-warning";
-    warning.textContent = key === null
-      ? "This approved product still needs reusable manufacturer-source verification."
-      : "This approved product needs reusable manufacturer-source verification before it can be assigned. Verify it below without leaving this listing.";
-    container.append(warning);
-  }
-  appendProductIdentityEvidence(container, product);
-  if (product.reuseEligible === false && key !== null) {
-    container.append(inlineProductAttestationControls(key, product));
-  }
+  container.append(productStructureSummary(product));
 }
 
-function inlineAttestationDraft(product) {
-  const productId = positiveInteger(product?.id);
-  const suggested = productAttestationDraft({
-    identity_source_url: product?.identitySourceUrl,
-    identity_source_title: product?.identitySourceTitle,
-  });
-  return {
-    productId,
-    sourceUrl: suggested.sourceUrl,
-    sourceTitle: suggested.sourceTitle,
-    evidenceText: suggested.evidenceText,
-    dirty: false,
-    saving: false,
-    error: "",
-  };
-}
-
-function updateInlineAttestationSuggestions(draft, product) {
-  const productId = positiveInteger(product?.id);
-  if (draft.inlineAttestation?.productId !== productId) {
-    draft.inlineAttestation = inlineAttestationDraft(product);
-    return;
-  }
-  if (draft.inlineAttestation.dirty) {
-    return;
-  }
-  const suggested = inlineAttestationDraft(product);
-  draft.inlineAttestation.sourceUrl = suggested.sourceUrl;
-  draft.inlineAttestation.sourceTitle = suggested.sourceTitle;
-}
-
-function inlineProductAttestationControls(key, product) {
-  const draft = state.drafts.get(key);
-  const attestation = draft?.inlineAttestation;
-  const section = document.createElement("section");
-  section.className = "review-inline-attestation";
-  const heading = document.createElement("strong");
-  heading.textContent = "Verify reusable product source";
-  const intro = document.createElement("p");
-  const requiredIdentity = [product.model, product.stableIdentifier]
-    .filter(nonBlank)
-    .join(" and ");
-  intro.textContent = `Confirm one current OEM page and paste one exact excerpt containing ${requiredIdentity || "the complete model and manufacturer identifier"}. This verifies the catalog product only; it does not save or reset any listing decisions.`;
-  const form = document.createElement("form");
-  form.addEventListener("submit", (event) => {
-    attestInlineCatalogProduct(event, key);
-  });
-  form.append(
-    draftInput("OEM source URL", attestation?.sourceUrl, (value) => {
-      attestation.sourceUrl = value;
-      attestation.dirty = true;
-      attestation.error = "";
-      syncInlineAttestationView(key);
-    }, "url", true),
-    draftInput(
-      "OEM source title",
-      attestation?.sourceTitle,
-      (value) => {
-        attestation.sourceTitle = value;
-        attestation.dirty = true;
-        attestation.error = "";
-        syncInlineAttestationView(key);
-      },
-      "text",
-      true,
-      REVIEW_PRODUCT_IDENTITY_LIMITS.sourceTitle,
-    ),
-    draftTextarea(
-      "Exact model and manufacturer identifier excerpt",
-      attestation?.evidenceText,
-      (value) => {
-        attestation.evidenceText = value;
-        attestation.dirty = true;
-        attestation.error = "";
-        syncInlineAttestationView(key);
-      },
-      REVIEW_PRODUCT_IDENTITY_LIMITS.evidenceText,
-    ),
-  );
-  const actions = document.createElement("div");
-  actions.className = "review-inline-attestation-actions";
-  const submit = document.createElement("button");
-  submit.type = "submit";
-  submit.className = "button primary";
-  submit.textContent = attestation?.saving
-    ? "Verifying source…"
-    : `Verify ${product.displayName}`;
-  const result = document.createElement("p");
-  result.className = "review-inline-attestation-result";
-  result.setAttribute("aria-live", "polite");
-  actions.append(submit, result);
-  form.append(actions);
-  section.append(heading, intro, form);
-  window.setTimeout(() => syncInlineAttestationView(key), 0);
-  return section;
-}
-
-function syncInlineAttestationView(key) {
-  const draft = state.drafts.get(key);
-  const section = state.aspectViews
-    .get(key)
-    ?.panels.get("use_verified_product")
-    ?.querySelector(".review-inline-attestation");
-  if (!draft || !section) {
-    return;
-  }
-  const attestation = draft.inlineAttestation;
-  const button = section.querySelector('button[type="submit"]');
-  const result = section.querySelector(".review-inline-attestation-result");
-  section.setAttribute("aria-busy", String(attestation.saving));
-  button.disabled = attestation.saving
-    || state.savingAspectKey !== null
-    || state.stale
-    || state.resolving
-    || state.automating;
-  button.textContent = attestation.saving
-    ? "Verifying source…"
-    : `Verify ${draft.catalogProduct.displayName}`;
-  result.classList.toggle("error", nonBlank(attestation.error));
-  result.setAttribute("role", nonBlank(attestation.error) ? "alert" : "status");
-  result.textContent = attestation.error
-    ? `Could not verify this product: ${attestation.error}`
-    : "Your other listing decisions remain in place while this source is checked.";
-}
-
-async function attestInlineCatalogProduct(event, key) {
-  event.preventDefault();
-  const review = state.currentReview;
-  const draft = state.drafts.get(key);
-  const productId = positiveInteger(draft?.catalogProduct?.id);
-  const attestation = draft?.inlineAttestation;
-  if (
-    !review
-    || !draft
-    || !attestation
-    || productId === null
-    || draft.catalogProduct.reuseEligible !== false
-    || state.savingAspectKey !== null
-    || state.stale
-    || state.resolving
-    || state.automating
-  ) {
-    return;
-  }
-  const sourceValidation = reviewProductIdentitySourceValidation(
-    attestation.sourceTitle,
-    attestation.evidenceText,
-  );
-  if (!authoritativeIdentityUrl(attestation.sourceUrl) || !sourceValidation.valid) {
-    attestation.error = !authoritativeIdentityUrl(attestation.sourceUrl)
-      ? "Provide an authoritative HTTPS OEM source URL."
-      : sourceValidation.message;
-    syncInlineAttestationView(key);
-    return;
-  }
-
-  state.savingAspectKey = key;
-  attestation.saving = true;
-  attestation.error = "";
-  syncInlineAttestationView(key);
-  syncAllAspectViews();
-  updateProgress();
-  try {
-    const result = await api(
-      `/api/review/avionics/products/${productId}/attest`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          listing_id: review.listing_id,
-          review_payload_sha256: review.review_payload_sha256,
-          aspect_id: draft.aspect.id,
-          catalog_revision_sha256: review.catalog_revision_sha256,
-          identity_source_url: attestation.sourceUrl,
-          identity_source_title: attestation.sourceTitle,
-          identity_evidence_text: attestation.evidenceText,
-        }),
-      },
-    );
-    if (state.currentReview !== review || state.savingAspectKey !== key) {
-      return;
-    }
-    if (
-      positiveInteger(result?.product_id) !== productId
-      || result?.attestation_status !== "current"
-    ) {
-      throw new Error("The server returned an invalid product verification result.");
-    }
-    const responseReview = result?.review;
-    const [productPayload, reviewPayload] = await Promise.all([
-      api(`/api/avionics/${productId}`),
-      responseReview === null || responseReview === undefined
-        ? api(`/api/review/listings/${review.listing_id}`)
-        : Promise.resolve({ review: responseReview }),
-    ]);
-    if (state.currentReview !== review || state.savingAspectKey !== key) {
-      return;
-    }
-    const refreshedReview = reviewPayload?.review;
-    const productDetail = productPayload?.avionics;
-    if (
-      !isReviewDetail(refreshedReview, review.listing_id)
-      || refreshedReview.review_payload_sha256 !== review.review_payload_sha256
-      || !productDetail?.summary
-      || positiveInteger(productDetail.summary.id) !== productId
-      || productDetail.summary.catalog?.reuse_eligible !== true
-    ) {
-      throw new Error("The product source was saved, but the refreshed catalog or listing review was inconsistent. Reload this review before continuing.");
-    }
-    const identity = productDetail.identity_evidence || {};
-    draft.catalogProduct = normalizedProduct({
-      ...productDetail.summary,
-      identity_source_url: identity.source_url,
-      identity_source_title: identity.source_title,
-      identity_evidence_text: identity.evidence_text,
-    });
-    state.currentReview.catalog_revision_sha256 = refreshedReview.catalog_revision_sha256;
-    state.savingAspectKey = null;
-    attestation.saving = false;
-    const selected = state.aspectViews
-      .get(key)
-      ?.panels.get("use_verified_product")
-      ?.querySelector(".review-selected-product");
-    if (selected) {
-      renderSelectedCatalogProduct(selected, draft.catalogProduct, key);
-    }
-    syncAspectView(key);
-    updateProgress();
-    await Promise.allSettled([Promise.resolve(refreshAvionics())]);
-    setWorkspaceMessage(
-      `${draft.catalogProduct.displayName} now has a current reusable source. Save this entry when the listing match is correct.`,
-    );
-  } catch (error) {
-    if (state.currentReview !== review || state.savingAspectKey !== key) {
-      return;
-    }
-    state.savingAspectKey = null;
-    attestation.saving = false;
-    attestation.error = error?.message || "The product source could not be verified.";
-    syncInlineAttestationView(key);
-    syncAllAspectViews();
-    updateProgress();
-    setWorkspaceMessage(
-      "The product source was not verified. The exact error is shown on this avionics card.",
-      true,
-    );
-  }
-}
-
-async function loadSelectedProductEvidence(key, productId, selected, message) {
+async function loadSelectedProductDetails(key, productId, selected, message) {
   if (positiveInteger(productId) === null) {
     return;
   }
-  message.textContent = "Loading authoritative identity evidence…";
+  message.textContent = "Loading product kind and suite composition…";
   try {
     const payload = await api(`/api/avionics/${productId}`);
     const detail = payload?.avionics;
@@ -4626,25 +4903,16 @@ async function loadSelectedProductEvidence(key, productId, selected, message) {
     if (positiveInteger(draft?.catalogProduct?.id) !== productId) {
       return;
     }
-    const identity = detail.identity_evidence || {};
     draft.catalogProduct = normalizedProduct({
       ...summary,
-      identity_source_url: identity.source_url,
-      identity_source_title: identity.source_title,
-      identity_evidence_text: identity.evidence_text,
+      suite_components: detail.suite_components,
+      suite_memberships: detail.suite_memberships,
     });
-    updateInlineAttestationSuggestions(draft, draft.catalogProduct);
-    renderSelectedCatalogProduct(selected, draft.catalogProduct, key);
-    const hasAuthoritativeEvidence = authoritativeIdentityUrl(
-      draft.catalogProduct.identitySourceUrl,
-    ) && nonBlank(draft.catalogProduct.identityEvidenceText);
-    const reusable = draft.catalogProduct.reuseEligible !== false;
-    message.classList.toggle("error", !hasAuthoritativeEvidence || !reusable);
-    message.textContent = !reusable
-      ? `${draft.catalogProduct.displayName} is approved, but its reusable manufacturer source must be verified below before assignment.`
-      : hasAuthoritativeEvidence
-        ? `${draft.catalogProduct.displayName} selected with authoritative identity evidence.`
-        : `${draft.catalogProduct.displayName} selected, but its catalog identity evidence is incomplete.`;
+    renderSelectedCatalogProduct(selected, draft.catalogProduct);
+    message.classList.remove("error");
+    message.textContent = draft.catalogProduct.valuationScope === "integrated_suite"
+      ? `${draft.catalogProduct.displayName} selected as one integrated suite. Confirm that the listing observes the suite; its catalog components are not separate listing observations.`
+      : `${draft.catalogProduct.displayName} selected as an individual unit.`;
     syncAllAspectViews();
     updateProgress();
   } catch (error) {
@@ -4653,7 +4921,7 @@ async function loadSelectedProductEvidence(key, productId, selected, message) {
       return;
     }
     message.classList.add("error");
-    message.textContent = `Product selected, but its identity evidence could not be loaded: ${error.message}`;
+    message.textContent = `Product selected, but its suite details could not be loaded: ${error.message}`;
   }
 }
 
@@ -4679,38 +4947,88 @@ function productSummary(value, heading) {
   if (product?.capabilities.length) {
     container.append(renderAvionicsChips(product.capabilities));
   }
-  appendProductIdentityEvidence(container, product);
+  container.append(productStructureSummary(product));
   return container;
 }
 
-function appendProductIdentityEvidence(container, product) {
-  const source = authoritativeIdentityUrl(product?.identitySourceUrl)
-    ? safeDetailLink(
-      product.identitySourceUrl,
-      product.identitySourceTitle || "Open authoritative identity source",
-    )
-    : null;
-  if (source) {
-    source.className = "review-product-source";
-    container.append(source);
-  } else {
-    const missingSource = document.createElement("span");
-    missingSource.className = "review-product-evidence-missing";
-    missingSource.textContent = "No authoritative identity source recorded.";
-    container.append(missingSource);
+function productValuationScope(value) {
+  const scope = value?.valuation_scope ?? value?.valuation?.scope;
+  return scope === "integrated_suite" ? "integrated_suite" : "unit";
+}
+
+function productKindLabel(product) {
+  return product?.valuationScope === "integrated_suite"
+    ? "Integrated suite"
+    : "Individual unit";
+}
+
+function normalizedSuiteComponents(values) {
+  if (!Array.isArray(values)) {
+    return [];
   }
-  const evidence = document.createElement("p");
-  evidence.className = "review-product-evidence";
-  if (nonBlank(product?.identityEvidenceText)) {
-    evidence.append(
-      strongText("Identity evidence: "),
-      document.createTextNode(product.identityEvidenceText),
+  return values.map((value) => {
+    const avionicsModelId = positiveInteger(
+      value?.avionicsModelId ?? value?.avionics_model_id ?? value?.model_id ?? value?.id,
     );
-  } else {
-    evidence.classList.add("empty");
-    evidence.textContent = "No authoritative identity evidence recorded.";
+    if (avionicsModelId === null) {
+      return null;
+    }
+    const manufacturer = productManufacturer(value);
+    const model = optionalText(value?.model ?? value?.name);
+    const stableIdentifierText = optionalText(value?.stableIdentifier);
+    const identifierValue = value?.stable_identifier?.value
+      ?? value?.manufacturer_identifier
+      ?? value?.identifier;
+    const identifierKind = value?.stable_identifier?.kind
+      ?? value?.manufacturer_identifier_kind
+      ?? value?.identifier_kind;
+    return {
+      avionicsModelId,
+      displayName: optionalText(value?.displayName ?? value?.display_name)
+        || [manufacturer, model].filter(nonBlank).join(" ")
+        || `Catalog unit ${avionicsModelId}`,
+      stableIdentifier: stableIdentifierText || (nonBlank(identifierValue)
+        ? [displayLabel(identifierKind), identifierValue].filter(nonBlank).join(" ")
+        : ""),
+      valuationScope: value?.valuationScope ?? productValuationScope(value),
+      quantity: positiveInteger(value?.quantity) ?? 1,
+    };
+  }).filter(Boolean);
+}
+
+function productStructureSummary(product) {
+  const structure = document.createElement("div");
+  structure.className = `review-product-structure ${product?.valuationScope === "integrated_suite" ? "suite" : "unit"}`;
+  const summary = document.createElement("p");
+  if (product?.valuationScope !== "integrated_suite") {
+    summary.textContent = "Individual unit · valued as its own listing occurrence.";
+    structure.append(summary);
+    if (product?.suiteMemberships?.length) {
+      const memberships = document.createElement("p");
+      memberships.textContent = `Also cataloged in: ${product.suiteMemberships.map((item) => item.displayName).join(", ")}. Selecting this unit does not imply that any suite was observed.`;
+      structure.append(memberships);
+    }
+    return structure;
   }
-  container.append(evidence);
+
+  summary.textContent = "Integrated suite · valued once as the selected suite. Catalog component rows are descriptive and are not valued again as part of this occurrence.";
+  structure.append(summary);
+  if (!product.suiteComponents.length) {
+    const empty = document.createElement("p");
+    empty.className = "review-selection-empty";
+    empty.textContent = "No known suite components are recorded.";
+    structure.append(empty);
+    return structure;
+  }
+  const list = document.createElement("ul");
+  list.className = "review-suite-component-summary";
+  for (const component of product.suiteComponents) {
+    const item = document.createElement("li");
+    item.textContent = `${component.quantity} × ${component.displayName}`;
+    list.append(item);
+  }
+  structure.append(list);
+  return structure;
 }
 
 function normalizedProduct(value) {
@@ -4730,7 +5048,6 @@ function normalizedProduct(value) {
   const stableIdentifier = nonBlank(stableIdentifierValue)
     ? [displayLabel(stableIdentifierKind), stableIdentifierValue].filter(nonBlank).join(" ")
     : "";
-  const reuseEligibleValue = value.catalog?.reuse_eligible ?? value.reuse_eligible;
   return {
     id,
     manufacturer,
@@ -4741,10 +5058,9 @@ function normalizedProduct(value) {
     capabilities,
     stableIdentifier,
     catalogStatus: value.catalog?.status ?? value.catalog_status,
-    reuseEligible: typeof reuseEligibleValue === "boolean" ? reuseEligibleValue : null,
-    identitySourceUrl: optionalText(value.identity_source_url),
-    identitySourceTitle: optionalText(value.identity_source_title),
-    identityEvidenceText: optionalText(value.identity_evidence_text),
+    valuationScope: productValuationScope(value),
+    suiteComponents: normalizedSuiteComponents(value.suite_components),
+    suiteMemberships: normalizedSuiteComponents(value.suite_memberships),
   };
 }
 
@@ -4774,25 +5090,25 @@ function allowedActions(aspect) {
 
 function actionTitle(action) {
   return {
-    use_verified_product: "Use verified product",
-    create_verified_product: "Create verified product",
+    use_verified_product: "Use approved catalog product",
+    create_verified_product: "Create human-verified product",
     discard: "Discard observation",
   }[action] || displayLabel(action);
 }
 
 function actionDescription(action, aspect) {
   if (action === "use_verified_product") {
-    return "Map the listing text to one approved avionics catalog identity.";
+    return "Map this one listing occurrence to an approved avionics identity and save that human decision independently.";
   }
   if (action === "create_verified_product") {
     const proposedId = positiveInteger(aspect.proposed_product?.id);
     const suggestedId = positiveInteger(aspect.suggested_product?.id);
     if (proposedId !== null && proposedId !== suggestedId) {
-      return "Curate the matched candidate, or enter a corrected identity as a separate product.";
+      return "Promote the matched candidate, or enter a corrected identity as a separate human-verified product.";
     }
     return suggestedId !== null
-      ? "Enter a corrected identity as a separate verified product."
-      : "Approve the proposed identity as a new catalog product.";
+      ? "Enter a corrected identity as a separate human-verified product."
+      : "Approve the proposed identity as a new human-verified catalog product.";
   }
   if (aspect.required === false) {
     return "Exclude this optional observation and record why.";

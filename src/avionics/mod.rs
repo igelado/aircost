@@ -1161,6 +1161,8 @@ async fn update_avionics_metadata(
               value_reference_year = ?,
               value_source = ?,
               valuation_scope = ?,
+              structure_verified_by_user_id = NULL,
+              structure_reviewed_at = NULL,
               updated_at = CURRENT_TIMESTAMP
             WHERE id = ? AND catalog_status = 'approved'
             "#,
@@ -1190,6 +1192,8 @@ async fn update_avionics_metadata(
               value_reference_year = ?,
               value_source = ?,
               valuation_scope = ?,
+              structure_verified_by_user_id = NULL,
+              structure_reviewed_at = NULL,
               updated_at = CURRENT_TIMESTAMP
             WHERE id = ? AND catalog_status = 'approved'
             "#,

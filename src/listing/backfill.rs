@@ -579,7 +579,7 @@ fn prepare_listing_review(
         }
         if !action_graph_invalid
             && matching_links.len() == 1
-            && matching_links[0].source == "listing_review"
+            && matching_links[0].source == "human_review"
         {
             // A prior reviewer decision is stronger evidence than the retained
             // extraction that originally fed the legacy link. Do not reopen or
@@ -673,7 +673,7 @@ fn prepare_listing_review(
         if matched_link_ids.contains(&link.id) {
             continue;
         }
-        if link.source == "listing_review" && !action_graph_invalid {
+        if link.source == "human_review" && !action_graph_invalid {
             // Backfill is not allowed to overturn an explicit reviewer
             // decision, even when the old retained extraction has drifted.
             continue;
@@ -769,7 +769,7 @@ fn prepare_listing_review(
         .collect::<BTreeSet<_>>();
     let mut required_associations = BTreeSet::new();
     for link in links {
-        if link.source == "listing_review" && !action_graph_invalid {
+        if link.source == "human_review" && !action_graph_invalid {
             continue;
         }
         let unmatched_approved_high_requires_review = has_usable_retained_observations
@@ -2072,7 +2072,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_reviewer_corroborated_link_is_preserved() {
+    fn unmatched_human_review_link_is_preserved() {
         let raw = r#"{"avionics":[{"manufacturer":"Garmin","model":"GNX 375","types":["GPS","Transponder"]}]}"#;
         let approved = product(7, "Garmin", "GTN 750Xi", "approved", &["GPS", "NAV", "COM"]);
         let catalog = vec![approved.clone()];
@@ -2081,7 +2081,7 @@ mod tests {
             id: 70,
             avionics_model_id: 7,
             quantity: 1,
-            source: "listing_review".to_string(),
+            source: "human_review".to_string(),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
             source_confidence: Some("high".to_string()),
@@ -2100,6 +2100,35 @@ mod tests {
         assert!(!prepared
             .reason_counts
             .contains_key("approved_high_confidence_link_unmatched_by_retained_observation"));
+    }
+
+    #[test]
+    fn unmatched_hash_bound_listing_review_link_is_reopened_without_live_authority() {
+        let raw = r#"{"avionics":[{"manufacturer":"Garmin","model":"GNX 375","types":["GPS","Transponder"]}]}"#;
+        let approved = product(7, "Garmin", "GTN 750Xi", "approved", &["GPS", "NAV", "COM"]);
+        let catalog = vec![approved.clone()];
+        let catalog_by_id = HashMap::from([(7, approved)]);
+        let links = vec![ListingLinkRow {
+            id: 70,
+            avionics_model_id: 7,
+            quantity: 1,
+            source: "listing_review".to_string(),
+            configuration_action: "installed".to_string(),
+            replaces_avionics_model_id: None,
+            source_confidence: Some("high".to_string()),
+        }];
+
+        let prepared = prepare_listing_review(42, Some(raw), &links, &catalog, &catalog_by_id);
+        assert_eq!(prepared.aspects.len(), 2);
+        assert_eq!(prepared.associations_requiring_coverage, 1);
+        assert_eq!(prepared.covered_association_count, 1);
+        assert!(prepared.association_coverage_complete);
+        assert_eq!(
+            prepared
+                .reason_counts
+                .get("approved_high_confidence_link_unmatched_by_retained_observation"),
+            Some(&1)
+        );
     }
 
     #[test]

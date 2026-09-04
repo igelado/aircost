@@ -471,6 +471,24 @@ async fn load_current(source: &mut ProjectionReader<'_>) -> Result<CurrentCatalo
             required_user_ids.insert(id);
         }
     }
+    for row in &identities {
+        if let Some(id) = row.nullable_integer("verified_by_user_id")? {
+            required_user_ids.insert(id);
+        }
+    }
+    for row in &memberships {
+        if let Some(id) = row.nullable_integer("verified_by_user_id")? {
+            required_user_ids.insert(id);
+        }
+    }
+    for row in &approved_models {
+        if let Some(id) = row.nullable_integer("verified_by_user_id")? {
+            required_user_ids.insert(id);
+        }
+        if let Some(id) = row.nullable_integer("structure_verified_by_user_id")? {
+            required_user_ids.insert(id);
+        }
+    }
     let required_user_rows = fetch(
         source,
         "users",

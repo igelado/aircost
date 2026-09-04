@@ -415,38 +415,44 @@ product variant.
 Ordinary extracted avionics aspects offer three decisions:
 
 - **Use verified product** searches and selects one existing approved catalog
-  identity.
+  identity. Saving it is an accountable listing-scoped human verification and
+  does not require a global OEM-source attestation.
 - **Create verified product** requires manufacturer, model, one or more
-  canonical capabilities, a stable manufacturer identifier kind and value,
-  and authoritative identity source URL, title, and evidence text.
+  canonical capabilities, and an explicit individual-unit or integrated-suite
+  scope. A stable manufacturer identifier is optional; when omitted, the
+  reviewed model becomes the manufacturer model number. A suite must select
+  its complete known set of approved unit components and quantities. No OEM
+  URL, title, excerpt, or Gemini request is required for this human decision.
 - **Discard observation** requires a reason and creates neither a catalog row
   nor a listing association.
 
-An existing-product match can be committed immediately with **Save verified
-product for this entry**. An independent raw observation can likewise be
-committed immediately with **Save discarded observation** after the reviewer
-provides a reason. The server updates only that occurrence, removes its card
-from the hash-bound review, and returns a fresh revision for the remaining
-cards; unsaved browser drafts for those cards are preserved. The final saved
-card runs the ordinary canonical listing finalizer automatically. The UI reports
-completion only when the returned listing is both `ready` and verified, and
-keeps any exact association or finalization failure on the affected card or in
-the terminal result instead of replacing it with a listing-wide generic error.
-Create decisions and discard decisions that cover an existing association or
-participate in a replacement graph continue to use the atomic complete-review
-action.
+An existing-product match, a human-created product, or an independent raw
+observation discard can be committed from its own card. The server updates only
+that occurrence, removes its card from the hash-bound review, and returns a
+fresh revision for the remaining cards; unsaved browser drafts for those cards
+are preserved. The final saved card runs the ordinary canonical listing
+finalizer automatically. The UI reports completion only when the returned
+listing is both `ready` and verified, and keeps any exact association or
+finalization failure on the affected card or in the terminal result instead of
+replacing it with a listing-wide generic error. Decisions covering an existing
+association or participating in a replacement graph continue to use the atomic
+complete-review action.
 
-Catalog search results expose `catalog.reuse_eligible`. An approved product that
-lacks a current reusable manufacturer-source attestation remains visible and
-can be selected only for inline source verification. The selected occurrence
-card accepts one exact OEM URL, title, and bounded identity excerpt, verifies
-the global product without Gemini, refreshes that card's catalog revision, and
-preserves every other unsaved listing decision. The reviewer must still save
-the listing association separately after confirming the match. Preparing the
-Known avionics products queue also promotes a still-current approved suggestion
-on an independent ordinary occurrence into an explicit product-attestation
-target. Both paths verify the OEM source once without recreating the catalog
-product.
+Catalog search results expose `catalog.reuse_eligible` for automatic reuse, but
+that automation flag does not restrict an authorized reviewer: every approved
+product can be selected from an occurrence card. The separate **OEM source
+automation** workspace maintains reusable manufacturer attestations and can
+apply them to eligible unambiguous occurrences in bulk. Its source URL, title,
+and excerpt are automation inputs, not human-review requirements.
+
+That workspace also exposes a source-free, catalog-revision-guarded structure
+editor for approved products. A reviewer can change a product between an
+individual unit and an integrated suite and replace the complete component set
+atomically. Units cannot contain components, suites cannot contain themselves
+or other suites, and components must be approved units. Suite membership never
+creates unobserved listing rows: it is used only to avoid valuing explicitly
+listed included components twice. G1000 and G1000 NXi are therefore separate
+suite identities even when listings use abbreviated descriptions.
 
 Each avionics card also allows the reviewer to correct the extracted
 manufacturer, model, canonical capabilities, and quantity. A fresh unlinked
@@ -751,9 +757,10 @@ together. Without the explicit finalization flag it leaves the listing
 incomplete and private. With the flag set, the server rechecks FAA admission
 and runs grounded enrichment outside the transaction. Only successful
 admission, enrichment, and readiness checks publish it as `ready` and
-verified. Accepted associations receive `listing_review`
-provenance and high installation confidence and participate in valuation under
-the same evidence rule as high-confidence `listing` associations. A completion
+verified. Human-accepted associations receive `human_review` provenance and
+high installation confidence and participate in valuation under the same
+confidence rule as high-confidence `listing` associations. The distinct
+`listing_review` source is reserved for hash-bound automated corroboration. A completion
 failure is stored as `quarantined`. Missing factory reference data is not a
 completion failure: the API returns the resolved listing as `incomplete` and
 unverified, the browser removes it from the manual queue, and the workspace

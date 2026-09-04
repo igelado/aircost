@@ -1032,11 +1032,23 @@ All three actions remain available for every avionics aspect, including an
 aspect with a suggested match or legacy candidate. The reviewer must make
 exactly one decision for every aspect in the bundle:
 
-- `use_verified_product` selects an existing `approved` catalog ID.
+- `use_verified_product` is an accountable human assertion that the exact
+  occurrence is an existing `approved` catalog ID. It does not invoke Gemini
+  or require an OEM-source attestation.
 - `create_verified_product` supplies a concrete manufacturer and model,
-  canonical capabilities, a stable manufacturer identifier kind and value,
-  plus authoritative source URL, title, and evidence text.
+  canonical capabilities, and whether the product is a unit or an integrated
+  suite. A stable manufacturer identifier is optional; when it is absent the
+  reviewed model is used as the manufacturer model number. Integrated suites
+  also supply their complete known approved-unit component set. The new
+  identity is attributed to the reviewer and does not store invented source
+  fields.
 - `discard` records a reason and creates no product or association.
+
+This human path is deliberately different from automatic catalog admission.
+An automatic write must still establish the authoritative manufacturer and
+product identity at very high confidence. Gemini grounding and reusable OEM
+attestations support that automatic boundary; neither is a prerequisite after
+an authorized reviewer takes responsibility for the decision.
 
 The bundle stores both its own payload hash and an approved-only catalog
 fingerprint of product IDs, manufacturer/model labels, capabilities, stable
@@ -1059,6 +1071,16 @@ aircraft defaults, reference configurations, or suite membership cannot be
 promoted through listing review. It never admits an undecided or unverified
 candidate into canonical state.
 
+An approved integrated suite is one catalog product with explicit approved
+unit components and quantities. That relationship is catalog containment, not
+an assertion that a listing named every component. If a listing explicitly
+names both the suite and one of its included units, valuation removes only the
+included quantity from the duplicate unit contribution; extra explicit units
+remain separately valued. Similar labels do not collapse distinct suites, so
+G1000 and G1000 NXi remain different products. Exact airframe- and year-specific
+factory configurations belong in aircraft reference configurations rather than
+in a universal suite definition.
+
 Avionics are also an explicit `PATCH` boundary. Omitting `avionics` skips
 avionics identity resolution and preserves the pending bundle, its hashes, and
 the exact listing-link IDs; ordinary price, status, hours, and similar changes
@@ -1080,10 +1102,11 @@ configurations are valuation gaps: they prevent that valuation row from being
 served, snapshotted, or used for training, but do not make the listing itself
 incomplete. An actual listing, FAA, or listing-specific enrichment failure is
 persisted as `quarantined`; neither path rolls back or holds a network request
-inside the catalog/link transaction. Associations explicitly corroborated by a
-reviewer use `listing_review` provenance with high installation confidence and
+inside the catalog/link transaction. Associations explicitly accepted by a
+reviewer use `human_review` provenance with high installation confidence and
 are valuation-eligible wherever equivalent high-confidence `listing`
-associations are accepted.
+associations are accepted. The distinct `listing_review` source remains
+reserved for hash-bound machine authorization.
 
 ## Grounded Product And Factory Facts
 

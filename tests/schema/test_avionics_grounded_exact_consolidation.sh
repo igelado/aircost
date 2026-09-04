@@ -25,20 +25,23 @@ PRAGMA foreign_keys = ON;
 INSERT INTO avionics_manufacturers (name, normalized_name)
 VALUES ('Schema Test', 'schema test');
 INSERT INTO avionics_manufacturer_identities (
-  canonical_name, normalized_identity_key, identity_evidence_kind,
+  canonical_name, normalized_identity_key, verification_method,
+  identity_evidence_kind,
   identity_source_url, identity_source_title, identity_evidence_text,
   identity_confidence
 ) VALUES (
-  'Schema Test', 'schematest', 'authoritative_reference',
+  'Schema Test', 'schematest', 'automated', 'authoritative_reference',
   'https://schema.example.test/manufacturer', 'Schema manufacturer',
   'Schema Test identifies itself as the manufacturer.', 'very_high'
 );
 INSERT INTO avionics_manufacturer_identity_memberships (
   avionics_manufacturer_id, avionics_manufacturer_identity_id,
-  membership_basis, normalized_name_key, evidence_source_url,
+  membership_basis, normalized_name_key, verification_method,
+  evidence_source_url,
   evidence_source_title, evidence_text, evidence_confidence
 )
 SELECT manufacturer.id, identity.id, 'deterministic_exact', 'schematest',
+       'automated',
        'urn:aircost:deterministic:avionics-manufacturer-normalization:v1',
        'Aircost exact manufacturer normalization v1',
        'The stored manufacturer spelling has the same exact deterministic normalization key as this evidence-backed identity.',

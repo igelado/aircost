@@ -2503,67 +2503,47 @@ label span,
   margin-top: 8px;
 }
 
-.review-product-source,
-.review-product-summary > .review-product-evidence-missing,
-.review-selected-product > .review-product-evidence-missing {
-  display: block;
-  margin-top: 8px;
-  overflow-wrap: anywhere;
-  font-size: 10px;
+.review-product-automation-note {
+  max-width: 760px;
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
-.review-product-source {
-  color: var(--accent-strong);
-  font-weight: 700;
+.review-product-structure-maintenance {
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #f7faf9;
 }
 
-.review-product-summary .review-product-evidence,
-.review-selected-product .review-product-evidence {
-  margin-bottom: 0;
-}
-
-.review-product-reuse-warning {
-  margin: 8px 0 0;
-  padding: 7px 8px;
-  border: 1px solid rgba(177, 77, 48, 0.3);
-  border-radius: 6px;
-  background: #fff7f2;
-  color: var(--danger);
-  font-size: 10px;
-  line-height: 1.4;
-}
-
-.review-selected-product.has-inline-attestation {
-  grid-column: 1 / -1;
-}
-
-.review-inline-attestation {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--line);
-}
-
-.review-inline-attestation > strong,
-.review-inline-attestation > p {
-  display: block;
+.review-product-structure-maintenance > h4,
+.review-product-structure-maintenance > p {
   margin: 0;
 }
 
-.review-inline-attestation > p {
+.review-product-structure-maintenance > p {
   margin-top: 4px;
   color: var(--muted);
-  font-size: 10px;
-  line-height: 1.4;
+  font-size: 11px;
+  line-height: 1.5;
 }
 
-.review-inline-attestation form {
+#review-product-structure-message {
+  min-height: 17px;
+}
+
+.review-existing-structure-form {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(180px, 0.5fr) minmax(260px, 1fr);
   gap: 10px;
-  margin-top: 10px;
+  align-items: end;
+  margin-top: 12px;
 }
 
-.review-inline-attestation label > span {
+.review-existing-structure-form > label > span {
   display: block;
   margin-bottom: 5px;
   color: var(--muted);
@@ -2571,26 +2551,24 @@ label span,
   font-weight: 700;
 }
 
-.review-inline-attestation-actions {
-  display: flex;
+.review-existing-structure-components,
+.review-existing-structure-form > .review-decision-validation,
+.review-existing-structure-form > .button {
   grid-column: 1 / -1;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
 }
 
-.review-inline-attestation-result {
-  flex: 1;
-  margin: 0;
-  color: var(--muted);
-  font-size: 10px;
-  line-height: 1.4;
-  text-align: right;
+.review-existing-structure-components {
+  display: grid;
+  gap: 7px;
 }
 
-.review-inline-attestation-result.error {
-  color: var(--danger);
-  font-weight: 700;
+.review-existing-structure-results,
+.review-existing-structure-form > .review-catalog-message {
+  grid-column: 2;
+}
+
+.review-existing-structure-form > .button {
+  justify-self: start;
 }
 
 .review-decision-fieldset {
@@ -2714,22 +2692,6 @@ label span,
   background: #f0faf8;
 }
 
-.review-catalog-result.not-reusable,
-.review-catalog-result.not-reusable:hover {
-  border-color: rgba(177, 77, 48, 0.28);
-  background: #fff7f2;
-  opacity: 0.78;
-}
-
-.review-catalog-result.not-reusable:not(:disabled) {
-  cursor: pointer;
-  opacity: 1;
-}
-
-.review-catalog-result.not-reusable:disabled {
-  cursor: not-allowed;
-}
-
 .review-catalog-result strong,
 .review-catalog-result span {
   display: block;
@@ -2756,6 +2718,73 @@ label span,
 
 .review-control-wide {
   grid-column: 1 / -1;
+}
+
+.review-create-candidate {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f7faf9;
+}
+
+.review-suite-editor,
+.review-product-structure {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f7faf9;
+}
+
+.review-suite-editor > p,
+.review-product-structure > p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.review-product-structure.suite {
+  border-color: rgba(31, 111, 98, 0.28);
+  background: #f0faf8;
+}
+
+.review-suite-component-list {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0;
+}
+
+.review-suite-component {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 90px auto;
+  gap: 8px;
+  align-items: end;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+}
+
+.review-suite-component > div > strong,
+.review-suite-component > div > span {
+  display: block;
+}
+
+.review-suite-component > div > span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.review-suite-component-summary {
+  margin: 7px 0 0;
+  padding-left: 18px;
+  font-size: 10px;
 }
 
 .review-character-counter {
@@ -3123,18 +3152,7 @@ label span,
     width: 100%;
   }
 
-  .review-inline-attestation-actions {
-    align-items: stretch;
-    flex-direction: column;
-    grid-column: 1;
-  }
-
-  .review-inline-attestation-actions .button {
-    width: 100%;
-  }
-
-  .review-aspect-save-result,
-  .review-inline-attestation-result {
+  .review-aspect-save-result {
     text-align: left;
   }
 
@@ -3154,14 +3172,24 @@ label span,
 
   .review-aspect-context,
   .review-action-panel,
-  .review-inline-attestation form {
+  .review-existing-structure-form {
     grid-template-columns: 1fr;
+  }
+
+  .review-suite-component {
+    grid-template-columns: 1fr;
+  }
+
+  .review-suite-component .button {
+    width: 100%;
   }
 
   .review-catalog-message,
   .review-catalog-results,
   .review-create-product-grid,
-  .review-control-wide {
+  .review-control-wide,
+  .review-existing-structure-results,
+  .review-existing-structure-form > .review-catalog-message {
     grid-column: 1;
   }
 

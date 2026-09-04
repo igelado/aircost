@@ -83,6 +83,8 @@ pub struct AvionicsCapability {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct AvionicsCatalogState {
     pub status: String,
+    pub verification_method: Option<String>,
+    pub verified_by_user_id: Option<i64>,
     pub identity_confidence: Option<String>,
     pub reviewed_at: Option<String>,
     /// Whether this exact approved identity may be selected for a listing
@@ -406,6 +408,8 @@ struct RawSummary {
     manufacturer_name: String,
     name: String,
     catalog_status: String,
+    verification_method: Option<String>,
+    verified_by_user_id: Option<i64>,
     manufacturer_identifier_kind: Option<String>,
     manufacturer_identifier: Option<String>,
     identity_source_url: Option<String>,
@@ -458,6 +462,13 @@ struct ListingValuationEligibility {
     listing_counts_by_model: BTreeMap<i64, i64>,
 }
 
+fn listing_association_authority_is_current(
+    source: &str,
+    automatic_authorization_is_current: bool,
+) -> bool {
+    source == "human_review" || automatic_authorization_is_current
+}
+
 macro_rules! listing_valuation_eligibility_in_transaction {
     ($db:expr, $transaction:expr, $rows:expr, $authorization_state:path) => {{
         let rows = $rows;
@@ -483,8 +494,10 @@ macro_rules! listing_valuation_eligibility_in_transaction {
             if !current_listing_states
                 .get(&row.listing_id)
                 .is_some_and(|state| {
-                    row.source == "listing_review"
-                        || state.automatic_link_is_current(row.listing_link_id)
+                    listing_association_authority_is_current(
+                        &row.source,
+                        state.automatic_link_is_current(row.listing_link_id),
+                    )
                 })
             {
                 continue;
@@ -543,7 +556,7 @@ async fn load_listing_valuation_eligibility(
           ON installed_model.id = link.avionics_model_id
         LEFT JOIN avionics_models replacement_model
           ON replacement_model.id = link.replaces_avionics_model_id
-        WHERE link.source IN ('listing', 'listing_explicit_count', 'listing_review')
+        WHERE link.source IN ('listing', 'listing_explicit_count', 'listing_review', 'human_review')
           AND (listing.is_verified = TRUE OR listing.created_by_user_id = ?)
           AND (? IS NULL OR link.avionics_model_id = ?
             OR link.replaces_avionics_model_id = ?)
@@ -602,6 +615,8 @@ fn summary_sql() -> String {
       manufacturer.name AS manufacturer_name,
       model.name,
       model.catalog_status,
+      model.verification_method,
+      model.verified_by_user_id,
       model.manufacturer_identifier_kind,
       model.manufacturer_identifier,
       model.identity_source_url,
@@ -768,15 +783,21 @@ fn completeness_blockers(row: &RawSummary) -> Vec<String> {
     {
         blockers.push("missing_stable_identifier".to_string());
     }
-    if is_blank(row.identity_source_url.as_deref())
-        || is_blank(row.identity_source_title.as_deref())
-        || is_blank(row.identity_evidence_text.as_deref())
-        || row.identity_evidence_kind != "authoritative_reference"
-    {
-        blockers.push("missing_authoritative_identity_evidence".to_string());
-    }
-    if row.identity_confidence.as_deref() != Some("very_high") {
-        blockers.push("identity_confidence_not_very_high".to_string());
+    if row.verification_method.as_deref() == Some("automated") {
+        if is_blank(row.identity_source_url.as_deref())
+            || is_blank(row.identity_source_title.as_deref())
+            || is_blank(row.identity_evidence_text.as_deref())
+            || row.identity_evidence_kind != "authoritative_reference"
+        {
+            blockers.push("missing_authoritative_identity_evidence".to_string());
+        }
+        if row.identity_confidence.as_deref() != Some("very_high") {
+            blockers.push("identity_confidence_not_very_high".to_string());
+        }
+    } else if row.verification_method.as_deref() != Some("human") {
+        blockers.push("missing_verification_method".to_string());
+    } else if row.verified_by_user_id.is_none() {
+        blockers.push("missing_human_reviewer".to_string());
     }
     if row.canonical_capability_count == 0 {
         blockers.push("missing_capability".to_string());
@@ -862,6 +883,8 @@ fn summary_from_raw(
         capabilities,
         catalog: AvionicsCatalogState {
             status: row.catalog_status,
+            verification_method: row.verification_method,
+            verified_by_user_id: row.verified_by_user_id,
             identity_confidence: row.identity_confidence,
             reviewed_at: row.catalog_reviewed_at,
             reuse_eligible,
@@ -1136,7 +1159,7 @@ fn listing_valuation_blockers(
     }
     if !matches!(
         row.source.as_str(),
-        "listing" | "listing_explicit_count" | "listing_review"
+        "listing" | "listing_explicit_count" | "listing_review" | "human_review"
     ) {
         blockers.push("source_not_listing".to_string());
     }
@@ -1404,7 +1427,8 @@ pub async fn get_avionics_catalog_detail(
 mod tests {
     use super::{
         avionics_catalog_options, completeness_blockers, get_avionics_catalog_detail,
-        list_avionics_catalog, AvionicsCatalogQuery, RawSummary,
+        list_avionics_catalog, listing_association_authority_is_current, AvionicsCatalogQuery,
+        RawSummary,
     };
     use crate::avionics::fingerprint::active_collision_closure_revision_sha256;
     use crate::avionics::manufacturer::ensure_test_manufacturer_identity_for_model;
@@ -1422,6 +1446,8 @@ mod tests {
             manufacturer_name: "Example".to_string(),
             name: "Unit".to_string(),
             catalog_status: "unreviewed".to_string(),
+            verification_method: None,
+            verified_by_user_id: None,
             manufacturer_identifier_kind: None,
             manufacturer_identifier: None,
             identity_source_url: None,
@@ -1450,6 +1476,7 @@ mod tests {
     fn complete_row() -> RawSummary {
         let mut row = incomplete_row();
         row.catalog_status = "approved".to_string();
+        row.verification_method = Some("automated".to_string());
         row.manufacturer_identifier_kind = Some("sku".to_string());
         row.manufacturer_identifier = Some("TEST-1".to_string());
         row.identity_source_url = Some("https://manufacturer.example/test-1".to_string());
@@ -1474,8 +1501,7 @@ mod tests {
             vec![
                 "catalog_not_approved",
                 "missing_stable_identifier",
-                "missing_authoritative_identity_evidence",
-                "identity_confidence_not_very_high",
+                "missing_verification_method",
                 "missing_capability",
                 "missing_introduced_year",
                 "missing_installed_contribution",
@@ -1485,6 +1511,22 @@ mod tests {
                 "value_basis_not_installed_contribution",
             ]
         );
+    }
+
+    #[test]
+    fn only_human_review_bypasses_capture_bound_association_authority() {
+        assert!(listing_association_authority_is_current(
+            "human_review",
+            false
+        ));
+        assert!(!listing_association_authority_is_current(
+            "listing_review",
+            false
+        ));
+        assert!(listing_association_authority_is_current(
+            "listing_review",
+            true
+        ));
     }
 
     #[test]
@@ -1854,7 +1896,7 @@ mod tests {
             .unwrap();
         execute(
             &db,
-            "UPDATE avionics_models SET catalog_status = 'approved', catalog_reviewed_at = CURRENT_TIMESTAMP WHERE id = (SELECT id FROM avionics_models WHERE normalized_name = 'visible unit')",
+            "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated', catalog_reviewed_at = CURRENT_TIMESTAMP WHERE id = (SELECT id FROM avionics_models WHERE normalized_name = 'visible unit')",
         )
         .await;
         for (email, registration) in [
@@ -1876,7 +1918,7 @@ mod tests {
         .await;
         execute(
             &db,
-            "UPDATE aircraft_sale_listing_avionics SET source = 'listing_review', source_confidence = 'high' WHERE aircraft_sale_listing_id = (SELECT id FROM aircraft_sale_listings WHERE registration_number = 'N100IT')",
+            "UPDATE aircraft_sale_listing_avionics SET source = 'human_review', source_confidence = 'high' WHERE aircraft_sale_listing_id = (SELECT id FROM aircraft_sale_listings WHERE registration_number = 'N100IT')",
         )
         .await;
         seed_current_faa_aircraft_assignment(&db, "N100IT").await;
@@ -1921,6 +1963,82 @@ mod tests {
         assert_eq!(page.items[0].id, avionics_id);
         assert_eq!(page.items[0].catalog.status, "approved");
         assert!(!page.items[0].catalog.reuse_eligible);
+    }
+
+    #[tokio::test]
+    async fn human_verified_product_is_selectable_but_not_automatic_reuse_eligible() {
+        let (db, current_user_id, _, _) = fixture().await;
+        let manufacturer_id = scalar(
+            &db,
+            "SELECT id FROM avionics_manufacturers WHERE normalized_name = 'inspector test'",
+        )
+        .await;
+        let capability_id = scalar(
+            &db,
+            "SELECT id FROM avionics_types WHERE normalized_name = 'inspector capability'",
+        )
+        .await;
+        execute(
+            &db,
+            &format!(
+                r#"INSERT INTO avionics_models (
+                     avionics_manufacturer_id, name, normalized_name,
+                     manufacturer_identifier_kind, manufacturer_identifier,
+                     normalized_manufacturer_identifier, catalog_reviewed_at
+                   ) VALUES (
+                     {manufacturer_id}, 'Human Unit', 'human unit',
+                     'manufacturer_model_number', 'HUMAN-1', 'human1',
+                     CURRENT_TIMESTAMP
+                   )"#,
+            ),
+        )
+        .await;
+        let human_model_id = scalar(
+            &db,
+            "SELECT id FROM avionics_models WHERE normalized_name = 'human unit'",
+        )
+        .await;
+        execute(
+            &db,
+            &format!(
+                "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES ({human_model_id}, {capability_id})",
+            ),
+        )
+        .await;
+        execute(
+            &db,
+            &format!(
+                "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'human', verified_by_user_id = {current_user_id} WHERE id = {human_model_id}",
+            ),
+        )
+        .await;
+
+        let page = list_avionics_catalog(
+            &db,
+            current_user_id,
+            AvionicsCatalogQuery {
+                search: Some("HUMAN-1".to_string()),
+                status: Some("approved".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, human_model_id);
+        assert_eq!(
+            page.items[0].catalog.verification_method.as_deref(),
+            Some("human")
+        );
+        assert!(!page.items[0].catalog.reuse_eligible);
+        assert!(
+            !get_avionics_catalog_detail(&db, current_user_id, human_model_id)
+                .await
+                .unwrap()
+                .summary
+                .catalog
+                .reuse_eligible
+        );
     }
 
     #[tokio::test]
@@ -2331,7 +2449,7 @@ mod tests {
             .unwrap();
         execute(
             &db,
-            "UPDATE avionics_models SET catalog_status = 'approved', catalog_reviewed_at = CURRENT_TIMESTAMP WHERE id = (SELECT id FROM avionics_models WHERE normalized_name = 'kx170b')",
+            "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated', catalog_reviewed_at = CURRENT_TIMESTAMP WHERE id = (SELECT id FROM avionics_models WHERE normalized_name = 'kx170b')",
         )
         .await;
 
@@ -2474,7 +2592,7 @@ mod tests {
         .await;
         execute(
             &db,
-            "UPDATE avionics_models SET catalog_status = 'approved', catalog_reviewed_at = CURRENT_TIMESTAMP WHERE normalized_name = 'legacy unknown unit'",
+            "UPDATE avionics_models SET catalog_status = 'approved', verification_method = 'automated', catalog_reviewed_at = CURRENT_TIMESTAMP WHERE normalized_name = 'legacy unknown unit'",
         )
         .await;
 

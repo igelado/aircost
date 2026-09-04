@@ -344,11 +344,6 @@ pub struct ApprovedAvionicsIdentity {
     pub evidence_title: String,
     pub evidence: String,
     pub reason: String,
-    /// Server-owned URLs for every accepted structured claim that supported
-    /// this new grounded decision. Never expose these as client-controlled
-    /// review input.
-    #[serde(skip)]
-    pub(crate) grounded_claim_source_urls: Vec<String>,
     #[serde(skip)]
     pub(crate) verified_local_reuse_proof: Option<VerifiedLocalReuseProof>,
 }
@@ -377,58 +372,10 @@ pub enum AvionicsIdentityOutcome {
     Unresolved { reason: String },
 }
 
-/// Result of the network-capable preflight used by the manual review API.
-///
-/// Ordinary identity decisions remain read-only and are returned as previews.
-/// A complete grounded exact-model duplicate group is different: it is safe to
-/// curate independently of the listing decision, so the preflight applies that
-/// catalog-only transaction and tells the caller to reload the rewritten
-/// review before submitting a listing decision.
-pub(crate) enum ReviewPreflightAvionicsIdentityOutcome {
-    Preview {
-        outcome: AvionicsIdentityOutcome,
-        direct_source_verification: Option<ReviewDirectSourceVerification>,
-    },
-    CatalogConsolidated(ApprovedAvionicsIdentity),
-}
-
-/// Server-owned receipt proving which immutable review anchors were matched
-/// against a fresh fetch from the admitted authoritative source.
-///
-/// This is intentionally transient. It authorizes retaining one exact,
-/// bounded reviewer excerpt for the current review request; it is not durable
-/// catalog evidence and cannot be populated from client JSON.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReviewDirectSourceVerification {
-    final_source_urls: Vec<String>,
-    verified_identity_anchors: Vec<String>,
-}
-
-impl ReviewDirectSourceVerification {
-    pub(crate) fn verifies_exact_anchor(&self, final_source_url: &str, anchor: &str) -> bool {
-        self.final_source_urls
-            .iter()
-            .any(|source_url| source_url == final_source_url)
-            && self
-                .verified_identity_anchors
-                .iter()
-                .any(|verified| verified == anchor)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(final_source_url: &str, verified_identity_anchor: &str) -> Self {
-        Self {
-            final_source_urls: vec![final_source_url.to_string()],
-            verified_identity_anchors: vec![verified_identity_anchor.to_string()],
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IdentityPersistenceMode {
     Apply,
     Preview,
-    ApplyGroundedConsolidationOnly,
 }
 
 impl IdentityPersistenceMode {
@@ -445,8 +392,6 @@ struct IdentityResolutionExecution {
     mode: IdentityPersistenceMode,
     grounded_exact_model_consolidated: bool,
     pending_review_revision_receipts: Vec<PendingReviewRevisionReceipt>,
-    review_direct_source_verification: Option<ReviewDirectSourceVerification>,
-    review_direct_source_verification_conflicted: bool,
     grounded_resolution_completed: bool,
     grounded_catalog_snapshot: Option<GroundedCatalogSnapshot>,
 }
@@ -457,54 +402,9 @@ impl IdentityResolutionExecution {
             mode,
             grounded_exact_model_consolidated: false,
             pending_review_revision_receipts: Vec::new(),
-            review_direct_source_verification: None,
-            review_direct_source_verification_conflicted: false,
             grounded_resolution_completed: false,
             grounded_catalog_snapshot: None,
         }
-    }
-
-    fn record_review_direct_source_verification(
-        &mut self,
-        plan: &IdentityGroundingPlan,
-        response: &GroundedJsonResponse,
-    ) {
-        let IdentityGroundingPlan::Direct(plan) = plan else {
-            return;
-        };
-        if self.review_direct_source_verification_conflicted
-            || plan.requirement != DirectSourceRequirement::Explicit
-            || !response.authoritative_direct_source_verified
-            || response.authoritative_direct_source_final_urls.is_empty()
-        {
-            return;
-        }
-
-        if self
-            .review_direct_source_verification
-            .as_ref()
-            .is_some_and(|verification| {
-                verification.verified_identity_anchors != plan.identity_anchors
-            })
-        {
-            self.review_direct_source_verification = None;
-            self.review_direct_source_verification_conflicted = true;
-            return;
-        }
-        let verification = self
-            .review_direct_source_verification
-            .get_or_insert_with(|| ReviewDirectSourceVerification {
-                final_source_urls: Vec::new(),
-                verified_identity_anchors: plan.identity_anchors.clone(),
-            });
-        verification.final_source_urls.extend(
-            response
-                .authoritative_direct_source_final_urls
-                .iter()
-                .cloned(),
-        );
-        verification.final_source_urls.sort();
-        verification.final_source_urls.dedup();
     }
 }
 
@@ -709,27 +609,6 @@ fn grounded_consolidation_preview_block(
         reason: "the independent collision review found a complete grounded exact-model duplicate group; apply mode must consolidate and approve it atomically"
             .to_string(),
     })
-}
-
-fn review_preflight_outcome(
-    outcome: AvionicsIdentityOutcome,
-    grounded_exact_model_consolidated: bool,
-    direct_source_verification: Option<ReviewDirectSourceVerification>,
-) -> CatalogResult<ReviewPreflightAvionicsIdentityOutcome> {
-    if !grounded_exact_model_consolidated {
-        return Ok(ReviewPreflightAvionicsIdentityOutcome::Preview {
-            outcome,
-            direct_source_verification,
-        });
-    }
-    let AvionicsIdentityOutcome::Approved(approved) = outcome else {
-        return Err(CatalogError::Validation(
-            "grounded exact-model consolidation completed without an approved survivor".to_string(),
-        ));
-    };
-    Ok(ReviewPreflightAvionicsIdentityOutcome::CatalogConsolidated(
-        approved,
-    ))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -1114,26 +993,6 @@ pub async fn preview_avionics_identity(
     resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await
 }
 
-/// Run manual-review grounding without applying an ordinary create or
-/// promotion. If the independent review proves one complete exact-model
-/// duplicate group, apply that catalog-only consolidation immediately so the
-/// pending review can be rewritten to the resulting verified product.
-pub(crate) async fn resolve_avionics_identity_for_review_preflight(
-    db: &AppDb,
-    extractor: &GeminiListingExtractor,
-    request: &AvionicsIdentityRequest,
-) -> CatalogResult<ReviewPreflightAvionicsIdentityOutcome> {
-    let mut execution =
-        IdentityResolutionExecution::new(IdentityPersistenceMode::ApplyGroundedConsolidationOnly);
-    let outcome =
-        resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await?;
-    review_preflight_outcome(
-        outcome,
-        execution.grounded_exact_model_consolidated,
-        execution.review_direct_source_verification,
-    )
-}
-
 /// Reject an observed model only when its complete typography-normalized label
 /// is one of the server-owned generic equipment categories.
 ///
@@ -1152,21 +1011,6 @@ pub(crate) fn deterministic_generic_avionics_rejection_reason(
     ))
 }
 
-/// Persist a current-policy reuse attestation for an already-approved product
-/// after a fresh preview completed the full grounded identity and collision
-/// review.
-///
-/// This is a dedicated mutation boundary: preview itself stays read-only. The
-/// transaction re-reads and exactly compares the immutable catalog identity
-/// and capability set, refreshes only its grounded evidence fields, then binds
-/// that exact refreshed row to the active source origin.
-pub(crate) async fn attest_grounded_existing_avionics_identity(
-    db: &AppDb,
-    grounded: &ApprovedAvionicsIdentity,
-) -> CatalogResult<bool> {
-    attest_grounded_existing_avionics_identity_with_guard(db, grounded, None).await
-}
-
 pub(crate) async fn attest_pending_review_product_identity(
     db: &AppDb,
     verification: &ApprovedProductSourceVerification,
@@ -1175,10 +1019,8 @@ pub(crate) async fn attest_pending_review_product_identity(
     attest_grounded_existing_avionics_identity_with_guard(
         db,
         &verification.approved,
-        Some((
-            verification.manufacturer_collision_snapshot_sha256.as_str(),
-            guard,
-        )),
+        verification.manufacturer_collision_snapshot_sha256.as_str(),
+        guard,
     )
     .await
 }
@@ -1225,7 +1067,8 @@ fn pending_review_payload_authorizes_attestation(
 async fn attest_grounded_existing_avionics_identity_with_guard(
     db: &AppDb,
     grounded: &ApprovedAvionicsIdentity,
-    guarded_review: Option<(&str, &PendingProductAttestationCommitGuard)>,
+    expected_collision_snapshot: &str,
+    guard: &PendingProductAttestationCommitGuard,
 ) -> CatalogResult<bool> {
     if grounded.id <= 0
         || grounded.evidence_url.trim().is_empty()
@@ -1286,53 +1129,50 @@ async fn attest_grounded_existing_avionics_identity_with_guard(
                     grounded.id
                 )));
             }
-            if let Some((expected_collision_snapshot, guard)) = guarded_review {
-                let current_manufacturer_identity_id = review_catalog
-                    .iter()
-                    .find(|candidate| candidate.candidate.id == grounded.id)
-                    .and_then(|candidate| candidate.manufacturer_identity_id);
-                let current_collision_snapshot = manufacturer_collision_snapshot_sha256(
-                    &grounded.manufacturer,
-                    current_manufacturer_identity_id,
-                    &review_catalog,
-                );
-                if current_collision_snapshot != expected_collision_snapshot {
-                    return Err(CatalogError::Validation(format!(
-                        "manufacturer-scoped collision catalog changed after source verification for catalog id {}; retry against the current product family",
-                        grounded.id
-                    )));
-                }
-                let pending_sql = db.sql(
-                    r#"
-                    SELECT review.review_payload_json
-                    FROM aircraft_sale_listing_pending_reviews review
-                    JOIN aircraft_sale_listings listing
-                      ON listing.id = review.listing_id
-                    WHERE review.listing_id = ?
-                      AND listing.created_by_user_id = ?
-                      AND review.review_payload_sha256 = ?
-                    "#,
-                );
-                let pending_payload: Option<String> =
-                    sqlx::query_scalar(&pending_sql)
-                        .bind(guard.listing_id)
-                        .bind(guard.owner_user_id)
-                        .bind(guard.review_payload_sha256.as_str())
-                        .fetch_optional(&mut *transaction)
-                        .await?;
-                if !pending_payload.as_deref().is_some_and(|payload| {
-                    pending_review_payload_authorizes_attestation(
-                        payload,
-                        &guard.aspect_id,
-                        grounded.id,
-                        guard.authorization,
-                    )
-                }) {
-                    return Err(CatalogError::Validation(format!(
-                        "the reviewer no longer owns the hash-bound pending review authorization for catalog id {}; reload the listing review",
-                        grounded.id
-                    )));
-                }
+            let current_manufacturer_identity_id = review_catalog
+                .iter()
+                .find(|candidate| candidate.candidate.id == grounded.id)
+                .and_then(|candidate| candidate.manufacturer_identity_id);
+            let current_collision_snapshot = manufacturer_collision_snapshot_sha256(
+                &grounded.manufacturer,
+                current_manufacturer_identity_id,
+                &review_catalog,
+            );
+            if current_collision_snapshot != expected_collision_snapshot {
+                return Err(CatalogError::Validation(format!(
+                    "manufacturer-scoped collision catalog changed after source verification for catalog id {}; retry against the current product family",
+                    grounded.id
+                )));
+            }
+            let pending_sql = db.sql(
+                r#"
+                SELECT review.review_payload_json
+                FROM aircraft_sale_listing_pending_reviews review
+                JOIN aircraft_sale_listings listing
+                  ON listing.id = review.listing_id
+                WHERE review.listing_id = ?
+                  AND listing.created_by_user_id = ?
+                  AND review.review_payload_sha256 = ?
+                "#,
+            );
+            let pending_payload: Option<String> = sqlx::query_scalar(&pending_sql)
+                .bind(guard.listing_id)
+                .bind(guard.owner_user_id)
+                .bind(guard.review_payload_sha256.as_str())
+                .fetch_optional(&mut *transaction)
+                .await?;
+            if !pending_payload.as_deref().is_some_and(|payload| {
+                pending_review_payload_authorizes_attestation(
+                    payload,
+                    &guard.aspect_id,
+                    grounded.id,
+                    guard.authorization,
+                )
+            }) {
+                return Err(CatalogError::Validation(format!(
+                    "the reviewer no longer owns the hash-bound pending review authorization for catalog id {}; reload the listing review",
+                    grounded.id
+                )));
             }
             let attested = $refresh_grounded(
                 db,
@@ -1374,7 +1214,7 @@ async fn attest_grounded_existing_avionics_identity_with_guard(
 /// cannot select a different product, infer capabilities, create catalog
 /// state, or resolve listing occurrence. The caller must separately
 /// corroborate the listing association after the returned identity is written
-/// through `attest_grounded_existing_avionics_identity`.
+/// through `attest_pending_review_product_identity`.
 pub(crate) async fn verify_approved_avionics_product_source_without_gemini(
     db: &AppDb,
     request: &ApprovedAvionicsProductSourceRequest,
@@ -1643,7 +1483,6 @@ fn deterministic_graph_approved_identity_from_source(
         evidence_title: source_title.trim().to_string(),
         evidence,
         reason: "A fresh guarded fetch from the currently admitted OEM origin carries the complete graph-approved model and stable identifier in one bounded visible structural row; the manufacturer-scoped catalog has no exact identity duplicate.".to_string(),
-        grounded_claim_source_urls: vec![fetched.final_url.to_string()],
         verified_local_reuse_proof: None,
     })
 }
@@ -1922,7 +1761,6 @@ pub(crate) async fn resolve_verified_catalog_avionics_identity(
         evidence_title: selected.identity_source_title.clone(),
         evidence: selected.identity_evidence.clone(),
         reason: "Reused one exact, unique graph-approved catalog product with a current reuse attestation for non-listing metadata enrichment without Gemini".to_string(),
-        grounded_claim_source_urls: Vec::new(),
         verified_local_reuse_proof: None,
     }))
 }
@@ -2590,7 +2428,6 @@ async fn resolve_avionics_identity_with_write_mode(
         &grounded_response,
     )
     .await?;
-    execution.record_review_direct_source_verification(&grounding_plan, &grounded_response);
     let verified_evidence = grounded_response.verified_evidence.clone();
     let mut response = grounded_response.value.clone();
     let mut issues = resolution_issues_with_direct_source_proofs(
@@ -2649,7 +2486,6 @@ async fn resolve_avionics_identity_with_write_mode(
             &grounded_response,
         )
         .await?;
-        execution.record_review_direct_source_verification(&grounding_plan, &grounded_response);
         response = grounded_response.value.clone();
         issues = resolution_issues_with_direct_source_proofs(
             &context,
@@ -2832,7 +2668,6 @@ async fn resolve_verified_identity(
         &review_response,
     )
     .await?;
-    execution.record_review_direct_source_verification(grounding_plan, &review_response);
     let mut domain_issues = collision_response_issues(
         context,
         &proposed,
@@ -2887,7 +2722,6 @@ async fn resolve_verified_identity(
             &review_response,
         )
         .await?;
-        execution.record_review_direct_source_verification(grounding_plan, &review_response);
         domain_issues = collision_response_issues(
             context,
             &proposed,
@@ -3067,7 +2901,6 @@ async fn resolve_verified_identity(
                 evidence_title: review.candidate_source_title.clone(),
                 evidence: review.candidate_evidence.clone(),
                 reason: review.reason.clone(),
-                grounded_claim_source_urls: proposed.grounded_claim_source_urls.clone(),
                 verified_local_reuse_proof: None,
             },
         ));
@@ -3516,7 +3349,6 @@ pub(crate) async fn approved_avionics_identity_for_grounded_replay(
         evidence_title: candidate.identity_source_title.clone(),
         evidence: candidate.identity_evidence.clone(),
         reason: "Replayed one exact current same-case grounded materialization capability without granting global reuse".to_string(),
-        grounded_claim_source_urls: Vec::new(),
         verified_local_reuse_proof: None,
     }))
 }
@@ -3683,7 +3515,6 @@ async fn resolve_approved_catalog_candidate_with_gemini(
         reason:
             "Matched one unchanged graph-approved catalog product through bounded Gemini listing-evidence adjudication without Search, URL Context, collision review, or catalog mutation"
                 .to_string(),
-        grounded_claim_source_urls: Vec::new(),
         verified_local_reuse_proof: None,
     }))
 }
@@ -4543,7 +4374,6 @@ fn known_approved_local_match_core(
         evidence_title: selected.identity_source_title.clone(),
         evidence: selected.identity_evidence.clone(),
         reason: match_reason.to_string(),
-        grounded_claim_source_urls: Vec::new(),
         verified_local_reuse_proof: Some(VerifiedLocalReuseProof::ManufacturerScoped),
     })
 }
@@ -4609,7 +4439,6 @@ fn globally_unique_exact_model_local_match_core(
         evidence: selected.identity_evidence.clone(),
         reason: "Matched one globally unique exact listing model to the sole current graph-approved, reuse-attested catalog product without Gemini; the observed manufacturer hint was unsupported"
             .to_string(),
-        grounded_claim_source_urls: Vec::new(),
         verified_local_reuse_proof: Some(VerifiedLocalReuseProof::GlobalExactModel),
     })
 }
@@ -6507,7 +6336,6 @@ fn approved_identity_from_verified(
         evidence_title: identity.identity_source_title.clone(),
         evidence: identity.identity_evidence.clone(),
         reason: identity.reason.clone(),
-        grounded_claim_source_urls: identity.grounded_claim_source_urls.clone(),
         verified_local_reuse_proof: None,
     }
 }
@@ -7126,6 +6954,8 @@ async fn persist_approved_identity(
                 r#"
                 UPDATE avionics_models
                 SET catalog_status = 'approved',
+                    verification_method = 'automated',
+                    verified_by_user_id = NULL,
                     catalog_reviewed_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
@@ -7254,8 +7084,7 @@ mod tests {
 
     use super::{
         approved_candidate_adjudication_plan, approved_candidate_adjudication_plan_is_unchanged,
-        approved_candidate_adjudication_selection, approved_identity_from_verified,
-        attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
+        approved_candidate_adjudication_selection, attest_pending_review_product_identity,
         avionics_model_identity_relation, candidate_triage_plan, candidate_triage_selection,
         canonical_avionics_types_for_label, canonical_types_from_response, catalog_fingerprint,
         collision_correction_plan, collision_response_issues,
@@ -7280,9 +7109,9 @@ mod tests {
         resolution_issues_with_direct_source_proofs, resolve_avionics_identity,
         resolve_verified_catalog_avionics_identity, resolve_verified_local_avionics_identity,
         resolve_verified_local_avionics_model_observation,
-        revalidate_direct_source_admission_state, review_preflight_outcome,
-        select_opportunistic_authoritative_source_urls, select_unique_exact_review_candidate,
-        shortlist_avionics_candidates, should_run_listing_only_approved_candidate_adjudication,
+        revalidate_direct_source_admission_state, select_opportunistic_authoritative_source_urls,
+        select_unique_exact_review_candidate, shortlist_avionics_candidates,
+        should_run_listing_only_approved_candidate_adjudication,
         stable_oem_identifier_has_placeholder, validate_authorized_direct_source_response,
         validate_collision_decision_relation, validate_evidence_values,
         verified_identity_from_response, ActiveCollisionCatalogFingerprintRow,
@@ -7293,9 +7122,8 @@ mod tests {
         AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext, CollisionCorrectionPlan,
         DirectSourceRequirement, GeminiGroundingSource, GeminiGroundingSupport,
         GroundedJsonResponse, IdentityGroundingPlan, IdentityPersistenceMode,
-        IdentityResolutionExecution, KnownApprovedAvionicsCandidate,
-        PendingProductAttestationAuthorization, PendingProductAttestationCommitGuard,
-        ReviewCatalogCandidate, ReviewPreflightAvionicsIdentityOutcome, VerifiedIdentity,
+        KnownApprovedAvionicsCandidate, PendingProductAttestationAuthorization,
+        PendingProductAttestationCommitGuard, ReviewCatalogCandidate, VerifiedIdentity,
         VerifiedLocalReuseProof, COLLISION_CANDIDATE_LIMIT, COLLISION_STRUCTURE_CALL_BUDGET,
         KNOWN_APPROVED_SELECT_SQL,
     };
@@ -7877,109 +7705,6 @@ mod tests {
                 if reason.contains("apply mode must consolidate and approve it atomically")
         ));
         assert!(grounded_consolidation_preview_block(IdentityPersistenceMode::Apply).is_none());
-        assert!(grounded_consolidation_preview_block(
-            IdentityPersistenceMode::ApplyGroundedConsolidationOnly
-        )
-        .is_none());
-        assert!(
-            !IdentityPersistenceMode::ApplyGroundedConsolidationOnly.persists_ordinary_identity()
-        );
-    }
-
-    #[test]
-    fn manual_preflight_distinguishes_preview_from_committed_catalog_consolidation() {
-        let preview_identity = approved_identity_from_verified(0, &verified_identity());
-        let preview = review_preflight_outcome(
-            AvionicsIdentityOutcome::Approved(preview_identity),
-            false,
-            None,
-        )
-        .unwrap();
-        assert!(matches!(
-            preview,
-            ReviewPreflightAvionicsIdentityOutcome::Preview {
-                outcome: AvionicsIdentityOutcome::Approved(ApprovedAvionicsIdentity { id: 0, .. }),
-                direct_source_verification: None,
-            }
-        ));
-
-        let consolidated_identity = approved_identity_from_verified(42, &verified_identity());
-        let consolidated = review_preflight_outcome(
-            AvionicsIdentityOutcome::Approved(consolidated_identity),
-            true,
-            None,
-        )
-        .unwrap();
-        assert!(matches!(
-            consolidated,
-            ReviewPreflightAvionicsIdentityOutcome::CatalogConsolidated(ApprovedAvionicsIdentity {
-                id: 42,
-                ..
-            })
-        ));
-        assert!(review_preflight_outcome(
-            AvionicsIdentityOutcome::Unresolved {
-                reason: "unexpected".to_string(),
-            },
-            true,
-            None,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn conflicting_direct_source_anchor_receipts_fail_closed_per_execution() {
-        let direct_plan = |anchors: &[&str]| {
-            IdentityGroundingPlan::Direct(AuthoritativeDirectSourcePlan {
-                source_urls: vec![
-                    "https://static.garmin.com/pumac/GDC74A_InstallationManual.pdf".to_string(),
-                ],
-                identity_anchors: anchors.iter().map(|anchor| (*anchor).to_string()).collect(),
-                admission: ManufacturerSourceOriginAdmission {
-                    avionics_manufacturer_id: 1,
-                    effective_manufacturer_identity_id: 2,
-                    canonical_origins: vec!["https://static.garmin.com".to_string()],
-                },
-                requirement: DirectSourceRequirement::Explicit,
-            })
-        };
-        let final_url = "https://static.garmin.com/pumac/GDC74A_InstallationManual.pdf";
-        let first_anchor = "Garmin identifies GDC 74A by manufacturer model number GDC 74A.";
-        let first_plan = direct_plan(&["Garmin", "GDC 74A", first_anchor]);
-        let mut execution = IdentityResolutionExecution::new(
-            IdentityPersistenceMode::ApplyGroundedConsolidationOnly,
-        );
-        execution.record_review_direct_source_verification(
-            &first_plan,
-            &direct_source_response(&[final_url]),
-        );
-        assert!(execution
-            .review_direct_source_verification
-            .as_ref()
-            .is_some_and(|verification| {
-                verification.verifies_exact_anchor(final_url, first_anchor)
-            }));
-
-        let conflicting_plan = direct_plan(&[
-            "Garmin",
-            "GMU 44",
-            "Garmin identifies GMU 44 by manufacturer model number GMU 44.",
-        ]);
-        execution.record_review_direct_source_verification(
-            &conflicting_plan,
-            &direct_source_response(&[final_url]),
-        );
-        assert!(execution.review_direct_source_verification.is_none());
-        assert!(execution.review_direct_source_verification_conflicted);
-
-        execution.record_review_direct_source_verification(
-            &first_plan,
-            &direct_source_response(&[final_url]),
-        );
-        assert!(
-            execution.review_direct_source_verification.is_none(),
-            "a later matching response cannot repopulate a receipt after conflicting anchors"
-        );
     }
 
     fn known_candidate(id: i64, model: &str) -> KnownApprovedAvionicsCandidate {
@@ -8086,7 +7811,6 @@ mod tests {
             approved.evidence,
             "GTX 33 Mode S Transponder | 011-00455-00"
         );
-        assert_eq!(approved.grounded_claim_source_urls.len(), 1);
     }
 
     #[test]
@@ -13241,144 +12965,6 @@ mod tests {
                 .is_none(),
             "an exact-case capability must not broaden the product into global local reuse"
         );
-    }
-
-    #[tokio::test]
-    async fn fresh_grounded_review_durably_attests_an_existing_historical_product() {
-        let db = AppDb::connect("sqlite::memory:")
-            .await
-            .expect("test database should initialize");
-        seed_garmin_static_source_authority(&db).await;
-        let stored = persist_approved_identity(
-            &db,
-            None,
-            &[],
-            &verified_identity(),
-            &catalog_fingerprint(&[]),
-        )
-        .await
-        .expect("approved product should seed");
-        let DatabaseBackend::Sqlite(pool) = db.backend() else {
-            unreachable!("test uses SQLite")
-        };
-        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
-            .bind(stored.id)
-            .execute(pool)
-            .await
-            .expect("fixture should emulate a pre-policy historical approval");
-
-        assert!(resolve_verified_local_avionics_identity(
-            &db,
-            &local_request("Garmin GTX345R P/N 011-03520-00 installed"),
-        )
-        .await
-        .expect("local resolver should fail closed")
-        .is_none());
-        let mut freshly_grounded = stored.clone();
-        freshly_grounded.evidence_url =
-            "https://static.garmin.com/pumac/current-gtx-345r-manual.pdf".to_string();
-        freshly_grounded.evidence_title = "Current Garmin GTX 345R manual".to_string();
-        freshly_grounded.evidence =
-            "Garmin GTX 345R manufacturer model number GTX 345R.".to_string();
-        assert!(
-            attest_grounded_existing_avionics_identity(&db, &freshly_grounded)
-                .await
-                .expect("fresh grounded conclusion should commit"),
-            "the reviewed exact Garmin origin is eligible for attestation"
-        );
-
-        let refreshed_evidence: (String, String, String, String, String) = sqlx::query_as(
-            r#"
-            SELECT identity_source_url, identity_source_title,
-                   identity_evidence_text, identity_evidence_kind,
-                   identity_confidence
-            FROM avionics_models
-            WHERE id = ?
-            "#,
-        )
-        .bind(stored.id)
-        .fetch_one(pool)
-        .await
-        .expect("refreshed evidence should load");
-        assert_eq!(
-            refreshed_evidence,
-            (
-                freshly_grounded.evidence_url.clone(),
-                freshly_grounded.evidence_title.clone(),
-                freshly_grounded.evidence.clone(),
-                "authoritative_reference".to_string(),
-                "very_high".to_string(),
-            )
-        );
-
-        let persisted: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
-        )
-        .bind(stored.id)
-        .fetch_one(pool)
-        .await
-        .expect("attestation should be durable");
-        assert_eq!(persisted, 1);
-        assert!(
-            resolve_verified_local_avionics_identity(
-                &db,
-                &local_request("Garmin GTX345R P/N 011-03520-00 installed"),
-            )
-            .await
-            .expect("local resolver should load")
-            .is_some(),
-            "the committed current-policy attestation should enable reuse"
-        );
-
-        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
-            .bind(stored.id)
-            .execute(pool)
-            .await
-            .expect("rollback fixture should clear the positive cache");
-        let mut unauthorized_source = freshly_grounded.clone();
-        unauthorized_source.evidence_url =
-            "https://unrelated.example/current-gtx-345r-manual.pdf".to_string();
-        unauthorized_source.evidence = "Unrelated source says GTX 345R.".to_string();
-        assert!(
-            !attest_grounded_existing_avionics_identity(&db, &unauthorized_source)
-                .await
-                .expect("an unauthorized source should fail closed"),
-            "an uncurated origin cannot produce a positive attestation"
-        );
-        let rolled_back_evidence: (String, String, String) = sqlx::query_as(
-            r#"
-            SELECT identity_source_url, identity_source_title, identity_evidence_text
-            FROM avionics_models WHERE id = ?
-            "#,
-        )
-        .bind(stored.id)
-        .fetch_one(pool)
-        .await
-        .expect("catalog evidence should still load");
-        assert_eq!(
-            rolled_back_evidence,
-            (
-                freshly_grounded.evidence_url.clone(),
-                freshly_grounded.evidence_title.clone(),
-                freshly_grounded.evidence.clone(),
-            ),
-            "failed attestation must roll back its tentative evidence refresh"
-        );
-        let mut stale_identity = freshly_grounded.clone();
-        stale_identity.model = "GTX 345R stale rewrite".to_string();
-        assert!(
-            attest_grounded_existing_avionics_identity(&db, &stale_identity)
-                .await
-                .is_err(),
-            "a catalog identity changed during grounding must fail its locked comparison"
-        );
-        let evidence_after_stale: String =
-            sqlx::query_scalar("SELECT identity_evidence_text FROM avionics_models WHERE id = ?")
-                .bind(stored.id)
-                .fetch_one(pool)
-                .await
-                .expect("evidence should remain readable");
-        assert_eq!(evidence_after_stale, freshly_grounded.evidence);
     }
 
     async fn pending_product_guard(

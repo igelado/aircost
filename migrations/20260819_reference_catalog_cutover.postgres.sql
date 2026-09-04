@@ -21,7 +21,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 1
         OR contract_fingerprint IS DISTINCT FROM
-          '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819'
+          '63cae87c0bc5081f0018855535d9a9c7ac9e457f7e8972f6d29ccabdb790b1a7'
       )
   ) THEN
     RAISE EXCEPTION 'reference catalog cutover contract marker mismatch';
@@ -33,7 +33,7 @@ BEGIN
     WHERE migration_name = '20260819_reference_catalog_cutover'
       AND contract_version = 1
       AND contract_fingerprint =
-        '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819'
+        '63cae87c0bc5081f0018855535d9a9c7ac9e457f7e8972f6d29ccabdb790b1a7'
   ) INTO exact_marker;
 
   IF exact_marker THEN
@@ -457,8 +457,8 @@ BEGIN
   FROM pg_temp.reference_catalog_cutover_owned_objects();
 
   IF exact_marker AND (
-    actual_object_count <> 804
-    OR actual_definition_digest <> 'ba236136f4f31173a4a5d71c8d8a5be5'
+    actual_object_count <> 813
+    OR actual_definition_digest <> '2398147ef3fa8ed8e4825690b2c47e60'
   ) THEN
     RAISE EXCEPTION
       'reference catalog cutover marker-present owned-object mismatch (% objects, digest %)',
@@ -1569,8 +1569,8 @@ BEGIN
   INTO actual_object_count, actual_definition_digest
   FROM pg_temp.reference_catalog_cutover_owned_objects();
 
-  IF actual_object_count <> 804
-     OR actual_definition_digest <> 'ba236136f4f31173a4a5d71c8d8a5be5' THEN
+  IF actual_object_count <> 813
+     OR actual_definition_digest <> '2398147ef3fa8ed8e4825690b2c47e60' THEN
     RAISE EXCEPTION
       'reference catalog cutover post-state mismatch (% objects, digest %)',
       actual_object_count, actual_definition_digest;
@@ -1615,7 +1615,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '45c2dc26c19e63af8b865ff6c95f18fa8e746f60e445d2f429e07735e6c2d819', CURRENT_TIMESTAMP
+  '63cae87c0bc5081f0018855535d9a9c7ac9e457f7e8972f6d29ccabdb790b1a7', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 

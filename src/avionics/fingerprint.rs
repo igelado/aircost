@@ -18,9 +18,9 @@ use crate::avionics::reuse::{
 use crate::db::{AppDb, DatabaseBackend};
 use crate::normalize::normalize_avionics_identifier;
 
-const APPROVED_CATALOG_FINGERPRINT_DOMAIN: &[u8] = b"aircost:approved-avionics-catalog:v1";
+const APPROVED_CATALOG_FINGERPRINT_DOMAIN: &[u8] = b"aircost:approved-avionics-catalog:v2";
 const APPROVED_CATALOG_PRODUCT_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:approved-avionics-catalog-product:v1";
+    b"aircost:approved-avionics-catalog-product:v2";
 const ACTIVE_COLLISION_CLOSURE_FINGERPRINT_DOMAIN: &[u8] =
     b"aircost:active-avionics-collision-closure:v1";
 const GROUNDED_COLLISION_CLOSURE_FINGERPRINT_DOMAIN: &[u8] =
@@ -65,6 +65,9 @@ pub(crate) struct CatalogFingerprintRow {
     pub(crate) identity_source_url: Option<String>,
     pub(crate) identity_source_title: Option<String>,
     pub(crate) identity_evidence_text: Option<String>,
+    pub(crate) valuation_scope: String,
+    pub(crate) suite_component_model_id: Option<i64>,
+    pub(crate) suite_component_quantity: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +85,8 @@ pub(crate) struct CatalogFingerprintProduct {
     pub(crate) identity_source_url: String,
     pub(crate) identity_source_title: String,
     pub(crate) identity_evidence_text: String,
+    pub(crate) valuation_scope: String,
+    pub(crate) suite_components: Vec<(i64, i64)>,
 }
 
 /// Every active catalog identity component that can block source-free reuse.
@@ -113,7 +118,10 @@ pub(crate) const APPROVED_CATALOG_ROWS_SQL: &str = r#"
       graph.canonical_identifier_key,
       model.identity_source_url,
       model.identity_source_title,
-      model.identity_evidence_text
+      model.identity_evidence_text,
+      model.valuation_scope,
+      suite_component.component_model_id AS suite_component_model_id,
+      suite_component.quantity AS suite_component_quantity
     FROM avionics_models model
     JOIN avionics_manufacturers manufacturer
       ON manufacturer.id = model.avionics_manufacturer_id
@@ -123,8 +131,11 @@ pub(crate) const APPROVED_CATALOG_ROWS_SQL: &str = r#"
       ON capability.id = membership.avionics_type_id
     JOIN avionics_approved_product_graph_identities graph
       ON graph.avionics_model_id = model.id
+    LEFT JOIN avionics_suite_components suite_component
+      ON suite_component.suite_model_id = model.id
     WHERE model.catalog_status = 'approved'
-    ORDER BY model.id, capability.normalized_name, capability.id
+    ORDER BY model.id, capability.normalized_name, capability.id,
+             suite_component.component_model_id
 "#;
 
 pub(crate) const ACTIVE_COLLISION_CATALOG_ROWS_SQL: &str = r#"
@@ -178,10 +189,34 @@ pub(crate) fn catalog_products(rows: Vec<CatalogFingerprintRow>) -> Vec<CatalogF
                 identity_source_url: row.identity_source_url.unwrap_or_default(),
                 identity_source_title: row.identity_source_title.unwrap_or_default(),
                 identity_evidence_text: row.identity_evidence_text.unwrap_or_default(),
+                valuation_scope: row.valuation_scope.clone(),
+                suite_components: Vec::new(),
             });
-        product.capabilities.push(row.capability);
+        if !product.capabilities.contains(&row.capability) {
+            product.capabilities.push(row.capability);
+        }
+        if let (Some(component_model_id), Some(quantity)) =
+            (row.suite_component_model_id, row.suite_component_quantity)
+        {
+            let component = (component_model_id, quantity);
+            if !product.suite_components.contains(&component) {
+                product.suite_components.push(component);
+            }
+        }
+    }
+    for product in products.values_mut() {
+        product.capabilities.sort();
+        product.suite_components.sort_unstable();
     }
     products.into_values().collect()
+}
+
+fn suite_component_fingerprint_value(components: &[(i64, i64)]) -> String {
+    components
+        .iter()
+        .map(|(component_model_id, quantity)| format!("{component_model_id}:{quantity}"))
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
 }
 
 pub(crate) fn fingerprint_catalog_products(products: &[CatalogFingerprintProduct]) -> String {
@@ -202,6 +237,8 @@ pub(crate) fn fingerprint_catalog_products(products: &[CatalogFingerprintProduct
             product.identity_source_url.clone(),
             product.identity_source_title.clone(),
             product.identity_evidence_text.clone(),
+            product.valuation_scope.clone(),
+            suite_component_fingerprint_value(&product.suite_components),
         ] {
             feed_fingerprint(&mut hasher, &value);
         }
@@ -226,6 +263,8 @@ pub(crate) fn fingerprint_catalog_product(product: &CatalogFingerprintProduct) -
         product.identity_source_url.clone(),
         product.identity_source_title.clone(),
         product.identity_evidence_text.clone(),
+        product.valuation_scope.clone(),
+        suite_component_fingerprint_value(&product.suite_components),
     ] {
         feed_fingerprint(&mut hasher, &value);
     }

@@ -149,7 +149,7 @@
             <strong id="review-reason-count">0</strong>
           </div>
           <div class="metric review-product-only-metric">
-            <span class="metric-label" id="review-attestation-label">Products needing source check</span>
+            <span class="metric-label" id="review-attestation-label">Products needing OEM maintenance</span>
             <strong id="review-attestation-count">0</strong>
           </div>
           <div class="metric review-product-only-metric">
@@ -167,7 +167,7 @@
             <div class="review-toolbar-actions">
               <div class="review-mode-switch" role="group" aria-label="Acceptance and review workflow">
                 <button class="button is-active" id="review-mode-pipeline" type="button" aria-pressed="true">Automatic acceptance</button>
-                <button class="button subtle" id="review-mode-product" type="button" aria-pressed="false">Known avionics products</button>
+                <button class="button subtle" id="review-mode-product" type="button" aria-pressed="false">OEM source automation</button>
                 <button class="button subtle" id="review-mode-listing" type="button" aria-pressed="false">Manual review</button>
               </div>
               <button class="icon-button" id="refresh-reviews" type="button" aria-label="Refresh review queue" title="Refresh review queue">
@@ -289,7 +289,7 @@
                   <tr>
                     <th>Product</th>
                     <th>Catalog identity</th>
-                    <th>Reusable source</th>
+                    <th>OEM automation source</th>
                     <th>Pending</th>
                     <th><span class="sr-only">Actions</span></th>
                   </tr>
@@ -301,20 +301,27 @@
             <section class="review-product-workspace is-hidden" id="review-product-workspace" aria-labelledby="review-product-title" tabindex="-1">
               <header class="review-product-heading">
                 <div>
-                  <span class="review-eyebrow">Known avionics product</span>
-                  <h3 id="review-product-title">Product source review</h3>
+                  <span class="review-eyebrow">Automated association maintenance</span>
+                  <h3 id="review-product-title">OEM source maintenance</h3>
                   <p id="review-product-summary"></p>
                 </div>
-                <span class="status-pill" id="review-product-status">Checking reusable source…</span>
+                <span class="status-pill" id="review-product-status">Checking OEM automation source…</span>
               </header>
               <div class="review-product-breakdown" aria-label="Selected product association summary">
                 <div><span>Total pending</span><strong id="review-product-total-count">0</strong></div>
                 <div><span>Ready locally</span><strong id="review-product-ready-count">0</strong></div>
                 <div><span>Needs source recovery</span><strong id="review-product-recovery-count">0</strong></div>
-                <div><span>Ready after source check</span><strong id="review-product-attestation-count">0</strong></div>
+                <div><span>Ready after OEM check</span><strong id="review-product-attestation-count">0</strong></div>
                 <div><span>Manual or ambiguous</span><strong id="review-product-manual-count">0</strong></div>
               </div>
+              <section class="review-product-structure-maintenance" aria-labelledby="review-product-structure-title">
+                <h4 id="review-product-structure-title">Human catalog structure</h4>
+                <p>Correct whether this approved product is one unit or an integrated suite. This is a source-free human catalog decision, separate from both OEM automation and approval of any listing association.</p>
+                <div id="review-product-structure-editor"></div>
+                <p id="review-product-structure-message" role="status" aria-live="polite"></p>
+              </section>
               <form id="review-product-attestation-form">
+                <p class="review-product-automation-note">This OEM dossier supports automated bulk validation only. It is not a prerequisite for a reviewer to approve an individual listing association.</p>
                 <div class="form-grid review-product-dossier">
                   <label>OEM source URL
                     <input name="identity_source_url" type="url" required placeholder="https://manufacturer.example/product">
@@ -328,11 +335,11 @@
                     <span class="field-hint" id="review-product-evidence-count">0 / 128</span>
                   </label>
                 </div>
-                <button class="button primary" id="review-product-attest" type="submit">Verify reusable product source</button>
+                <button class="button primary" id="review-product-attest" type="submit">Verify OEM source for automation</button>
               </form>
               <div class="review-product-actions">
                 <button class="button" id="review-product-recover" type="button">Recover listing source text</button>
-                <button class="button primary" id="review-product-validate" type="button">Apply to eligible unique occurrences</button>
+                <button class="button primary" id="review-product-validate" type="button">Automatically apply to eligible unique occurrences</button>
                 <span id="review-product-action-message" role="status" aria-live="polite"></span>
               </div>
               <div class="table-shell">
