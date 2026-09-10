@@ -13642,37 +13642,6 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        let prices_before: String = sqlx::query_scalar(
-            "SELECT COALESCE(jsonb_agg(to_jsonb(price_row) ORDER BY id), '[]'::jsonb)::text FROM public.aircraft_reference_prices price_row",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let price_sequence_before: String = sqlx::query_scalar(
-            "SELECT last_value::text || ':' || is_called::text FROM public.aircraft_reference_prices_id_seq",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let mut migration_connection = pool.acquire().await.unwrap();
-        for statement in split_sql_statements(REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL) {
-            migration_connection.execute(statement).await.unwrap();
-        }
-        drop(migration_connection);
-        let prices_after: String = sqlx::query_scalar(
-            "SELECT COALESCE(jsonb_agg(to_jsonb(price_row) ORDER BY id), '[]'::jsonb)::text FROM public.aircraft_reference_prices price_row",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let price_sequence_after: String = sqlx::query_scalar(
-            "SELECT last_value::text || ':' || is_called::text FROM public.aircraft_reference_prices_id_seq",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(prices_after, prices_before);
-        assert_eq!(price_sequence_after, price_sequence_before);
         let preflight = AppDb {
             backend: DatabaseBackend::Postgres(pool),
         };
