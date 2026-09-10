@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 const indexHtml = readFileSync(new URL("../index.html", import.meta.url), "utf8");
@@ -11,8 +13,6 @@ const reviewJs = readFileSync(new URL("../review.js", import.meta.url), "utf8");
 const chromiumPath = [
   process.env.AIRCOST_TEST_CHROMIUM_PATH,
   "/snap/bin/chromium",
-  "/usr/bin/chromium",
-  "/usr/bin/chromium-browser",
 ].find((path) => path && existsSync(path));
 
 test("keeps listing form reset explicit without creating a duplicate route entry", () => {
@@ -572,16 +572,30 @@ test("reopens rebuilt avionics details before restoring native Chromium focus", 
         );
       <\/script>
     </body>`;
-  const result = spawnSync(chromiumPath, [
-    "--headless=new",
-    "--no-sandbox",
-    "--disable-gpu",
-    "--dump-dom",
-    `data:text/html;charset=utf-8,${encodeURIComponent(html)}`,
-  ], { encoding: "utf8", timeout: 20_000 });
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /data-focus="new-capability"/);
-  assert.match(result.stdout, /data-open="true"/);
+  const profileDirectory = mkdtempSync(join(tmpdir(), "aircost-chromium-"));
+  try {
+    const result = spawnSync(chromiumPath, [
+      "--headless=new",
+      `--user-data-dir=${profileDirectory}`,
+      "--disable-background-networking",
+      "--disable-breakpad",
+      "--disable-component-update",
+      "--disable-crash-reporter",
+      "--disable-default-apps",
+      "--disable-extensions",
+      "--disable-gpu",
+      "--disable-sync",
+      "--no-default-browser-check",
+      "--no-first-run",
+      "--dump-dom",
+      `data:text/html;charset=utf-8,${encodeURIComponent(html)}`,
+    ], { encoding: "utf8", timeout: 20_000 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /data-focus="new-capability"/);
+    assert.match(result.stdout, /data-open="true"/);
+  } finally {
+    rmSync(profileDirectory, { recursive: true, force: true });
+  }
 });
 
 test("all listing editors retain the global in-flight Save lock", () => {
