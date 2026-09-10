@@ -8,6 +8,12 @@ const appCss = readFileSync(new URL("../app.css", import.meta.url), "utf8");
 const appJs = readFileSync(new URL("../app.js", import.meta.url), "utf8");
 const avionicsJs = readFileSync(new URL("../avionics.js", import.meta.url), "utf8");
 const reviewJs = readFileSync(new URL("../review.js", import.meta.url), "utf8");
+const chromiumPath = [
+  process.env.AIRCOST_TEST_CHROMIUM_PATH,
+  "/snap/bin/chromium",
+  "/usr/bin/chromium",
+  "/usr/bin/chromium-browser",
+].find((path) => path && existsSync(path));
 
 test("keeps listing form reset explicit without creating a duplicate route entry", () => {
   assert.match(
@@ -522,19 +528,8 @@ test("restores dynamic avionics focus after a clean background rebind", () => {
 });
 
 test("reopens rebuilt avionics details before restoring native Chromium focus", {
-  skip: ![
-    "/snap/bin/chromium",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-  ].some((path) => existsSync(path)),
+  skip: chromiumPath === undefined,
 }, () => {
-  const chromium = [
-    "/snap/bin/chromium",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-  ].find((path) => existsSync(path));
   const start = appJs.indexOf("function captureListingEditorFocus");
   const end = appJs.indexOf("\nfunction editListing", start);
   assert.ok(start >= 0 && end > start);
@@ -577,7 +572,7 @@ test("reopens rebuilt avionics details before restoring native Chromium focus", 
         );
       <\/script>
     </body>`;
-  const result = spawnSync(chromium, [
+  const result = spawnSync(chromiumPath, [
     "--headless=new",
     "--no-sandbox",
     "--disable-gpu",
