@@ -4,6 +4,7 @@ import {
   createHistoryRouter,
   destinationForRoute,
   parseRoute,
+  preserveLiveRouteInput,
   routeActivationIsCurrent,
 } from "/routing.mjs";
 
@@ -70,6 +71,7 @@ document.addEventListener("DOMContentLoaded", () => {
     refreshListings: loadListings,
     refreshReview: () => reviewWorkspace.refresh(),
     navigate: navigateRoute,
+    preserveLiveRouteInput,
     routeActivationIsCurrent,
   });
   reviewWorkspace = initializeReviewWorkspace({
@@ -284,7 +286,7 @@ function bindEvents() {
   });
 }
 
-function applyAppRoute(route) {
+function applyAppRoute(route, context = {}) {
   const destination = destinationForRoute(route);
   if (route.name !== "listings") {
     closeListingDialog({ navigate: false });
@@ -311,11 +313,11 @@ function applyAppRoute(route) {
   elements.viewSubtitle.textContent = destination.subtitle;
   document.title = destination.documentTitle;
   if (route.name === "catalog") {
-    return avionicsInspector.activate(route);
+    return avionicsInspector.activate(route, context);
   } else if (route.name === "review") {
-    return reviewWorkspace.activate(route);
+    return reviewWorkspace.activate(route, context);
   } else if (route.name === "listings") {
-    return applyListingsRoute(route);
+    return applyListingsRoute(route, context);
   } else if (route.name === "values") {
     return applyValuesRoute(route);
   }
@@ -325,8 +327,8 @@ function navigateRoute(route, { replace = false } = {}) {
   return appRouter.navigate(route, { replace });
 }
 
-function applyListingsRoute(route) {
-  applyListingFilterControls(route.filters);
+function applyListingsRoute(route, context = {}) {
+  applyListingFilterControls(route.filters, context);
   renderListings();
   if (route.selected === "new") {
     if (state.editingListingId !== null || !elements.listingDialog.open) {
@@ -352,8 +354,13 @@ function applyListingsRoute(route) {
   }
 }
 
-function applyListingFilterControls(filters = {}) {
-  elements.listingSearch.value = filters.search || "";
+function applyListingFilterControls(filters = {}, { source } = {}) {
+  if (!preserveLiveRouteInput(
+    source,
+    document.activeElement === elements.listingSearch,
+  )) {
+    elements.listingSearch.value = filters.search || "";
+  }
   elements.yearMinFilter.value = filters.yearMin ?? "";
   elements.yearMaxFilter.value = filters.yearMax ?? "";
   elements.priceMinFilter.value = filters.priceMin ?? "";

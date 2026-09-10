@@ -9,6 +9,7 @@ let setButtonBusy;
 let refreshListings;
 let refreshReview;
 let navigate;
+let preserveLiveRouteInput;
 let routeActivationIsCurrent;
 
 const state = {
@@ -47,6 +48,7 @@ export function initializeAvionicsInspector(shared) {
     refreshListings,
     refreshReview,
     navigate,
+    preserveLiveRouteInput,
     routeActivationIsCurrent,
   } = shared);
   collectElements();
@@ -54,8 +56,8 @@ export function initializeAvionicsInspector(shared) {
   initialized = true;
 
   return Object.freeze({
-    activate(route) {
-      return applyCatalogRoute(route);
+    activate(route, context) {
+      return applyCatalogRoute(route, context);
     },
     deactivate() {
       state.route = { ...state.route };
@@ -72,11 +74,16 @@ export function initializeAvionicsInspector(shared) {
   });
 }
 
-async function applyCatalogRoute(route) {
+async function applyCatalogRoute(route, { source } = {}) {
   state.route = route;
   cancelAvionicsSearch();
   const filters = route.filters || {};
-  elements.avionicsSearch.value = filters.search || "";
+  if (!preserveLiveRouteInput(
+    source,
+    document.activeElement === elements.avionicsSearch,
+  )) {
+    elements.avionicsSearch.value = filters.search || "";
+  }
   elements.avionicsCompletenessFilter.value = filters.completeness || "";
   if (!state.avionicsOptionsLoaded) {
     await loadAvionicsOptions();

@@ -39,6 +39,34 @@ test("uses one application history owner for task and review routing", () => {
   assert.doesNotMatch(reviewJs, /window\.(?:history|location)|popstate|FromLocation/);
 });
 
+test("keeps live search text only for focused replace activations", () => {
+  assert.match(appJs, /function applyAppRoute\(route, context = \{\}\)/);
+  assert.match(
+    appJs,
+    /preserveLiveRouteInput\(\s*source,\s*document\.activeElement === elements\.listingSearch,/,
+  );
+  assert.match(
+    reviewJs,
+    /preserveLiveRouteInput\(\s*source,\s*document\.activeElement === elements\.reviewPipelineSearch,/,
+  );
+  assert.match(
+    avionicsJs,
+    /preserveLiveRouteInput\(\s*source,\s*document\.activeElement === elements\.avionicsSearch,/,
+  );
+});
+
+test("falls back from absent product detail only through its route owner", () => {
+  assert.match(
+    reviewJs,
+    /const result = await openProductReview\(route\.productId\);\s*await replaceAbsentProductRoute\(result, route\);/,
+  );
+  assert.match(reviewJs, /routeOwner: state\.route/);
+  assert.match(
+    reviewJs,
+    /if \(finishProductAction\(action\)\) \{\s*await replaceAbsentProductRoute\(detailResult, action\.routeOwner\);/,
+  );
+});
+
 test("guards review mutations and stale asynchronous completion at the route boundary", () => {
   assert.match(
     reviewJs,
@@ -88,7 +116,7 @@ test("drops stale listing, product-review, and catalog activation continuations"
   );
   assert.match(
     reviewJs,
-    /Promise\.resolve\(queueLoad\)\.then\(\(loaded\) => \(\s*loaded\s*&& routeActivationIsCurrent\(route, state\.route\)/,
+    /Promise\.resolve\(queueLoad\)\.then\(async \(loaded\) => \{\s*if \(!loaded \|\| !routeActivationIsCurrent\(route, state\.route\)\)/,
   );
   assert.match(
     avionicsJs,

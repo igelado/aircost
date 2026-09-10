@@ -54,11 +54,13 @@ import {
   validateAvionicsObservationCorrection,
 } from "/review/domain.mjs";
 import {
+  preserveLiveRouteInput,
   reviewAreaForRoute,
   reviewListingIdForRoute,
   reviewListingRouteOwner,
   reviewListingRouteOwnerIsCurrent,
   reviewMutationInProgress,
+  reviewProductFallbackForResult,
   routeActivationIsCurrent,
 } from "/routing.mjs";
 
@@ -157,8 +159,8 @@ export function initializeReviewWorkspace(shared) {
   initialized = true;
 
   return Object.freeze({
-    activate(route) {
-      return activateReviewRoute(route);
+    activate(route, context) {
+      return activateReviewRoute(route, context);
     },
     deactivate() {
       state.routeGeneration += 1;
@@ -194,7 +196,7 @@ export function initializeReviewWorkspace(shared) {
   });
 }
 
-function activateReviewRoute(route) {
+function activateReviewRoute(route, { source } = {}) {
   state.routeGeneration += 1;
   state.route = route;
   if (route.view !== "products") {
@@ -223,12 +225,14 @@ function activateReviewRoute(route) {
       ? Promise.resolve(true)
       : loadProductQueue();
     const detailLoad = route.productId
-      ? Promise.resolve(queueLoad).then((loaded) => (
-        loaded
-        && routeActivationIsCurrent(route, state.route)
-          ? openProductReview(route.productId)
-          : { status: "superseded" }
-      ))
+      ? Promise.resolve(queueLoad).then(async (loaded) => {
+        if (!loaded || !routeActivationIsCurrent(route, state.route)) {
+          return { status: "superseded" };
+        }
+        const result = await openProductReview(route.productId);
+        await replaceAbsentProductRoute(result, route);
+        return result;
+      })
       : Promise.resolve(closeProductReview());
     return Promise.allSettled([queueLoad, detailLoad]);
   }
@@ -240,7 +244,12 @@ function activateReviewRoute(route) {
 
   state.pipelineSearch = route.search || "";
   state.pipelineFilter = route.filter || "all";
-  elements.reviewPipelineSearch.value = state.pipelineSearch;
+  if (!preserveLiveRouteInput(
+    source,
+    document.activeElement === elements.reviewPipelineSearch,
+  )) {
+    elements.reviewPipelineSearch.value = state.pipelineSearch;
+  }
   elements.reviewPipelineFilter.value = state.pipelineFilter;
   setQueueMode("pipeline", { load: false });
   if (state.pipelineLoaded) {
@@ -1657,6 +1666,19 @@ async function openProductReview(productId) {
   }
 }
 
+async function replaceAbsentProductRoute(result, routeOwner) {
+  const fallback = reviewProductFallbackForResult(
+    result,
+    routeOwner,
+    state.route,
+  );
+  if (fallback === null) {
+    return false;
+  }
+  await navigate(fallback, { replace: true });
+  return true;
+}
+
 function closeProductReview() {
   if (state.productStructureSearchTimer !== null) {
     window.clearTimeout(state.productStructureSearchTimer);
@@ -2150,6 +2172,7 @@ async function attestSelectedProduct(event) {
     return;
   }
   const action = beginProductAction(selected);
+  let detailResult = null;
   elements.reviewProductActionMessage.textContent =
     "Fetching the OEM source and checking the immutable product identity…";
   try {
@@ -2182,7 +2205,7 @@ async function attestSelectedProduct(event) {
     if (!productActionContextIsCurrent(action, state)) {
       return;
     }
-    await openProductReview(action.productId);
+    detailResult = await openProductReview(action.productId);
   } catch (error) {
     if (!productActionContextIsCurrent(action, state)) {
       return;
@@ -2191,7 +2214,9 @@ async function attestSelectedProduct(event) {
     elements.reviewProductActionMessage.textContent =
       `${outcome.label}: ${outcome.detail}`;
   } finally {
-    finishProductAction(action);
+    if (finishProductAction(action)) {
+      await replaceAbsentProductRoute(detailResult, action.routeOwner);
+    }
   }
 }
 
@@ -2212,6 +2237,7 @@ async function validateSelectedProductAssociations() {
     return;
   }
   const action = beginProductAction(selected);
+  let detailResult = null;
   elements.reviewProductActionMessage.textContent =
     `Validating ${initialAssociations.length} associations locally…`;
   try {
@@ -2335,9 +2361,11 @@ async function validateSelectedProductAssociations() {
     if (!productActionContextIsCurrent(action, state)) {
       return;
     }
-    await openProductReview(action.productId);
+    detailResult = await openProductReview(action.productId);
   } finally {
-    finishProductAction(action);
+    if (finishProductAction(action)) {
+      await replaceAbsentProductRoute(detailResult, action.routeOwner);
+    }
   }
 }
 
@@ -2361,6 +2389,7 @@ async function recoverSelectedProductEvidence() {
     selected.attestationStatus,
   );
   const action = beginProductAction(selected);
+  let detailResult = null;
   elements.reviewProductActionMessage.textContent =
     `Recovering exact source text from ${listingCount} `
       + `${pluralize(listingCount, "listing")}…`;
@@ -2384,7 +2413,7 @@ async function recoverSelectedProductEvidence() {
     if (!productActionContextIsCurrent(action, state)) {
       return;
     }
-    const detailResult = await openProductReview(action.productId);
+    detailResult = await openProductReview(action.productId);
     if (detailResult.status !== "loaded" || state.selectedProduct?.id !== action.productId) {
       return;
     }
@@ -2401,7 +2430,9 @@ async function recoverSelectedProductEvidence() {
       failed ? `${failed} ${pluralize(failed, "listing")} could not be refreshed` : null,
     ].filter(nonBlank).join(" · ");
   } finally {
-    finishProductAction(action);
+    if (finishProductAction(action)) {
+      await replaceAbsentProductRoute(detailResult, action.routeOwner);
+    }
   }
 }
 
@@ -2410,6 +2441,7 @@ function beginProductAction(selected) {
     productId: selected.id,
     detailSequence: state.productDetailRequestSequence,
     actionSequence: state.productActionSequence + 1,
+    routeOwner: state.route,
   };
   state.productActionSequence = action.actionSequence;
   state.productBusyProductId = action.productId;
@@ -2422,10 +2454,11 @@ function finishProductAction(action) {
     state.productActionSequence !== action.actionSequence
     || state.productBusyProductId !== action.productId
   ) {
-    return;
+    return false;
   }
   state.productBusyProductId = null;
   setProductBusy(false);
+  return true;
 }
 
 function setProductBusy(busy) {

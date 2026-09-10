@@ -6,11 +6,13 @@ import {
   createHistoryRouter,
   formatRoute,
   parseRoute,
+  preserveLiveRouteInput,
   reviewAreaForRoute,
   reviewListingIdForRoute,
   reviewListingRouteOwner,
   reviewListingRouteOwnerIsCurrent,
   reviewMutationInProgress,
+  reviewProductFallbackForResult,
   routeActivationIsCurrent,
 } from "../routing.mjs";
 
@@ -186,6 +188,97 @@ test("reconciles shared cache before dropping a stale route continuation", async
   assert.equal(cacheReconciled, true);
   assert.equal(committed, false);
   assert.equal(routeActivationIsCurrent(currentRoute, currentRoute), true);
+});
+
+test("preserves focused raw input only for its replace activation", () => {
+  assert.equal(preserveLiveRouteInput("replace", true), true);
+  assert.equal(preserveLiveRouteInput("replace", false), false);
+  for (const source of ["startup", "push", "popstate", undefined]) {
+    assert.equal(
+      preserveLiveRouteInput(source, true),
+      false,
+      `${source || "missing"} activation remains route-authoritative`,
+    );
+  }
+});
+
+test("keeps raw input through replace but restores route text through browser history", () => {
+  const listeners = new Map();
+  const location = fakeLocation();
+  setLocation(location, "/#/catalog?search=Garmin");
+  const input = { focused: true, value: "" };
+  const history = {
+    pushState(_state, _title, url) {
+      setLocation(location, url);
+    },
+    replaceState(_state, _title, url) {
+      setLocation(location, url);
+    },
+  };
+  const router = createHistoryRouter({
+    location,
+    history,
+    listen: (name, listener) => listeners.set(name, listener),
+    apply: (route, { source }) => {
+      if (!preserveLiveRouteInput(source, input.focused)) {
+        input.value = route.filters.search;
+      }
+    },
+  });
+
+  router.start();
+  assert.equal(input.value, "Garmin");
+  input.value = "GNS ";
+  router.navigate({ name: "catalog", filters: { search: input.value } }, { replace: true });
+  assert.equal(location.hash, "#/catalog?search=GNS");
+  assert.equal(input.value, "GNS ", "the active keystroke keeps its trailing space");
+
+  setLocation(location, "/#/catalog?search=King");
+  listeners.get("popstate")();
+  assert.equal(input.value, "King", "history restores its route even while input stays focused");
+});
+
+test("replaces an absent product detail only while its exact route owns activation", async () => {
+  const owner = parseRoute("/#/review/products/28");
+  assert.deepEqual(
+    reviewProductFallbackForResult({ status: "absent" }, owner, owner),
+    { name: "review", view: "products" },
+  );
+  assert.equal(
+    reviewProductFallbackForResult({ status: "loaded" }, owner, owner),
+    null,
+  );
+  assert.equal(
+    reviewProductFallbackForResult(
+      { status: "absent" },
+      owner,
+      parseRoute("/#/review/products/29"),
+    ),
+    null,
+    "a late 404 cannot replace a newer product route",
+  );
+  assert.equal(
+    reviewProductFallbackForResult(
+      { status: "absent" },
+      owner,
+      parseRoute("/#/review/products/28"),
+    ),
+    null,
+    "equal route values do not substitute for the initiating activation object",
+  );
+  let release;
+  let current = owner;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  }).then((result) => reviewProductFallbackForResult(result, owner, current));
+  current = parseRoute("/#/review/products/29");
+  release({ status: "absent" });
+  assert.equal(await pending, null, "a deferred 404 cannot replace the newer route");
+  const collection = parseRoute("/#/review/products");
+  assert.equal(
+    reviewProductFallbackForResult({ status: "absent" }, collection, collection),
+    null,
+  );
 });
 
 test("restores complete route snapshots through Back and Forward without recursive writes", () => {

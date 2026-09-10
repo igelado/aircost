@@ -221,6 +221,22 @@ export function routeActivationIsCurrent(owner, current) {
   return owner === current;
 }
 
+export function preserveLiveRouteInput(source, focused) {
+  return source === "replace" && focused;
+}
+
+export function reviewProductFallbackForResult(result, owner, current) {
+  if (result?.status !== "absent" || !routeActivationIsCurrent(owner, current)) {
+    return null;
+  }
+  const route = normalizeRoute(current);
+  return route.name === "review"
+      && route.view === "products"
+      && route.productId !== undefined
+    ? { name: "review", view: "products" }
+    : null;
+}
+
 export function reviewListingRouteOwner(route, generation) {
   const listingId = reviewListingIdForRoute(route);
   return listingId === null ? null : { generation, listingId };
