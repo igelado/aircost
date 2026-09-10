@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+mode="${1:-verify}"
 
 postgres_contract_tests=(
   diagnostic_postgres_connections_default_to_read_only
@@ -56,6 +57,14 @@ require_command cargo
 require_command diff
 require_command rg
 
+case "$mode" in
+  verify | run-postgres) ;;
+  *)
+    printf 'usage: bash tests/schema/rust_test_inventory.sh [verify|run-postgres]\n' >&2
+    exit 2
+    ;;
+esac
+
 list_ignored_tests() {
   local filter="${1:-}"
   if [[ -n "$filter" ]]; then
@@ -83,11 +92,25 @@ manual_tests="$(printf '%s\n' "$ignored_tests" \
   | rg -v 'postgres' \
   | sed 's/.*:://' \
   | LC_ALL=C sort)"
-selected_postgres_tests="$({
+selected_postgres_qualified_tests="$({
   cd "$repository_root"
   list_ignored_tests postgres
-} | sed -n 's/: test$//p' \
+} | sed -n 's/: test$//p' | LC_ALL=C sort -u)"
+selected_postgres_tests="$(printf '%s\n' "$selected_postgres_qualified_tests" \
   | sed 's/.*:://' \
+  | LC_ALL=C sort)"
+selected_postgres_lib_tests="$({
+  cd "$repository_root"
+  cargo test --locked --lib postgres -- --ignored --list
+} | sed -n 's/: test$//p' | LC_ALL=C sort -u)"
+selected_postgres_admin_tests="$({
+  cd "$repository_root"
+  cargo test --locked --bin aircost-admin postgres -- --ignored --list
+} | sed -n 's/: test$//p' | LC_ALL=C sort -u)"
+targeted_postgres_tests="$(printf '%s\n%s\n' \
+  "$selected_postgres_lib_tests" \
+  "$selected_postgres_admin_tests" \
+  | sed '/^$/d' \
   | LC_ALL=C sort -u)"
 expected_postgres_tests="$(printf '%s\n' "${postgres_contract_tests[@]}" | LC_ALL=C sort)"
 expected_manual_tests="$(printf '%s\n' "${manual_fixture_tests[@]}" | LC_ALL=C sort)"
@@ -113,6 +136,13 @@ if ! diff -u \
   exit 1
 fi
 
+if ! diff -u \
+    <(printf '%s\n' "$selected_postgres_qualified_tests") \
+    <(printf '%s\n' "$targeted_postgres_tests"); then
+  echo 'ignored PostgreSQL tests must belong to the library or aircost-admin target' >&2
+  exit 1
+fi
+
 postgres_test_count="${#postgres_contract_tests[@]}"
 if [[ "$postgres_test_count" -ne 32 ]]; then
   printf 'expected the registered PostgreSQL inventory to contain 32 tests, found %d\n' \
@@ -123,3 +153,63 @@ fi
 printf 'Ignored Rust test inventory: %d PostgreSQL, %d manual fixture\n' \
   "$postgres_test_count" \
   "$(printf '%s\n' "$manual_tests" | wc -l)"
+
+if [[ "$mode" == verify ]]; then
+  exit 0
+fi
+
+require_command psql
+: "${AIRCOST_TEST_POSTGRES_URL:?AIRCOST_TEST_POSTGRES_URL is required}"
+: "${AIRCOST_TEST_POSTGRES_ADMIN_URL:?AIRCOST_TEST_POSTGRES_ADMIN_URL is required}"
+: "${AIRCOST_TEST_POSTGRES_DATABASE:?AIRCOST_TEST_POSTGRES_DATABASE is required}"
+
+if [[ ! "$AIRCOST_TEST_POSTGRES_DATABASE" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+  printf 'invalid PostgreSQL test database name: %s\n' \
+    "$AIRCOST_TEST_POSTGRES_DATABASE" >&2
+  exit 1
+fi
+
+reset_postgres_database() {
+  psql "$AIRCOST_TEST_POSTGRES_ADMIN_URL" \
+    --no-psqlrc \
+    --set=ON_ERROR_STOP=1 \
+    --set=database_name="$AIRCOST_TEST_POSTGRES_DATABASE" <<'SQL'
+DROP DATABASE IF EXISTS :"database_name" WITH (FORCE);
+CREATE DATABASE :"database_name";
+SQL
+}
+
+run_postgres_contracts() {
+  local target="$1"
+  local test_names="$2"
+  local test_name
+
+  while IFS= read -r test_name; do
+    [[ -n "$test_name" ]] || continue
+    printf 'Running isolated PostgreSQL Rust contract (%s): %s\n' \
+      "$target" "$test_name"
+    reset_postgres_database
+
+    if [[ "$target" == aircost-admin ]]; then
+      psql "$AIRCOST_TEST_POSTGRES_URL" \
+        --no-psqlrc \
+        --set=ON_ERROR_STOP=1 \
+        --file="$repository_root/schema/postgres.sql" \
+        >/dev/null
+    fi
+
+    (
+      cd "$repository_root"
+      if [[ "$target" == lib ]]; then
+        cargo test --locked --lib "$test_name" -- \
+          --ignored --exact --nocapture --test-threads=1
+      else
+        cargo test --locked --bin aircost-admin "$test_name" -- \
+          --ignored --exact --nocapture --test-threads=1
+      fi
+    )
+  done <<< "$test_names"
+}
+
+run_postgres_contracts lib "$selected_postgres_lib_tests"
+run_postgres_contracts aircost-admin "$selected_postgres_admin_tests"
