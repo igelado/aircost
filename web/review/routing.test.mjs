@@ -163,15 +163,17 @@ test("invalidates asynchronous review completion when route ownership changes", 
   assert.equal(reviewListingRouteOwner(parseRoute("/#/review/manual"), 8), null);
 });
 
-test("drops a deferred continuation after a newer route activation", async () => {
+test("reconciles shared cache before dropping a stale route continuation", async () => {
   const firstRoute = parseRoute("/#/review/products/28");
   let currentRoute = firstRoute;
   let release;
   const pending = new Promise((resolve) => {
     release = resolve;
   });
+  let cacheReconciled = false;
   let committed = false;
   const continuation = pending.then(() => {
+    cacheReconciled = true;
     if (routeActivationIsCurrent(firstRoute, currentRoute)) {
       committed = true;
     }
@@ -181,6 +183,7 @@ test("drops a deferred continuation after a newer route activation", async () =>
   release();
   await continuation;
 
+  assert.equal(cacheReconciled, true);
   assert.equal(committed, false);
   assert.equal(routeActivationIsCurrent(currentRoute, currentRoute), true);
 });

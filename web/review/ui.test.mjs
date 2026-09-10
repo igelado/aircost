@@ -80,7 +80,11 @@ test("drops stale listing, product-review, and catalog activation continuations"
   );
   assert.match(
     appJs,
-    /await refreshAircraftAfterEstimateResponse\(response\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*navigateRoute\(/,
+    /const response = await api\([\s\S]*?state\.listings = reconcileSavedListingCache\(state\.listings, response\?\.listing\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await loadListings\(\);[\s\S]*?navigateRoute\(/,
+  );
+  assert.match(
+    appJs,
+    /await api\(`\/api\/listings\/\$\{listing\.id\}`[\s\S]*?state\.listings = reconcileDeletedListingCache\(state\.listings, listing\.id\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await loadListings\(\);[\s\S]*?navigateRoute\(/,
   );
   assert.match(
     reviewJs,
@@ -89,6 +93,46 @@ test("drops stale listing, product-review, and catalog activation continuations"
   assert.match(
     avionicsJs,
     /await loadAvionicsOptions\(\);\s*\}\s*if \(!routeActivationIsCurrent\(route, state\.route\)\) \{\s*return;/,
+  );
+});
+
+test("reconciles stale listing saves and deletes without changing load semantics", () => {
+  const start = appJs.indexOf("function reconcileSavedListingCache");
+  const end = appJs.indexOf("\nasync function refreshAircraftAfterEstimateResponse", start);
+  assert.ok(start >= 0 && end > start);
+  const helpers = Function(
+    `${appJs.slice(start, end)}\nreturn { reconcileSavedListingCache, reconcileDeletedListingCache };`,
+  )();
+  const original = [
+    { id: 2, label: "existing two" },
+    { id: 1, label: "old one" },
+  ];
+
+  const updated = helpers.reconcileSavedListingCache(
+    original,
+    { id: 1, label: "fresh one" },
+  );
+  assert.deepEqual(updated, [
+    { id: 2, label: "existing two" },
+    { id: 1, label: "fresh one" },
+  ]);
+  assert.deepEqual(original, [
+    { id: 2, label: "existing two" },
+    { id: 1, label: "old one" },
+  ]);
+
+  const created = helpers.reconcileSavedListingCache(
+    updated,
+    { id: 3, label: "created three" },
+  );
+  assert.deepEqual(created.map((listing) => listing.id), [3, 2, 1]);
+  assert.deepEqual(
+    helpers.reconcileDeletedListingCache(created, 2).map((listing) => listing.id),
+    [3, 1],
+  );
+  assert.doesNotMatch(
+    appJs.slice(start, end),
+    /listingsLoaded|renderListings|navigateRoute/,
   );
 });
 

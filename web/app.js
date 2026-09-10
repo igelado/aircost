@@ -1284,13 +1284,11 @@ async function saveListing(event) {
       method,
       body: JSON.stringify({ listing }),
     });
+    state.listings = reconcileSavedListingCache(state.listings, response?.listing);
     if (!ownsRoute()) {
       return;
     }
     await loadListings();
-    if (!ownsRoute()) {
-      return;
-    }
     await refreshAircraftAfterEstimateResponse(response);
     if (!ownsRoute()) {
       return;
@@ -1334,13 +1332,11 @@ async function deleteListing(listing) {
   const ownsRoute = () => routeActivationIsCurrent(routeOwner, appRouter.current());
   try {
     await api(`/api/listings/${listing.id}`, { method: "DELETE" });
+    state.listings = reconcileDeletedListingCache(state.listings, listing.id);
     if (!ownsRoute()) {
       return;
     }
     await loadListings();
-    if (!ownsRoute()) {
-      return;
-    }
     await loadAircraftOptions();
     if (!ownsRoute()) {
       return;
@@ -1359,6 +1355,22 @@ async function deleteListing(listing) {
       }
     }
   }
+}
+
+function reconcileSavedListingCache(listings, listing) {
+  const listingId = Number(listing?.id);
+  if (!Number.isSafeInteger(listingId) || listingId <= 0) {
+    return listings.slice();
+  }
+  const existingIndex = listings.findIndex((item) => Number(item?.id) === listingId);
+  const reconciled = listings.filter((item) => Number(item?.id) !== listingId);
+  reconciled.splice(existingIndex < 0 ? 0 : existingIndex, 0, listing);
+  return reconciled;
+}
+
+function reconcileDeletedListingCache(listings, listingId) {
+  const deletedId = Number(listingId);
+  return listings.filter((item) => Number(item?.id) !== deletedId);
 }
 
 async function refreshAircraftAfterEstimateResponse(response) {
