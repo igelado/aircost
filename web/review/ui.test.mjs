@@ -162,7 +162,7 @@ test("hands catalog deletion cleanup to the exact operation owner", () => {
 test("preserves focused listing search text during its own asynchronous refresh", () => {
   assert.match(
     appJs,
-    /const routeOwner = appRouter\.current\(\);[\s\S]*?const route = appRouter\.current\(\);\s*if \(route\?\.name === "listings"\) \{\s*const context = routeActivationIsCurrent\(routeOwner, route\)\s*\? \{ source: "refresh" \}/,
+    /const route = appRouter\.current\(\);\s*if \(route\?\.name === "listings"\) \{\s*applyListingsRoute\(route, \{ source: "refresh" \}\);/,
   );
 });
 
@@ -180,6 +180,137 @@ test("reloads the manual review collection on every route re-entry", () => {
     reviewJs,
     /if \(route\.view === "manual"\) \{\s*setQueueMode\("listing", \{ load: false \}\);\s*const queueLoad = loadQueue\(\{\s*commitGuard: \(\) => routeActivationIsCurrent\(route, state\.route\),/,
   );
+});
+
+test("reloads the pipeline collection under exact route ownership", () => {
+  assert.match(
+    reviewJs,
+    /const pipelineLoad = loadPipelineQueue\(\{\s*commitGuard: \(\) => routeActivationIsCurrent\(route, state\.route\),/,
+  );
+  assert.match(
+    reviewJs,
+    /async function loadPipelineQueue\(\{ quiet = false, commitGuard = null \} = \{\}\) \{\s*const sequence = \+\+state\.pipelineRequestSequence;\s*const uiGeneration = \+\+state\.reviewLoadUiGeneration;\s*const mayCommit = \(\) => \(/,
+  );
+});
+
+test("route-invalidated manual and pipeline loads release only their own busy state", async () => {
+  for (const [name, endMarker, sequenceKey, resultKey] of [
+    ["loadQueue", "\nfunction renderQueue()", "queueRequestSequence", "reviewResults"],
+    ["loadPipelineQueue", "\nfunction renderPipeline()", "pipelineRequestSequence", "reviewPipelineResults"],
+  ]) {
+    const start = reviewJs.indexOf(`async function ${name}`);
+    const end = reviewJs.indexOf(endMarker, start);
+    assert.ok(start >= 0 && end > start);
+    const state = { [sequenceKey]: 0, reviewLoadUiGeneration: 0 };
+    const attributes = [];
+    const elements = {
+      [resultKey]: {
+        setAttribute(attribute, value) {
+          attributes.push([attribute, value]);
+        },
+      },
+      refreshReviews: {},
+    };
+    const busy = [];
+    const pending = [];
+    const api = () => new Promise((resolve) => pending.push(resolve));
+    const loader = Function(
+      "state",
+      "elements",
+      "api",
+      "setQueueMessage",
+      "setButtonBusy",
+      "QUEUE_LIMIT",
+      `${reviewJs.slice(start, end)}\nreturn ${name};`,
+    )(
+      state,
+      elements,
+      api,
+      () => {},
+      (_button, value) => busy.push(value),
+      50,
+    );
+    let routeCurrent = true;
+    const first = loader({ commitGuard: () => routeCurrent });
+    const second = loader({ commitGuard: () => routeCurrent });
+    pending[0]({});
+    await first;
+    assert.equal(busy.at(-1), true, `${name} stale sequence keeps newer load busy`);
+
+    routeCurrent = false;
+    pending[1]({});
+    assert.equal(await second, false);
+    assert.equal(busy.at(-1), false, `${name} current sequence releases shared refresh`);
+    assert.deepEqual(attributes.at(-1), ["aria-busy", "false"]);
+  }
+});
+
+test("an older manual load cannot release a newer pipeline refresh", async () => {
+  const loaderSource = (name, endMarker) => {
+    const start = reviewJs.indexOf(`async function ${name}`);
+    const end = reviewJs.indexOf(endMarker, start);
+    assert.ok(start >= 0 && end > start);
+    return reviewJs.slice(start, end);
+  };
+  const state = {
+    queueRequestSequence: 0,
+    pipelineRequestSequence: 0,
+    reviewLoadUiGeneration: 0,
+  };
+  const attributes = new Map();
+  const result = (name) => ({
+    setAttribute(attribute, value) {
+      attributes.set(name, [attribute, value]);
+    },
+  });
+  const elements = {
+    reviewResults: result("manual"),
+    reviewPipelineResults: result("pipeline"),
+    refreshReviews: {},
+  };
+  const busy = [];
+  const pending = [];
+  const api = () => new Promise((resolve) => pending.push(resolve));
+  const compile = (name, source) => Function(
+    "state",
+    "elements",
+    "api",
+    "setQueueMessage",
+    "setButtonBusy",
+    "QUEUE_LIMIT",
+    `${source}\nreturn ${name};`,
+  )(
+    state,
+    elements,
+    api,
+    () => {},
+    (_button, value) => busy.push(value),
+    50,
+  );
+  const loadManual = compile(
+    "loadQueue",
+    loaderSource("loadQueue", "\nfunction renderQueue()"),
+  );
+  const loadPipeline = compile(
+    "loadPipelineQueue",
+    loaderSource("loadPipelineQueue", "\nfunction renderPipeline()"),
+  );
+  let manualRouteCurrent = true;
+  let pipelineRouteCurrent = true;
+  const manual = loadManual({ commitGuard: () => manualRouteCurrent });
+  const pipeline = loadPipeline({ commitGuard: () => pipelineRouteCurrent });
+
+  manualRouteCurrent = false;
+  pending[0]({});
+  assert.equal(await manual, false);
+  assert.equal(busy.at(-1), true, "manual completion leaves newer pipeline busy");
+  assert.deepEqual(attributes.get("manual"), ["aria-busy", "false"]);
+
+  pipelineRouteCurrent = false;
+  pending[1]({});
+  assert.equal(await pipeline, false);
+  assert.equal(busy.at(-1), false, "newest pipeline completion releases Refresh");
+  assert.deepEqual(attributes.get("pipeline"), ["aria-busy", "false"]);
 });
 
 test("guards review mutations and stale asynchronous completion at the route boundary", () => {

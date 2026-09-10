@@ -482,7 +482,6 @@ async function loadCurrentUser() {
 }
 
 async function loadListings() {
-  const routeOwner = appRouter.current();
   setListMessage("Loading listings...");
   setButtonBusy(elements.refreshListings, true);
   try {
@@ -492,10 +491,7 @@ async function loadListings() {
     populateFilterOptions();
     const route = appRouter.current();
     if (route?.name === "listings") {
-      const context = routeActivationIsCurrent(routeOwner, route)
-        ? { source: "refresh" }
-        : {};
-      applyListingsRoute(route, context);
+      applyListingsRoute(route, { source: "refresh" });
     } else {
       renderListings();
     }

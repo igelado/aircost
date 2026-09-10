@@ -111,6 +111,7 @@ const state = {
   verificationRunCreating: false,
   verificationRunCancelling: false,
   productRequestSequence: 0,
+  reviewLoadUiGeneration: 0,
   productDetailRequestSequence: 0,
   productGroups: [],
   selectedProduct: null,
@@ -284,7 +285,9 @@ function activateReviewRoute(route, { source } = {}) {
   if (state.pipelineLoaded) {
     renderPipelineTable();
   }
-  const pipelineLoad = state.pipelineLoaded ? Promise.resolve() : loadPipelineQueue();
+  const pipelineLoad = loadPipelineQueue({
+    commitGuard: () => routeActivationIsCurrent(route, state.route),
+  });
   const runLoad = state.activeVerificationRunId === null
     ? Promise.resolve()
     : resumeVerificationRun(state.activeVerificationRunId);
@@ -631,8 +634,13 @@ function setQueueMode(mode, { load = true } = {}) {
   }
 }
 
-async function loadPipelineQueue({ quiet = false } = {}) {
+async function loadPipelineQueue({ quiet = false, commitGuard = null } = {}) {
   const sequence = ++state.pipelineRequestSequence;
+  const uiGeneration = ++state.reviewLoadUiGeneration;
+  const mayCommit = () => (
+    sequence === state.pipelineRequestSequence
+    && (commitGuard === null || commitGuard())
+  );
   if (!quiet) {
     setQueueMessage("Running provider-free verification preflight…");
   }
@@ -650,7 +658,7 @@ async function loadPipelineQueue({ quiet = false } = {}) {
       const payload = await api(
         `/api/review/verification/preflight?${params}`,
       );
-      if (sequence !== state.pipelineRequestSequence) {
+      if (!mayCommit()) {
         return false;
       }
       responses.push(payload);
@@ -670,7 +678,7 @@ async function loadPipelineQueue({ quiet = false } = {}) {
       afterListingId = checkpoint.resumeAfterListingId;
     } while (true);
 
-    if (sequence !== state.pipelineRequestSequence) {
+    if (!mayCommit()) {
       return false;
     }
     state.pipelineResponses = responses;
@@ -699,7 +707,7 @@ async function loadPipelineQueue({ quiet = false } = {}) {
     }
     return true;
   } catch (error) {
-    if (sequence === state.pipelineRequestSequence) {
+    if (mayCommit()) {
       setQueueMessage(
         `Could not load verification pipeline: ${error.message}`,
         true,
@@ -709,6 +717,8 @@ async function loadPipelineQueue({ quiet = false } = {}) {
   } finally {
     if (sequence === state.pipelineRequestSequence) {
       elements.reviewPipelineResults.setAttribute("aria-busy", "false");
+    }
+    if (uiGeneration === state.reviewLoadUiGeneration) {
       setButtonBusy(elements.refreshReviews, false);
     }
   }
@@ -1449,6 +1459,7 @@ async function reconcileCompletedVerificationRun(run, sequence) {
 
 async function loadProductQueue({ quiet = false, commitGuard = null } = {}) {
   const sequence = ++state.productRequestSequence;
+  const uiGeneration = ++state.reviewLoadUiGeneration;
   const mayCommit = () => (
     sequence === state.productRequestSequence
     && (commitGuard === null || commitGuard())
@@ -1520,6 +1531,8 @@ async function loadProductQueue({ quiet = false, commitGuard = null } = {}) {
   } finally {
     if (sequence === state.productRequestSequence) {
       elements.reviewProductResults.setAttribute("aria-busy", "false");
+    }
+    if (uiGeneration === state.reviewLoadUiGeneration) {
       setButtonBusy(elements.refreshReviews, false);
     }
   }
@@ -2555,6 +2568,7 @@ function setProductBusy(busy) {
 
 async function loadQueue({ quiet = false, commitGuard = null } = {}) {
   const sequence = ++state.queueRequestSequence;
+  const uiGeneration = ++state.reviewLoadUiGeneration;
   const mayCommit = () => (
     sequence === state.queueRequestSequence
     && (commitGuard === null || commitGuard())
@@ -2610,8 +2624,10 @@ async function loadQueue({ quiet = false, commitGuard = null } = {}) {
     }
     return false;
   } finally {
-    if (mayCommit()) {
+    if (sequence === state.queueRequestSequence) {
       elements.reviewResults.setAttribute("aria-busy", "false");
+    }
+    if (uiGeneration === state.reviewLoadUiGeneration) {
       setButtonBusy(elements.refreshReviews, false);
     }
   }

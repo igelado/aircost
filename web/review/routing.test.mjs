@@ -526,29 +526,38 @@ test("replace keeps position and Back then push forms a contiguous active stack"
   assert.equal(history.state.aircostPosition, 1);
 });
 
-test("restores an unowned rejected popstate without applying or pushing", () => {
-  const listeners = new Map();
-  const location = fakeLocation();
-  const applied = [];
-  const history = trackedHistory(location, listeners, "/#/review/manual");
-  const router = createHistoryRouter({
-    location,
-    history,
-    listen: (name, listener) => listeners.set(name, listener),
-    apply: (route) => applied.push(formatRoute(route)),
-    mayNavigate: () => false,
-  });
-  router.start();
-  const pushes = history.pushCount;
-  const replacements = history.replaceCount;
-  setLocation(location, "/#/catalog");
-  listeners.get("popstate")({ state: { aircostPosition: 0, foreignRoute: true } });
+test("adopts and repairs new unowned fragment entries without corrupting history", () => {
+  for (const externalState of [null, { aircostPosition: 99, foreignRoute: true }]) {
+    const listeners = new Map();
+    const location = fakeLocation();
+    const applied = [];
+    let mutationActive = true;
+    const history = trackedHistory(location, listeners, "/#/review/manual");
+    const router = createHistoryRouter({
+      location,
+      history,
+      listen: (name, listener) => listeners.set(name, listener),
+      apply: (route) => applied.push(formatRoute(route)),
+      mayNavigate: () => !mutationActive,
+    });
+    router.start();
+    const pushes = history.pushCount;
+    const replacements = history.replaceCount;
+    history.pushExternal("/#/catalog", externalState);
 
-  assert.equal(history.pushCount, pushes);
-  assert.equal(history.replaceCount, replacements + 1);
-  assert.equal(location.hash, "#/review/manual");
-  assert.equal(formatRoute(router.current()), "/#/review/manual");
-  assert.deepEqual(applied, ["/#/review/manual"]);
+    assert.equal(history.pushCount, pushes);
+    assert.equal(history.replaceCount, replacements + 1);
+    assert.deepEqual(history.urls(), ["/#/review/manual", "/#/catalog"]);
+    assert.equal(location.hash, "#/review/manual");
+    assert.equal(formatRoute(router.current()), "/#/review/manual");
+    assert.deepEqual(applied, ["/#/review/manual"]);
+
+    mutationActive = false;
+    history.forward();
+    assert.equal(location.hash, "#/catalog");
+    assert.equal(formatRoute(router.current()), "/#/catalog");
+    assert.deepEqual(applied, ["/#/review/manual", "/#/catalog"]);
+  }
 });
 
 test("canonicalizes malformed URLs reached through browser history", () => {
@@ -613,6 +622,13 @@ function trackedHistory(location, listeners, initialUrl) {
     },
     forward() {
       this.go(1);
+    },
+    pushExternal(url, state = null) {
+      entries.splice(index + 1, entries.length, { state, url });
+      index += 1;
+      this.state = state;
+      setLocation(location, url);
+      listeners.get("popstate")({ state });
     },
     urls() {
       return entries.map((entry) => entry.url);

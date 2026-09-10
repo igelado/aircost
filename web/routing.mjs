@@ -319,7 +319,11 @@ export function createHistoryRouter({ location, history, listen, apply, mayNavig
   let suppressedPosition = null;
 
   function positionFromState(value) {
-    if (value?.aircostRoute === null || typeof value?.aircostRoute !== "object") {
+    if (
+      value?.aircostRouterVersion !== 1
+      || value.aircostRoute === null
+      || typeof value.aircostRoute !== "object"
+    ) {
       return null;
     }
     const position = value?.aircostPosition;
@@ -327,7 +331,11 @@ export function createHistoryRouter({ location, history, listen, apply, mayNavig
   }
 
   function routeState(route, position) {
-    return { aircostRoute: route, aircostPosition: position };
+    return {
+      aircostRouterVersion: 1,
+      aircostRoute: route,
+      aircostPosition: position,
+    };
   }
 
   function write(route, mode, source) {
@@ -344,13 +352,24 @@ export function createHistoryRouter({ location, history, listen, apply, mayNavig
   }
 
   function restore(event) {
-    const targetPosition = positionFromState(event?.state);
+    const next = parseRoute(location.href);
+    let targetPosition = positionFromState(event?.state);
+    if (targetPosition === null) {
+      // Startup and every router-owned write are tagged. A state-less
+      // same-document target is therefore a newly created fragment entry
+      // adjacent to the active entry; adopt it without appending history.
+      targetPosition = currentPosition + 1;
+      history.replaceState(
+        routeState(next, targetPosition),
+        "",
+        formatRoute(next),
+      );
+    }
     if (suppressedPosition !== null && targetPosition === suppressedPosition) {
       suppressedPosition = null;
       return true;
     }
     suppressedPosition = null;
-    const next = parseRoute(location.href);
     if (current !== null && !navigationAllowed(next, current, "popstate")) {
       if (
         targetPosition !== null
@@ -359,12 +378,6 @@ export function createHistoryRouter({ location, history, listen, apply, mayNavig
       ) {
         suppressedPosition = currentPosition;
         history.go(currentPosition - targetPosition);
-      } else {
-        history.replaceState(
-          routeState(current, currentPosition),
-          "",
-          formatRoute(current),
-        );
       }
       return false;
     }
