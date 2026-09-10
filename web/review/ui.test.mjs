@@ -243,6 +243,82 @@ test("preserves stale listing drafts across review area routes", async () => {
   assert.equal(state.drafts.size, 0);
 });
 
+test("cold detail preloads commit only while their listing route owns activation", async () => {
+  const start = reviewJs.indexOf("function activateReviewRoute");
+  const end = reviewJs.indexOf("\nfunction activeReviewMutation", start);
+  assert.ok(start >= 0 && end > start);
+
+  const state = {
+    route: null,
+    routeGeneration: 0,
+    currentReview: null,
+    queueLoaded: false,
+    pipelineLoaded: false,
+    activeVerificationRunId: null,
+  };
+  const pending = [];
+  const commits = [];
+  const deferredLoad = (name) => (options) => new Promise((resolve) => {
+    pending.push(() => {
+      const owned = options.commitGuard();
+      if (owned) {
+        commits.push(name);
+      }
+      resolve(owned);
+    });
+  });
+  const activate = Function(
+    "state",
+    "closeProductReview",
+    "setQueueMode",
+    "loadQueue",
+    "loadPipelineQueue",
+    "openReview",
+    "resumeVerificationRun",
+    "routeActivationIsCurrent",
+    "reviewListingIdForRoute",
+    "positiveInteger",
+    "showWorkspace",
+    "setActiveReviewArea",
+    `${reviewJs.slice(start, end)}\nreturn activateReviewRoute;`,
+  )(
+    state,
+    () => {},
+    () => {},
+    deferredLoad("manual"),
+    deferredLoad("pipeline"),
+    () => Promise.resolve(),
+    () => Promise.resolve(),
+    (owner, current) => owner === current,
+    (route) => route?.name === "review" && route.view === "listing"
+      ? route.listingId
+      : null,
+    (value) => Number.isInteger(value) && value > 0 ? value : null,
+    () => {},
+    () => {},
+  );
+  const firstRoute = {
+    name: "review",
+    view: "listing",
+    listingId: 41,
+    area: "avionics",
+  };
+
+  const departedLoad = activate(firstRoute);
+  assert.equal(pending.length, 2);
+  assert.equal(pending.every((release) => typeof release === "function"), true);
+  state.route = { name: "review", view: "products" };
+  pending.splice(0).forEach((release) => release());
+  await departedLoad;
+  assert.deepEqual(commits, [], "late detail preloads cannot repaint another Review view");
+
+  const secondRoute = { ...firstRoute, listingId: 42 };
+  const ownedLoad = activate(secondRoute);
+  pending.splice(0).forEach((release) => release());
+  await ownedLoad;
+  assert.deepEqual(commits, ["manual", "pipeline"]);
+});
+
 test("reloads pipeline only on startup and true collection re-entry", async () => {
   const start = reviewJs.indexOf("function deactivateReviewRoute");
   const end = reviewJs.indexOf("\nfunction activeReviewMutation", start);
@@ -459,6 +535,63 @@ test("catalog deactivation cancels a pending routed search", () => {
     route: { name: "catalog", filters: { search: "GNS", page: 1 } },
     options: { replace: true },
   }]);
+});
+
+test("catalog deactivation suppresses hidden trigger focus", () => {
+  const deactivateStart = avionicsJs.indexOf("function deactivateAvionicsInspector");
+  const deactivateEnd = avionicsJs.indexOf("\nasync function applyCatalogRoute", deactivateStart);
+  const closeStart = avionicsJs.indexOf("function closeAvionicsDetail");
+  const closeEnd = avionicsJs.indexOf("\nfunction detailState", closeStart);
+  assert.ok(deactivateStart >= 0 && deactivateEnd > deactivateStart);
+  assert.ok(closeStart >= 0 && closeEnd > closeStart);
+
+  let closeHandler = () => {};
+  let hiddenFocus = 0;
+  let visibleFocus = 0;
+  const state = {
+    route: { name: "catalog", filters: { page: 1 } },
+    avionicsDetailTrigger: { focus: () => { hiddenFocus += 1; } },
+    avionicsDetailRequestSequence: 0,
+    avionicsDetail: {},
+    avionicsDeleting: false,
+  };
+  const elements = {
+    avionicsDetailDialog: {
+      open: true,
+      close() {
+        this.open = false;
+        closeHandler();
+      },
+    },
+    deleteAvionicsProduct: {},
+  };
+  const lifecycle = Function(
+    "state",
+    "elements",
+    "cancelAvionicsSearch",
+    "navigate",
+    "catalogRouteFromControls",
+    `${avionicsJs.slice(deactivateStart, deactivateEnd)}\n`
+      + `${avionicsJs.slice(closeStart, closeEnd)}\n`
+      + "return { deactivateAvionicsInspector, finishAvionicsDetailClose, closeAvionicsDetail };",
+  )(
+    state,
+    elements,
+    () => {},
+    () => {},
+    () => ({ name: "catalog", filters: { page: 1 } }),
+  );
+  closeHandler = lifecycle.finishAvionicsDetailClose;
+
+  lifecycle.deactivateAvionicsInspector();
+  assert.equal(hiddenFocus, 0);
+  assert.equal(state.avionicsDetailTrigger, null);
+
+  elements.avionicsDetailDialog.open = true;
+  state.avionicsDetailTrigger = { focus: () => { visibleFocus += 1; } };
+  lifecycle.closeAvionicsDetail(false, { updateRoute: false });
+  assert.equal(visibleFocus, 1, "an ordinary user close restores its visible trigger");
+  assert.equal(state.avionicsDetailTrigger, null);
 });
 
 test("hands catalog deletion cleanup to the exact operation owner", () => {

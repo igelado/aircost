@@ -78,8 +78,21 @@ export function initializeAvionicsInspector(shared) {
 
 function deactivateAvionicsInspector() {
   cancelAvionicsSearch();
+  state.avionicsDetailTrigger = null;
   state.route = { ...state.route };
   closeAvionicsDetail(false, { updateRoute: false });
+}
+
+function finishAvionicsDetailClose() {
+  if (elements.avionicsDetailDialog.open) {
+    return;
+  }
+  state.avionicsDetailRequestSequence += 1;
+  state.avionicsDetail = null;
+  state.avionicsDeleting = false;
+  elements.deleteAvionicsProduct.disabled = true;
+  state.avionicsDetailTrigger?.focus();
+  state.avionicsDetailTrigger = null;
 }
 
 async function applyCatalogRoute(route, { source } = {}) {
@@ -229,17 +242,7 @@ function bindEvents() {
     event.preventDefault();
     closeAvionicsDetail();
   });
-  elements.avionicsDetailDialog.addEventListener("close", () => {
-    if (elements.avionicsDetailDialog.open) {
-      return;
-    }
-    state.avionicsDetailRequestSequence += 1;
-    state.avionicsDetail = null;
-    state.avionicsDeleting = false;
-    elements.deleteAvionicsProduct.disabled = true;
-    state.avionicsDetailTrigger?.focus();
-    state.avionicsDetailTrigger = null;
-  });
+  elements.avionicsDetailDialog.addEventListener("close", finishAvionicsDetailClose);
 }
 
 async function loadAvionicsWorkspace(forceOptions = false) {

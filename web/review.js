@@ -221,10 +221,13 @@ function activateReviewRoute(route, { source } = {}) {
   if (route.view === "listing") {
     setQueueMode("listing", { load: false });
     state.activeArea = route.area ?? "avionics";
-    const queueLoad = state.queueLoaded ? Promise.resolve() : loadQueue({ quiet: true });
+    const detailRouteOwnsActivation = () => routeActivationIsCurrent(route, state.route);
+    const queueLoad = state.queueLoaded
+      ? Promise.resolve()
+      : loadQueue({ quiet: true, commitGuard: detailRouteOwnsActivation });
     const pipelineLoad = state.pipelineLoaded
       ? Promise.resolve()
-      : loadPipelineQueue({ quiet: true });
+      : loadPipelineQueue({ quiet: true, commitGuard: detailRouteOwnsActivation });
     const detailLoad = reuseListingReviewForAreaRoute(previousRoute, route)
       ? Promise.resolve()
       : openReview(route.listingId, { discardDraft: true });
