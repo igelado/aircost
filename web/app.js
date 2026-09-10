@@ -1289,6 +1289,9 @@ async function saveListing(event) {
       return;
     }
     await loadListings();
+    if (!ownsRoute()) {
+      return;
+    }
     await refreshAircraftAfterEstimateResponse(response);
     if (!ownsRoute()) {
       return;
@@ -1337,6 +1340,9 @@ async function deleteListing(listing) {
       return;
     }
     await loadListings();
+    if (!ownsRoute()) {
+      return;
+    }
     await loadAircraftOptions();
     if (!ownsRoute()) {
       return;
