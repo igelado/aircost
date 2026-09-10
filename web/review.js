@@ -225,9 +225,9 @@ function activateReviewRoute(route, { source } = {}) {
     const pipelineLoad = state.pipelineLoaded
       ? Promise.resolve()
       : loadPipelineQueue({ quiet: true });
-    const detailLoad = openReview(route.listingId, {
-      discardDraft: true,
-    });
+    const detailLoad = reuseListingReviewForAreaRoute(previousRoute, route)
+      ? Promise.resolve()
+      : openReview(route.listingId, { discardDraft: true });
     const runLoad = state.activeVerificationRunId === null
       ? Promise.resolve()
       : resumeVerificationRun(state.activeVerificationRunId);
@@ -292,6 +292,18 @@ function activateReviewRoute(route, { source } = {}) {
     ? Promise.resolve()
     : resumeVerificationRun(state.activeVerificationRunId);
   return Promise.allSettled([pipelineLoad, runLoad]);
+}
+
+function reuseListingReviewForAreaRoute(previousRoute, route) {
+  if (
+    reviewListingIdForRoute(previousRoute) !== route.listingId
+    || positiveInteger(state.currentReview?.listing_id) !== route.listingId
+  ) {
+    return false;
+  }
+  showWorkspace();
+  setActiveReviewArea(state.activeArea);
+  return true;
 }
 
 function activeReviewMutation() {

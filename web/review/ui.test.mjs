@@ -116,6 +116,83 @@ test("guards real product drafts while preserving same-product activations", () 
   assert.match(reviewJs, /state\.selectedProduct\.attestationStatus = "current";\s*state\.productAttestationDirty = false;/);
 });
 
+test("preserves stale listing drafts across review area routes", async () => {
+  const start = reviewJs.indexOf("function activateReviewRoute");
+  const end = reviewJs.indexOf("\nfunction activeReviewMutation", start);
+  assert.ok(start >= 0 && end > start);
+
+  const listingId = 41;
+  const draft = {
+    action: "discard",
+    correction: { dirty: true },
+  };
+  const aircraftRoute = {
+    name: "review",
+    view: "listing",
+    listingId,
+    area: "aircraft",
+  };
+  const avionicsRoute = { ...aircraftRoute, area: "avionics" };
+  const state = {
+    route: aircraftRoute,
+    routeGeneration: 0,
+    currentReview: { listing_id: listingId },
+    drafts: new Map([["aspect-1", draft]]),
+    stale: true,
+    activeArea: "aircraft",
+    queueLoaded: true,
+    pipelineLoaded: true,
+    activeVerificationRunId: null,
+  };
+  const opened = [];
+  const selectedAreas = [];
+  const activate = Function(
+    "state",
+    "closeProductReview",
+    "setQueueMode",
+    "loadQueue",
+    "loadPipelineQueue",
+    "openReview",
+    "resumeVerificationRun",
+    "reviewListingIdForRoute",
+    "positiveInteger",
+    "showWorkspace",
+    "setActiveReviewArea",
+    `${reviewJs.slice(start, end)}\nreturn activateReviewRoute;`,
+  )(
+    state,
+    () => {},
+    () => {},
+    () => Promise.resolve(),
+    () => Promise.resolve(),
+    (nextListingId) => {
+      opened.push(nextListingId);
+      state.currentReview = { listing_id: nextListingId };
+      state.drafts.clear();
+      state.stale = false;
+      return Promise.resolve();
+    },
+    () => Promise.resolve(),
+    (route) => route?.name === "review" && route.view === "listing"
+      ? route.listingId
+      : null,
+    (value) => Number.isInteger(value) && value > 0 ? value : null,
+    () => {},
+    (area) => selectedAreas.push(area),
+  );
+
+  await activate(avionicsRoute, { source: "popstate" });
+  assert.deepEqual(opened, []);
+  assert.equal(state.stale, true);
+  assert.equal(state.drafts.get("aspect-1"), draft);
+  assert.deepEqual(selectedAreas, ["avionics"]);
+
+  await activate({ ...aircraftRoute, listingId: 42 });
+  assert.deepEqual(opened, [42], "a different listing must load instead of reusing drafts");
+  assert.equal(state.stale, false);
+  assert.equal(state.drafts.size, 0);
+});
+
 test("falls back from absent product detail only through its route owner", () => {
   assert.match(
     reviewJs,
