@@ -53,6 +53,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes ripgrep sqlite3
+          command -v rg
+          command -v sqlite3
 
       - name: Run SQLite schema contracts
         run: bash tests/schema/run.sh sqlite
@@ -88,6 +90,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes postgresql-client ripgrep sqlite3
+          command -v psql
+          command -v rg
+          command -v sqlite3
 
       - name: Verify ignored Rust test inventory
         run: |
