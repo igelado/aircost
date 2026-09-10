@@ -143,6 +143,107 @@ test("guards dirty listing editors before closing or changing their route", () =
   assert.match(appJs, /function resetListingForm\([\s\S]*?state\.listingDraftDirty = false;/);
 });
 
+test("preserves an open dirty editor when its refreshed listing disappears", () => {
+  const start = appJs.indexOf("function applyListingsRoute");
+  const end = appJs.indexOf("\nfunction applyListingFilterControls", start);
+  assert.ok(start >= 0 && end > start);
+
+  const run = ({ dirty, editingListingId, routeListingId, superseded = false }) => {
+    const closes = [];
+    const formMessages = [];
+    const listMessages = [];
+    const navigations = [];
+    const state = {
+      listingDraftDirty: dirty,
+      editingListingId,
+      listingsLoaded: true,
+      listings: [],
+    };
+    const elements = { listingDialog: { open: true } };
+    const route = { name: "listings", listingId: routeListingId, filters: { search: "Piper" } };
+    const currentRoute = superseded
+      ? { name: "listings", listingId: 99, filters: {} }
+      : route;
+    const apply = Function(
+      "state",
+      "elements",
+      "appRouter",
+      "routeActivationIsCurrent",
+      "applyListingFilterControls",
+      "renderListings",
+      "resetListingForm",
+      "openListingDialog",
+      "setFormMessage",
+      "setListMessage",
+      "closeListingDialog",
+      "editListing",
+      "navigateRoute",
+      `${appJs.slice(start, end)}\nreturn applyListingsRoute;`,
+    )(
+      state,
+      elements,
+      { current: () => currentRoute },
+      (owner, current) => owner === current,
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      (...message) => formMessages.push(message),
+      (...message) => listMessages.push(message),
+      (options) => {
+        closes.push(options);
+        state.listingDraftDirty = false;
+        elements.listingDialog.open = false;
+      },
+      () => {},
+      (nextRoute, options) => navigations.push({ route: nextRoute, options }),
+    );
+    apply(route);
+    return { closes, elements, formMessages, listMessages, navigations, state };
+  };
+
+  const ownedDraft = run({ dirty: true, editingListingId: 41, routeListingId: 41 });
+  assert.deepEqual(ownedDraft.closes, []);
+  assert.equal(ownedDraft.state.listingDraftDirty, true);
+  assert.equal(ownedDraft.elements.listingDialog.open, true);
+  assert.deepEqual(ownedDraft.formMessages, [[
+    "Listing 41 is no longer available. Your unsaved changes remain open.",
+    true,
+  ]]);
+  assert.deepEqual(ownedDraft.listMessages, [["Listing 41 was not found.", true]]);
+  assert.deepEqual(ownedDraft.navigations, []);
+
+  const clean = run({ dirty: false, editingListingId: 41, routeListingId: 41 });
+  assert.deepEqual(clean.closes, [{ navigate: false }]);
+  assert.equal(clean.elements.listingDialog.open, false);
+  assert.deepEqual(clean.navigations, [{
+    route: { name: "listings", filters: { search: "Piper" } },
+    options: { replace: true },
+  }]);
+
+  const cold = run({ dirty: false, editingListingId: null, routeListingId: 41 });
+  assert.deepEqual(cold.closes, [{ navigate: false }]);
+  assert.deepEqual(cold.navigations, clean.navigations);
+
+  const differentListing = run({ dirty: true, editingListingId: 41, routeListingId: 42 });
+  assert.deepEqual(differentListing.closes, [{ navigate: false }]);
+  assert.equal(differentListing.state.listingDraftDirty, false);
+  assert.deepEqual(differentListing.navigations, [{
+    route: { name: "listings", filters: { search: "Piper" } },
+    options: { replace: true },
+  }]);
+
+  const superseded = run({
+    dirty: false,
+    editingListingId: 41,
+    routeListingId: 41,
+    superseded: true,
+  });
+  assert.deepEqual(superseded.closes, []);
+  assert.deepEqual(superseded.listMessages, []);
+  assert.deepEqual(superseded.navigations, []);
+});
+
 test("all listing editors retain the global in-flight Save lock", () => {
   const start = appJs.indexOf("function synchronizeListingSaveDisabled");
   const end = appJs.indexOf("\nfunction openListingDialog", start);
@@ -545,6 +646,114 @@ test("canonicalizes catalog result pages before continuing detail activation", (
     avionicsJs,
     /const pageFallback = state\.avionicsLoaded[\s\S]*?catalogPageFallbackForResult\(\s*route,\s*state\.route,\s*state\.avionicsTotal,\s*state\.avionicsLimit,[\s\S]*?const navigated = await navigate\(pageFallback, \{ replace: true \}\);\s*if \(navigated !== false\) \{\s*return;/,
   );
+});
+
+test("closes a mismatched catalog detail before route loading but retains the same product", async () => {
+  const applyStart = avionicsJs.indexOf("async function applyCatalogRoute");
+  const applyEnd = avionicsJs.indexOf("\nfunction setCatalogSelectValue", applyStart);
+  assert.ok(applyStart >= 0 && applyEnd > applyStart);
+
+  const compile = ({ oldProductId, targetProductId }) => {
+    const filters = { page: 1 };
+    const route = {
+      name: "catalog",
+      filters,
+      ...(targetProductId === null ? {} : { productId: targetProductId }),
+    };
+    let releaseOptions;
+    const state = {
+      route: { name: "catalog", filters, productId: oldProductId },
+      avionicsDetail: { summary: { id: oldProductId } },
+      avionicsDetailRequestSequence: 4,
+      avionicsDetailTrigger: { focus() {} },
+      avionicsDeleting: false,
+      avionicsOptionsLoaded: false,
+      avionicsLoaded: true,
+      catalogRouteKey: JSON.stringify(filters),
+      avionicsTotal: 1,
+      avionicsLimit: 20,
+      avionicsOffset: 0,
+    };
+    const elements = {
+      avionicsDetailDialog: { open: true },
+      deleteAvionicsProduct: { disabled: false },
+      avionicsSearch: { value: "" },
+      avionicsCompletenessFilter: { value: "" },
+      avionicsStatusFilter: {},
+      avionicsCapabilityFilter: {},
+    };
+    const closes = [];
+    const opens = [];
+    const apply = Function(
+      "state",
+      "elements",
+      "positiveInteger",
+      "closeAvionicsDetail",
+      "cancelAvionicsSearch",
+      "preserveLiveRouteInput",
+      "document",
+      "loadAvionicsOptions",
+      "routeActivationIsCurrent",
+      "setCatalogSelectValue",
+      "loadAvionics",
+      "catalogPageFallbackForResult",
+      "navigate",
+      "openAvionicsDetail",
+      `${avionicsJs.slice(applyStart, applyEnd)}\nreturn applyCatalogRoute;`,
+    )(
+      state,
+      elements,
+      (value, fallback) => {
+        const numeric = Number.parseInt(value, 10);
+        return Number.isInteger(numeric) && numeric > 0 ? numeric : fallback;
+      },
+      (_force, options) => {
+        closes.push(options);
+        elements.avionicsDetailDialog.open = false;
+      },
+      () => {},
+      () => false,
+      { activeElement: null },
+      () => new Promise((resolve) => { releaseOptions = resolve; }),
+      (owner, current) => owner === current,
+      () => {},
+      () => { throw new Error("matching route key must not reload results"); },
+      () => null,
+      () => { throw new Error("page fallback must not navigate"); },
+      (id) => opens.push(id),
+    );
+    return {
+      apply: () => apply(route),
+      closes,
+      elements,
+      opens,
+      releaseOptions: () => releaseOptions(),
+      state,
+    };
+  };
+
+  const changed = compile({ oldProductId: 7, targetProductId: 9 });
+  const changedActivation = changed.apply();
+  assert.equal(changed.elements.avionicsDetailDialog.open, false);
+  assert.equal(changed.elements.deleteAvionicsProduct.disabled, true);
+  assert.equal(changed.state.avionicsDetail, null);
+  assert.equal(changed.state.avionicsDetailTrigger, null);
+  assert.equal(changed.state.avionicsDetailRequestSequence, 5);
+  assert.deepEqual(changed.closes, [{ updateRoute: false }]);
+  assert.deepEqual(changed.opens, [], "the new detail waits for route-owned loading");
+  changed.releaseOptions();
+  await changedActivation;
+  assert.deepEqual(changed.opens, [9]);
+
+  const same = compile({ oldProductId: 7, targetProductId: 7 });
+  const sameActivation = same.apply();
+  assert.equal(same.elements.avionicsDetailDialog.open, true);
+  assert.equal(same.elements.deleteAvionicsProduct.disabled, false);
+  assert.equal(same.state.avionicsDetailRequestSequence, 4);
+  assert.deepEqual(same.closes, []);
+  same.releaseOptions();
+  await sameActivation;
+  assert.deepEqual(same.opens, [], "a same-product filter activation retains its detail");
 });
 
 test("catalog deactivation cancels a pending routed search", () => {

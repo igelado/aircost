@@ -369,8 +369,27 @@ function applyListingsRoute(route, context = {}) {
   if (route.listingId && state.listingsLoaded) {
     const listing = state.listings.find((item) => Number(item.id) === route.listingId);
     if (!listing) {
+      if (!routeActivationIsCurrent(route, appRouter.current())) {
+        return;
+      }
+      if (
+        state.listingDraftDirty
+        && state.editingListingId === route.listingId
+        && elements.listingDialog.open
+      ) {
+        setFormMessage(
+          `Listing ${route.listingId} is no longer available. Your unsaved changes remain open.`,
+          true,
+        );
+        setListMessage(`Listing ${route.listingId} was not found.`, true);
+        return;
+      }
       closeListingDialog({ navigate: false });
       setListMessage(`Listing ${route.listingId} was not found.`, true);
+      navigateRoute({
+        name: "listings",
+        filters: route.filters,
+      }, { replace: true });
       return;
     }
     if (state.editingListingId !== route.listingId || !elements.listingDialog.open) {

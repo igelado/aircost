@@ -96,6 +96,22 @@ function finishAvionicsDetailClose() {
 }
 
 async function applyCatalogRoute(route, { source } = {}) {
+  const targetProductId = positiveInteger(route.productId, null);
+  const displayedProductId = positiveInteger(
+    state.avionicsDetail?.summary?.id,
+    positiveInteger(state.route?.productId, null),
+  );
+  if (
+    elements.avionicsDetailDialog.open
+    && (targetProductId === null || displayedProductId !== targetProductId)
+  ) {
+    state.avionicsDetailRequestSequence += 1;
+    state.avionicsDetailTrigger = null;
+    state.avionicsDetail = null;
+    state.avionicsDeleting = false;
+    elements.deleteAvionicsProduct.disabled = true;
+    closeAvionicsDetail(false, { updateRoute: false });
+  }
   state.route = route;
   cancelAvionicsSearch();
   const filters = route.filters || {};

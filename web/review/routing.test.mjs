@@ -554,6 +554,12 @@ test("rebases a rejected pre-router stateless Back target into a coherent owned 
       aircostRoute: parseRoute("/#/listings"),
       aircostPosition: 99,
     },
+    {
+      aircostRouterVersion: 0,
+      aircostEpoch: "obsolete-version",
+      aircostRoute: parseRoute("/#/listings"),
+      aircostPosition: 0,
+    },
   ]) {
     const listeners = new Map();
     const location = fakeLocation();
@@ -622,7 +628,12 @@ test("rebases a rejected newly-created stateless Forward target without guessing
   });
   router.start();
   const pushes = history.pushCount;
-  history.pushExternal("/#/catalog");
+  history.pushExternal("/#/catalog", {
+    aircostRouterVersion: 1,
+    aircostEpoch: history.state.aircostEpoch,
+    aircostRoute: parseRoute("/#/catalog"),
+    aircostPosition: -1,
+  });
 
   assert.equal(location.hash, "#/review/manual");
   assert.equal(formatRoute(router.current()), "/#/review/manual");
@@ -678,6 +689,19 @@ test("adopts foreign Back and Forward targets in place and owns later guard repa
     assert.equal(history.state.aircostPosition, 0);
     assert.equal(history.pushCount, pushes, "accepted adoption does not push");
 
+    if (direction === "back") {
+      history.forward();
+      assert.equal(location.hash, "#/review/manual");
+      assert.equal(formatRoute(router.current()), "/#/review/manual");
+      assert.equal(history.state.aircostPosition, 0);
+      assert.equal(history.pushCount, pushes, "old-epoch Forward adoption stays in place");
+      assert.deepEqual(
+        applied,
+        ["/#/review/manual", "/#/listings", "/#/review/manual"],
+        "each accepted foreign target applies exactly once",
+      );
+    }
+
     router.navigate(parseRoute("/#/values"));
     mutationActive = true;
     history.back();
@@ -686,8 +710,9 @@ test("adopts foreign Back and Forward targets in place and owns later guard repa
 
     mutationActive = false;
     history.back();
-    assert.equal(location.hash, "#/listings");
-    assert.equal(formatRoute(router.current()), "/#/listings");
+    const adoptedUrl = direction === "back" ? "/#/review/manual" : "/#/listings";
+    assert.equal(`${location.pathname}${location.hash}`, adoptedUrl);
+    assert.equal(formatRoute(router.current()), adoptedUrl);
   }
 });
 

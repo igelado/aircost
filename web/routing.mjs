@@ -352,7 +352,7 @@ export function createHistoryRouter({
       return null;
     }
     const position = value?.aircostPosition;
-    return Number.isSafeInteger(position) ? position : null;
+    return Number.isSafeInteger(position) && position >= 0 ? position : null;
   }
 
   function routeState(route, position) {
