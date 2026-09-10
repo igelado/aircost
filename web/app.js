@@ -1,18 +1,12 @@
 import { initializeAvionicsInspector } from "/avionics.js";
 import { initializeReviewWorkspace } from "/review.js";
+import {
+  createHistoryRouter,
+  destinationForRoute,
+  parseRoute,
+} from "/routing.mjs";
 
 const USER_HEADER = "developer";
-const VIEW_TITLES = {
-  "listings-panel": ["Listings", "Sale listings and aircraft details"],
-  "review-panel": [
-    "Acceptance & review",
-    "Accept unambiguous evidence automatically; review only the residual exceptions",
-  ],
-  "aircraft-panel": ["Aircraft", "Model parameters and depreciation curves"],
-  "avionics-panel": ["Avionics", "Catalog identities, capabilities, values, and usage"],
-  "comparisons-panel": ["Comparisons", "Purchase, rental, and investment runs"],
-  "rentals-panel": ["Rentals", "Club and rental aircraft profiles"],
-};
 const AVIONICS_TYPES = [
   "GPS",
   "NAV",
@@ -49,6 +43,7 @@ const ICONS = {
 
 const state = {
   listings: [],
+  listingsLoaded: false,
   aircraftOptions: [],
   aircraftDetail: null,
   editingListingId: null,
@@ -58,6 +53,7 @@ const state = {
 const elements = {};
 let avionicsInspector;
 let reviewWorkspace;
+let appRouter;
 
 document.addEventListener("DOMContentLoaded", () => {
   collectElements();
@@ -72,23 +68,34 @@ document.addEventListener("DOMContentLoaded", () => {
     setButtonBusy,
     refreshListings: loadListings,
     refreshReview: () => reviewWorkspace.refresh(),
+    navigate: navigateRoute,
   });
   reviewWorkspace = initializeReviewWorkspace({
-    activatePanel,
     api,
     formatDate,
     formatNumber,
     refreshAvionics: () => avionicsInspector.refresh(),
     refreshListings: loadListings,
     setButtonBusy,
+    navigate: navigateRoute,
   });
   bindEvents();
   addAvionicsRow();
+  appRouter = createHistoryRouter({
+    location: window.location,
+    history: window.history,
+    listen: (name, listener) => window.addEventListener(name, listener),
+    apply: applyAppRoute,
+    mayNavigate: (next) => (
+      reviewWorkspace.confirmRouteChange(next)
+      && avionicsInspector.confirmRouteChange(next)
+    ),
+  });
+  appRouter.start();
   loadValuationStatus();
   loadCurrentUser();
   loadListings();
   loadAircraftOptions();
-  reviewWorkspace.restoreFromLocation();
 });
 
 function collectElements() {
@@ -188,15 +195,35 @@ function renderValuationStatus() {
 
 function bindEvents() {
   for (const tab of elements.navTabs) {
-    tab.addEventListener("click", () => activatePanel(tab.dataset.panel));
+    tab.addEventListener("click", (event) => {
+      if (
+        event.defaultPrevented
+        || event.button !== 0
+        || event.metaKey
+        || event.ctrlKey
+        || event.shiftKey
+        || event.altKey
+      ) {
+        return;
+      }
+      event.preventDefault();
+      navigateRoute(parseRoute(tab.href));
+    });
   }
   elements.refreshListings.addEventListener("click", loadListings);
   elements.newListing.addEventListener("click", () => {
-    resetListingForm();
-    openListingDialog();
+    navigateRoute({
+      name: "listings",
+      selected: "new",
+      filters: listingFiltersFromControls(),
+    });
   });
   elements.resetForm.addEventListener("click", resetListingForm);
   elements.closeListingDialog.addEventListener("click", closeListingDialog);
+  elements.listingDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeListingDialog();
+  });
   elements.listingDialog.addEventListener("click", (event) => {
     if (event.target === elements.listingDialog) {
       closeListingDialog();
@@ -206,23 +233,34 @@ function bindEvents() {
     populateModelFilter();
     populateVariantFilter();
     renderListings();
+    updateListingsRoute(false);
   });
   elements.modelFilter.addEventListener("change", () => {
     populateVariantFilter();
     renderListings();
+    updateListingsRoute(false);
   });
   for (const filter of [
     elements.listingSearch,
-    elements.variantFilter,
-    elements.statusFilter,
-    elements.verifiedFilter,
     elements.yearMinFilter,
     elements.yearMaxFilter,
     elements.priceMinFilter,
     elements.priceMaxFilter,
   ]) {
-    filter.addEventListener("input", renderListings);
-    filter.addEventListener("change", renderListings);
+    filter.addEventListener("input", () => {
+      renderListings();
+      updateListingsRoute(true);
+    });
+  }
+  for (const filter of [
+    elements.variantFilter,
+    elements.statusFilter,
+    elements.verifiedFilter,
+  ]) {
+    filter.addEventListener("change", () => {
+      renderListings();
+      updateListingsRoute(false);
+    });
   }
   elements.clearFilters.addEventListener("click", clearFilters);
   elements.addAvionics.addEventListener("click", () => addAvionicsRow());
@@ -233,32 +271,168 @@ function bindEvents() {
   elements.aircraftManufacturer.addEventListener("change", () => {
     populateAircraftModelSelect();
     populateAircraftVariantSelect();
-    loadSelectedAircraftDetail();
+    updateValuesRoute();
   });
   elements.aircraftModel.addEventListener("change", () => {
     populateAircraftVariantSelect();
-    loadSelectedAircraftDetail();
+    updateValuesRoute();
   });
   elements.aircraftVariant.addEventListener("change", () => {
-    loadSelectedAircraftDetail();
+    updateValuesRoute();
   });
 }
 
-function activatePanel(panelId) {
+function applyAppRoute(route) {
+  const destination = destinationForRoute(route);
+  if (route.name !== "listings") {
+    closeListingDialog({ navigate: false });
+  }
+  if (route.name !== "catalog") {
+    avionicsInspector.deactivate();
+  }
+  if (route.name !== "review") {
+    reviewWorkspace.deactivate();
+  }
   for (const tab of elements.navTabs) {
-    tab.classList.toggle("is-active", tab.dataset.panel === panelId);
+    const active = tab.dataset.destination === route.name;
+    tab.classList.toggle("is-active", active);
+    if (active) {
+      tab.setAttribute("aria-current", "page");
+    } else {
+      tab.removeAttribute("aria-current");
+    }
   }
   for (const panel of elements.viewPanels) {
-    panel.classList.toggle("is-active", panel.id === panelId);
+    panel.classList.toggle("is-active", panel.id === destination.panelId);
   }
-  const [title, subtitle] = VIEW_TITLES[panelId] || VIEW_TITLES["listings-panel"];
-  elements.viewTitle.textContent = title;
-  elements.viewSubtitle.textContent = subtitle;
-  if (panelId === "avionics-panel") {
-    avionicsInspector.activate();
-  } else if (panelId === "review-panel") {
-    reviewWorkspace.activate();
+  elements.viewTitle.textContent = destination.title;
+  elements.viewSubtitle.textContent = destination.subtitle;
+  document.title = destination.documentTitle;
+  if (route.name === "catalog") {
+    return avionicsInspector.activate(route);
+  } else if (route.name === "review") {
+    return reviewWorkspace.activate(route);
+  } else if (route.name === "listings") {
+    return applyListingsRoute(route);
+  } else if (route.name === "values") {
+    return applyValuesRoute(route);
   }
+}
+
+function navigateRoute(route, { replace = false } = {}) {
+  return appRouter.navigate(route, { replace });
+}
+
+function applyListingsRoute(route) {
+  applyListingFilterControls(route.filters);
+  renderListings();
+  if (route.selected === "new") {
+    if (state.editingListingId !== null || !elements.listingDialog.open) {
+      resetListingForm();
+    }
+    openListingDialog();
+    return;
+  }
+  if (route.listingId && state.listingsLoaded) {
+    const listing = state.listings.find((item) => Number(item.id) === route.listingId);
+    if (!listing) {
+      closeListingDialog({ navigate: false });
+      setListMessage(`Listing ${route.listingId} was not found.`, true);
+      return;
+    }
+    if (state.editingListingId !== route.listingId || !elements.listingDialog.open) {
+      editListing(listing);
+    }
+    return;
+  }
+  if (!route.listingId) {
+    closeListingDialog({ navigate: false });
+  }
+}
+
+function applyListingFilterControls(filters = {}) {
+  elements.listingSearch.value = filters.search || "";
+  elements.yearMinFilter.value = filters.yearMin ?? "";
+  elements.yearMaxFilter.value = filters.yearMax ?? "";
+  elements.priceMinFilter.value = filters.priceMin ?? "";
+  elements.priceMaxFilter.value = filters.priceMax ?? "";
+  elements.statusFilter.value = filters.status || "all";
+  elements.verifiedFilter.value = filters.verified || "all";
+  if (!state.listingsLoaded) {
+    return;
+  }
+  selectFilterValue(elements.manufacturerFilter, filters.manufacturer);
+  populateModelFilter();
+  selectFilterValue(elements.modelFilter, filters.model);
+  populateVariantFilter();
+  selectFilterValue(elements.variantFilter, filters.variant);
+}
+
+function selectFilterValue(select, value) {
+  const selected = value || "all";
+  if (![...select.options].some((option) => option.value === selected)) {
+    select.append(selectOption(selected, selected));
+  }
+  select.value = selected;
+}
+
+function listingFiltersFromControls() {
+  return {
+    search: elements.listingSearch.value,
+    manufacturer: elements.manufacturerFilter.value === "all"
+      ? ""
+      : elements.manufacturerFilter.value,
+    model: elements.modelFilter.value === "all" ? "" : elements.modelFilter.value,
+    variant: elements.variantFilter.value === "all" ? "" : elements.variantFilter.value,
+    status: elements.statusFilter.value,
+    verified: elements.verifiedFilter.value,
+    yearMin: nullableNumber(elements.yearMinFilter.value),
+    yearMax: nullableNumber(elements.yearMaxFilter.value),
+    priceMin: nullableNumber(elements.priceMinFilter.value),
+    priceMax: nullableNumber(elements.priceMaxFilter.value),
+  };
+}
+
+function updateListingsRoute(replace) {
+  const route = appRouter.current();
+  if (route?.name !== "listings") {
+    return;
+  }
+  navigateRoute({ ...route, filters: listingFiltersFromControls() }, { replace });
+}
+
+async function applyValuesRoute(route) {
+  if (!state.aircraftOptions.length) {
+    return;
+  }
+  if (!route.variantId) {
+    elements.aircraftManufacturer.selectedIndex = 0;
+    populateAircraftModelSelect();
+    elements.aircraftModel.selectedIndex = 0;
+    populateAircraftVariantSelect();
+    elements.aircraftVariant.selectedIndex = 0;
+    return loadSelectedAircraftDetail();
+  }
+  const option = state.aircraftOptions.find(
+    (candidate) => Number(candidate.variant_id) === route.variantId,
+  );
+  if (!option) {
+    state.aircraftDetail = null;
+    clearAircraftDetail();
+    setAircraftMessage(`Aircraft variant ${route.variantId} was not found.`, true);
+    return;
+  }
+  elements.aircraftManufacturer.value = String(option.manufacturer_id);
+  populateAircraftModelSelect();
+  elements.aircraftModel.value = String(option.model_id);
+  populateAircraftVariantSelect();
+  elements.aircraftVariant.value = String(option.variant_id);
+  await loadSelectedAircraftDetail();
+}
+
+function updateValuesRoute() {
+  const variantId = selectedInteger(elements.aircraftVariant);
+  navigateRoute(variantId === null ? { name: "values" } : { name: "values", variantId });
 }
 
 async function loadCurrentUser() {
@@ -277,9 +451,16 @@ async function loadListings() {
   try {
     const payload = await api("/api/listings");
     state.listings = payload.listings || [];
+    state.listingsLoaded = true;
     populateFilterOptions();
-    renderListings();
+    const route = appRouter.current();
+    if (route?.name === "listings") {
+      applyListingsRoute(route);
+    } else {
+      renderListings();
+    }
   } catch (error) {
+    state.listingsLoaded = false;
     setListMessage(error.message, true);
   } finally {
     setButtonBusy(elements.refreshListings, false);
@@ -295,7 +476,12 @@ async function loadAircraftOptions() {
     populateAircraftManufacturerSelect();
     populateAircraftModelSelect();
     populateAircraftVariantSelect();
-    await loadSelectedAircraftDetail();
+    const route = appRouter.current();
+    if (route?.name === "values") {
+      await applyValuesRoute(route);
+    } else {
+      await loadSelectedAircraftDetail();
+    }
   } catch (error) {
     state.aircraftOptions = [];
     state.aircraftDetail = null;
@@ -628,6 +814,7 @@ function clearFilters() {
   elements.priceMinFilter.value = "";
   elements.priceMaxFilter.value = "";
   renderListings();
+  updateListingsRoute(false);
 }
 
 function listingRow(listing) {
@@ -1003,7 +1190,11 @@ function handleTableClick(event) {
     return;
   }
   if (button.dataset.action === "edit") {
-    editListing(listing);
+    navigateRoute({
+      name: "listings",
+      listingId: Number(listing.id),
+      filters: listingFiltersFromControls(),
+    });
   } else if (button.dataset.action === "delete") {
     deleteListing(listing);
   }
@@ -1064,9 +1255,15 @@ function openListingDialog() {
   firstInput?.focus();
 }
 
-function closeListingDialog() {
+function closeListingDialog({ navigate = true } = {}) {
   if (elements.listingDialog.open) {
     elements.listingDialog.close();
+  }
+  if (navigate && appRouter.current()?.name === "listings") {
+    navigateRoute({
+      name: "listings",
+      filters: listingFiltersFromControls(),
+    });
   }
 }
 
@@ -1085,8 +1282,10 @@ async function saveListing(event) {
     });
     await loadListings();
     await refreshAircraftAfterEstimateResponse(response);
-    resetListingForm();
-    closeListingDialog();
+    navigateRoute({
+      name: "listings",
+      filters: listingFiltersFromControls(),
+    }, { replace: true });
     setListMessage(isEditing ? "Listing updated." : "Listing created.");
   } catch (error) {
     setFormMessage(error.message, true);
@@ -1118,10 +1317,12 @@ async function deleteListing(listing) {
   }
   try {
     await api(`/api/listings/${listing.id}`, { method: "DELETE" });
-    resetListingForm();
-    closeListingDialog();
     await loadListings();
     await loadAircraftOptions();
+    navigateRoute({
+      name: "listings",
+      filters: listingFiltersFromControls(),
+    }, { replace: true });
     setListMessage("Listing deleted.");
   } catch (error) {
     if (elements.listingDialog.open) {
@@ -1431,6 +1632,11 @@ function optionalNumber(value) {
   }
   const parsed = Number.parseFloat(trimmed);
   return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+function nullableNumber(value) {
+  const parsed = optionalNumber(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function finiteNumber(value) {

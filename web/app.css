@@ -88,12 +88,27 @@ button {
   line-height: 1.4;
 }
 
+.nav-groups {
+  display: grid;
+  gap: 22px;
+}
+
+.nav-group h2 {
+  margin: 0 0 7px;
+  padding: 0 12px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 .nav-tabs {
   display: grid;
   gap: 6px;
 }
 
 .nav-tab {
+  display: block;
   width: 100%;
   min-height: 40px;
   padding: 9px 12px;
@@ -101,7 +116,9 @@ button {
   border-radius: 8px;
   background: transparent;
   color: var(--muted);
+  line-height: 22px;
   text-align: left;
+  text-decoration: none;
 }
 
 .nav-tab:hover {
@@ -231,8 +248,7 @@ button {
   line-height: 1.2;
 }
 
-.data-panel,
-.placeholder-panel {
+.data-panel {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
@@ -771,15 +787,9 @@ label span,
   color: var(--danger);
 }
 
-.empty-state,
-.placeholder-panel {
+.empty-state {
   padding: 28px;
   color: var(--muted);
-}
-
-.placeholder-panel h2 {
-  margin: 0 0 6px;
-  color: var(--text);
 }
 
 .aircraft-toolbar {
@@ -2884,10 +2894,6 @@ label span,
   margin: 0 0 12px;
 }
 
-.placeholder-panel p {
-  margin: 0;
-}
-
 .is-hidden {
   display: none !important;
 }
@@ -2931,8 +2937,13 @@ label span,
     border-bottom: 1px solid var(--line);
   }
 
+  .nav-groups {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+
   .nav-tabs {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .nav-tab {

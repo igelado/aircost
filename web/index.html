@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AirCost</title>
+  <title>Listings · AirCost</title>
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
@@ -16,14 +16,22 @@
           <span>Aircraft economics</span>
         </div>
       </div>
-      <nav class="nav-tabs" aria-label="Primary">
-        <button class="nav-tab is-active" type="button" data-panel="listings-panel">Listings</button>
-        <button class="nav-tab" type="button" data-panel="review-panel">Review</button>
-        <button class="nav-tab" type="button" data-panel="aircraft-panel">Aircraft</button>
-        <button class="nav-tab" type="button" data-panel="avionics-panel">Avionics</button>
-        <button class="nav-tab" type="button" data-panel="comparisons-panel">Comparisons</button>
-        <button class="nav-tab" type="button" data-panel="rentals-panel">Rentals</button>
-      </nav>
+      <div class="nav-groups">
+        <section class="nav-group" aria-labelledby="market-navigation-title">
+          <h2 id="market-navigation-title">Market analysis</h2>
+          <nav class="nav-tabs" aria-label="Market analysis">
+            <a class="nav-tab is-active" href="/#/listings" data-destination="listings" aria-current="page">Listings</a>
+            <a class="nav-tab" href="/#/values" data-destination="values">Aircraft values</a>
+          </nav>
+        </section>
+        <section class="nav-group" aria-labelledby="operations-navigation-title">
+          <h2 id="operations-navigation-title">Operations</h2>
+          <nav class="nav-tabs" aria-label="Operations">
+            <a class="nav-tab" href="/#/review" data-destination="review">Review queue</a>
+            <a class="nav-tab" href="/#/catalog" data-destination="catalog">Avionics catalog</a>
+          </nav>
+        </section>
+      </div>
     </aside>
 
     <main class="workspace">
@@ -480,7 +488,7 @@
         </section>
       </section>
 
-      <section class="view-panel" id="aircraft-panel">
+      <section class="view-panel" id="values-panel">
         <section class="data-panel aircraft-panel">
           <div class="aircraft-toolbar">
             <select id="aircraft-manufacturer" aria-label="Aircraft manufacturer">
@@ -538,7 +546,7 @@
         </section>
       </section>
 
-      <section class="view-panel" id="avionics-panel">
+      <section class="view-panel" id="catalog-panel">
         <div class="metrics-row avionics-metrics" aria-label="Avionics catalog summary">
           <div class="metric">
             <span class="metric-label">Catalog entries</span>
@@ -605,19 +613,6 @@
         </section>
       </section>
 
-      <section class="view-panel" id="comparisons-panel">
-        <div class="placeholder-panel">
-          <h2>Comparisons</h2>
-          <p>No comparison runs yet.</p>
-        </div>
-      </section>
-
-      <section class="view-panel" id="rentals-panel">
-        <div class="placeholder-panel">
-          <h2>Rentals</h2>
-          <p>No rental profiles yet.</p>
-        </div>
-      </section>
     </main>
   </div>
 

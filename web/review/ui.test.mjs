@@ -8,6 +8,37 @@ const appJs = readFileSync(new URL("../app.js", import.meta.url), "utf8");
 const avionicsJs = readFileSync(new URL("../avionics.js", import.meta.url), "utf8");
 const reviewJs = readFileSync(new URL("../review.js", import.meta.url), "utf8");
 
+test("keeps listing form reset local instead of creating a duplicate route entry", () => {
+  assert.match(
+    appJs,
+    /elements\.resetForm\.addEventListener\("click", resetListingForm\)/,
+  );
+});
+
+test("organizes four addressable task links without unfinished destinations", () => {
+  assert.match(indexHtml, /id="market-navigation-title">Market analysis<\/h2>/);
+  assert.match(indexHtml, /id="operations-navigation-title">Operations<\/h2>/);
+  for (const [route, destination, label] of [
+    ["listings", "listings", "Listings"],
+    ["values", "values", "Aircraft values"],
+    ["review", "review", "Review queue"],
+    ["catalog", "catalog", "Avionics catalog"],
+  ]) {
+    assert.match(
+      indexHtml,
+      new RegExp(`href="/#/${route}"[^>]*data-destination="${destination}"[^>]*>${label}<\\/a>`),
+    );
+  }
+  assert.doesNotMatch(indexHtml, /comparisons-panel|rentals-panel/);
+  assert.match(indexHtml, /id="values-panel"/);
+  assert.match(indexHtml, /id="catalog-panel"/);
+});
+
+test("uses one application history owner for task and review routing", () => {
+  assert.match(appJs, /createHistoryRouter/);
+  assert.doesNotMatch(reviewJs, /window\.(?:history|location)|popstate|FromLocation/);
+});
+
 test("uses a compact multi-capability dropdown in listing avionics rows", () => {
   assert.match(appJs, /function avionicsTypeDropdown\(values = \[\]\)/);
   assert.match(appJs, /querySelectorAll\('\[name="avionics_types"\]:checked'\)/);
