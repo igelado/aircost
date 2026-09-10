@@ -1470,6 +1470,9 @@ async function reconcileCompletedVerificationRun(run, sequence) {
       force: true,
     });
   }
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   setWorkspaceMessage(
     `${status.label}: ${verificationRunItemDetail(item, status.detail)}`,
     item.status === "failed",

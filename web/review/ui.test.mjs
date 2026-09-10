@@ -815,6 +815,90 @@ test("reloads pipeline only on startup and true collection re-entry", async () =
   assert.deepEqual(resumedRuns, [7, 7]);
 });
 
+test("drops a completed-run message when reopened review ownership changes", async () => {
+  const start = reviewJs.indexOf("async function reconcileCompletedVerificationRun");
+  const end = reviewJs.indexOf("\nasync function loadProductQueue", start);
+  assert.ok(start >= 0 && end > start);
+
+  const run = async ({ supersede }) => {
+    const state = {
+      route: { name: "review", view: "listing", listingId: 41 },
+      routeGeneration: 3,
+      verificationRunRequestSequence: 9,
+      reconciledVerificationRunId: null,
+      queueMode: "listing",
+      activeVerificationRunItemByListing: new Map([[
+        41,
+        { status: "failed", reason: "restage failed" },
+      ]]),
+      reviews: [],
+    };
+    let releaseOpen;
+    const messages = [];
+    const reconcile = Function(
+      "state",
+      "loadPipelineQueue",
+      "loadQueue",
+      "refreshListings",
+      "refreshAvionics",
+      "renderPipelineMetrics",
+      "renderPipelinePlan",
+      "renderVerificationRun",
+      "renderPipelineTable",
+      "renderPipelineSelection",
+      "captureListingRouteOwner",
+      "setQueueMessage",
+      "verificationRunStatusView",
+      "setAutomaticVerificationBusy",
+      "leaveAutomaticallyVerifiedReview",
+      "pipelineRowForListing",
+      "openReview",
+      "listingRouteOwnerIsCurrent",
+      "setWorkspaceMessage",
+      "verificationRunItemDetail",
+      `${reviewJs.slice(start, end)}\nreturn reconcileCompletedVerificationRun;`,
+    )(
+      state,
+      () => Promise.resolve(),
+      () => Promise.resolve(),
+      () => Promise.resolve(),
+      () => Promise.resolve(),
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      () => ({ generation: state.routeGeneration, listingId: state.route.listingId }),
+      () => {},
+      () => ({ label: "Failed", detail: "failed" }),
+      () => {},
+      () => Promise.resolve(),
+      () => ({ hasPendingReview: true }),
+      () => new Promise((resolve) => { releaseOpen = resolve; }),
+      (owner) => owner.generation === state.routeGeneration
+        && owner.listingId === state.route?.listingId,
+      (...message) => messages.push(message),
+      (item) => item.reason,
+    );
+    const pending = reconcile({ id: 7, status: "completed" }, 9);
+    await Promise.resolve();
+    await Promise.resolve();
+    if (supersede) {
+      state.route = { name: "review", view: "listing", listingId: 42 };
+      state.routeGeneration += 1;
+    }
+    releaseOpen();
+    await pending;
+    return messages;
+  };
+
+  assert.deepEqual(await run({ supersede: true }), []);
+  assert.deepEqual(
+    await run({ supersede: false }),
+    [["Failed: restage failed", true]],
+  );
+});
+
 test("review tab selection changes only after accepted navigation", () => {
   const start = reviewJs.indexOf("function navigateReviewArea");
   const end = reviewJs.indexOf("\nfunction handleReviewTabKeydown", start);
