@@ -660,6 +660,7 @@ async function deleteCurrentAvionicsProduct() {
       ? Math.max(1, (state.route.filters?.page || 1) - 1)
       : state.route.filters?.page || 1;
     closeAvionicsDetail(true, { updateRoute: false });
+    state.avionicsDeleting = false;
     await navigate(catalogRouteFromControls({
       page,
     }), { replace: true });

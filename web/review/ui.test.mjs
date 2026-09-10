@@ -67,6 +67,18 @@ test("falls back from absent product detail only through its route owner", () =>
   );
 });
 
+test("releases the catalog deletion guard before canonical route replacement", () => {
+  assert.match(
+    avionicsJs,
+    /const outcome = avionicsDeletionOutcome\(payload, productId\);[\s\S]*?closeAvionicsDetail\(true, \{ updateRoute: false \}\);\s*state\.avionicsDeleting = false;\s*await navigate\(catalogRouteFromControls\(/,
+  );
+  assert.match(
+    avionicsJs,
+    /finally \{\s*state\.avionicsDeleting = false;/,
+    "cleanup remains unconditional when deletion or follow-up refresh fails",
+  );
+});
+
 test("guards review mutations and stale asynchronous completion at the route boundary", () => {
   assert.match(
     reviewJs,
