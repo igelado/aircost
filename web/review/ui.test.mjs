@@ -601,8 +601,13 @@ test("hands catalog deletion cleanup to the exact operation owner", () => {
   );
   assert.match(
     avionicsJs,
-    /closeAvionicsDetail\(true, \{ updateRoute: false \}\);\s*if \(!ownsDeletion\(\)\) \{\s*return;\s*\}\s*state\.avionicsDeleting = false;\s*await navigate\(catalogRouteFromControls\(/,
+    /closeAvionicsDetail\(true, \{ updateRoute: false \}\);\s*if \(!ownsDeletion\(\)\) \{\s*return;\s*\}\s*state\.avionicsDeleting = false;\s*const navigation = navigate\(catalogRouteFromControls\([\s\S]*?const routeOwner = state\.route;\s*await navigation;\s*if \(!ownsDeletion\(\) \|\| !routeActivationIsCurrent\(routeOwner, state\.route\)\) \{\s*return;\s*\}/,
     "the owning delete releases route navigation only after the response is committed",
+  );
+  assert.match(
+    avionicsJs,
+    /await Promise\.allSettled\([\s\S]*?if \(!ownsDeletion\(\) \|\| !routeActivationIsCurrent\(routeOwner, state\.route\)\) \{\s*return;\s*\}\s*const listingIds/,
+    "a later Catalog activation owns the deletion follow-up message",
   );
   assert.match(
     avionicsJs,
@@ -797,6 +802,72 @@ test("guards review mutations and stale asynchronous completion at the route bou
     reviewJs,
     /shouldReconcileResolution\(error\)[\s\S]*?recoverCommittedResolution\(\s*resolvedListingId,\s*`Review decisions were saved, but the response was interrupted\.[\s\S]*?`,\s*routeOwner,\s*\)/,
   );
+});
+
+test("commits post-navigation review messages only for the accepted activation", async () => {
+  const start = reviewJs.indexOf("async function navigateAndCommitReviewRoute");
+  const end = reviewJs.indexOf("\nfunction handleReviewTabKeydown", start);
+  assert.ok(start >= 0 && end > start);
+
+  const state = {
+    route: { name: "review", view: "listing", listingId: 41 },
+    routeGeneration: 1,
+  };
+  const pending = [];
+  const navigate = (route) => {
+    state.route = route;
+    state.routeGeneration += 1;
+    return new Promise((resolve) => pending.push(resolve));
+  };
+  const navigateAndCommit = Function(
+    "state",
+    "navigate",
+    "routeActivationIsCurrent",
+    `${reviewJs.slice(start, end)}\nreturn navigateAndCommitReviewRoute;`,
+  )(
+    state,
+    navigate,
+    (owner, current) => owner === current,
+  );
+  for (const helper of ["automatic verification", "manual resolution"]) {
+    const messages = [];
+    const superseded = navigateAndCommit(
+      { name: "review", view: "listing", listingId: 42 },
+      { replace: true },
+      () => messages.push(`${helper} next listing`),
+    );
+    state.route = { name: "review", view: "listing", listingId: 43 };
+    state.routeGeneration += 1;
+    pending.shift()();
+    assert.equal(await superseded, false);
+    assert.deepEqual(
+      messages,
+      [],
+      `${helper} cannot overwrite a superseding listing activation`,
+    );
+
+    const owned = navigateAndCommit(
+      { name: "review", view: "manual" },
+      { replace: true },
+      () => messages.push(`${helper} queue fallback`),
+    );
+    pending.shift()();
+    assert.equal(await owned, true);
+    assert.deepEqual(messages, [`${helper} queue fallback`]);
+  }
+
+  for (const [name, endMarker] of [
+    ["leaveAutomaticallyVerifiedReview", "\nfunction setAutomaticVerificationBusy"],
+    ["resolveReview", "\nfunction showAspectResolutionError"],
+  ]) {
+    const helperStart = reviewJs.indexOf(`async function ${name}`);
+    const helperEnd = reviewJs.indexOf(endMarker, helperStart);
+    const source = reviewJs.slice(helperStart, helperEnd);
+    assert.ok(helperStart >= 0 && helperEnd > helperStart);
+    assert.match(source, /navigateAndCommitReviewRoute\(\s*reviewListingRoute\(nextId\)/);
+    assert.match(source, /navigateAndCommitReviewRoute\(\s*reviewQueueRoute\("listing"\)/);
+    assert.doesNotMatch(source, /await navigate\(/);
+  }
 });
 
 test("drops stale listing, product-review, and catalog activation continuations", () => {

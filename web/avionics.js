@@ -701,15 +701,23 @@ async function deleteCurrentAvionicsProduct() {
       return;
     }
     state.avionicsDeleting = false;
-    await navigate(catalogRouteFromControls({
+    const navigation = navigate(catalogRouteFromControls({
       page,
     }), { replace: true });
+    if (navigation === false) {
+      return;
+    }
+    const routeOwner = state.route;
+    await navigation;
+    if (!ownsDeletion() || !routeActivationIsCurrent(routeOwner, state.route)) {
+      return;
+    }
     await Promise.allSettled([
       loadAvionicsWorkspace(true),
       Promise.resolve(refreshListings()),
       Promise.resolve(refreshReview()),
     ]);
-    if (!ownsDeletion()) {
+    if (!ownsDeletion() || !routeActivationIsCurrent(routeOwner, state.route)) {
       return;
     }
     const listingIds = outcome.affectedListingIds.length

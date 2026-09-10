@@ -2977,6 +2977,24 @@ function navigateReviewArea(area, { focus = false } = {}) {
   return result;
 }
 
+async function navigateAndCommitReviewRoute(route, options, commit) {
+  const activation = navigate(route, options);
+  if (activation === false) {
+    return false;
+  }
+  const routeOwner = state.route;
+  const routeGeneration = state.routeGeneration;
+  await activation;
+  if (
+    !routeActivationIsCurrent(routeOwner, state.route)
+    || routeGeneration !== state.routeGeneration
+  ) {
+    return false;
+  }
+  commit();
+  return true;
+}
+
 function handleReviewTabKeydown(event, area) {
   const currentIndex = REVIEW_AREAS.indexOf(area);
   let nextIndex = null;
@@ -4555,15 +4573,21 @@ async function leaveAutomaticallyVerifiedReview(
   }
   const nextId = nextAfterResolved(previousQueue, listingId);
   if (nextId !== null) {
-    await navigate(reviewListingRoute(nextId), { replace: true });
-    setWorkspaceMessage(`${label}. Loaded the next pending review.`);
+    await navigateAndCommitReviewRoute(
+      reviewListingRoute(nextId),
+      { replace: true },
+      () => setWorkspaceMessage(`${label}. Loaded the next pending review.`),
+    );
     return;
   }
-  await navigate(reviewQueueRoute("listing"), { replace: true });
-  setQueueMessage(
-    state.total === 0
-      ? `${label}. The review queue is clear.`
-      : `${label}.`,
+  await navigateAndCommitReviewRoute(
+    reviewQueueRoute("listing"),
+    { replace: true },
+    () => setQueueMessage(
+      state.total === 0
+        ? `${label}. The review queue is clear.`
+        : `${label}.`,
+    ),
   );
 }
 
@@ -4694,14 +4718,20 @@ async function resolveReview() {
     state.resolving = false;
     const nextId = nextAfterResolved(previousQueue, resolvedListingId);
     if (nextId !== null) {
-      await navigate(reviewListingRoute(nextId), { replace: true });
-      setWorkspaceMessage(`${outcome.label}. Loaded the next pending review.`);
+      await navigateAndCommitReviewRoute(
+        reviewListingRoute(nextId),
+        { replace: true },
+        () => setWorkspaceMessage(`${outcome.label}. Loaded the next pending review.`),
+      );
     } else {
-      await navigate(reviewQueueRoute("listing"), { replace: true });
-      setQueueMessage(
-        state.total === 0
-          ? `${outcome.label}. The review queue is clear.`
-          : `${outcome.label}.`,
+      await navigateAndCommitReviewRoute(
+        reviewQueueRoute("listing"),
+        { replace: true },
+        () => setQueueMessage(
+          state.total === 0
+            ? `${outcome.label}. The review queue is clear.`
+            : `${outcome.label}.`,
+        ),
       );
     }
   } catch (error) {
@@ -5003,28 +5033,31 @@ async function leaveCompletedOneByOneReview(listingId, outcome, routeOwner) {
   if (!listingRouteOwnerIsCurrent(routeOwner)) {
     return;
   }
-  await navigate(reviewQueueRoute("listing"), { replace: true });
-  const listingReady = outcome?.listing_ready === true;
-  const listingVerified = outcome?.listing_verified === true;
-  const finalizationError = optionalText(outcome?.finalization_error);
-  if (listingReady && listingVerified) {
-    setQueueMessage(
-      state.total === 0
-        ? `Listing ${listingId} is verified and ready. The review queue is clear.`
-        : `Listing ${listingId} is verified and ready.`,
-    );
-    return;
-  }
-  if (nonBlank(finalizationError)) {
-    setQueueMessage(
-      `The final avionics decision for listing ${listingId} was saved, but the listing could not be verified: ${finalizationError}`,
-      true,
-    );
-    return;
-  }
-  setQueueMessage(
-    `The review decisions for listing ${listingId} were saved, but the server did not confirm that the listing is verified and ready.`,
-    true,
+  await navigateAndCommitReviewRoute(
+    reviewQueueRoute("listing"),
+    { replace: true },
+    () => {
+      const listingReady = outcome?.listing_ready === true;
+      const listingVerified = outcome?.listing_verified === true;
+      const finalizationError = optionalText(outcome?.finalization_error);
+      if (listingReady && listingVerified) {
+        setQueueMessage(
+          state.total === 0
+            ? `Listing ${listingId} is verified and ready. The review queue is clear.`
+            : `Listing ${listingId} is verified and ready.`,
+        );
+      } else if (nonBlank(finalizationError)) {
+        setQueueMessage(
+          `The final avionics decision for listing ${listingId} was saved, but the listing could not be verified: ${finalizationError}`,
+          true,
+        );
+      } else {
+        setQueueMessage(
+          `The review decisions for listing ${listingId} were saved, but the server did not confirm that the listing is verified and ready.`,
+          true,
+        );
+      }
+    },
   );
 }
 
@@ -5064,8 +5097,11 @@ async function recoverCommittedResolution(listingId, message, routeOwner) {
   if (!listingRouteOwnerIsCurrent(routeOwner)) {
     return;
   }
-  await navigate(reviewQueueRoute("listing"), { replace: true });
-  setQueueMessage(message, true);
+  await navigateAndCommitReviewRoute(
+    reviewQueueRoute("listing"),
+    { replace: true },
+    () => setQueueMessage(message, true),
+  );
 }
 
 function decisionFromDraft(draft) {
