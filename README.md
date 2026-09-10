@@ -71,6 +71,13 @@ AIRCOST_TEST_POSTGRES_URL=postgres://postgres:aircost@localhost:5432/aircost_tes
 AIRCOST_TEST_POSTGRES_ADMIN_URL=postgres://postgres:aircost@localhost:5432/postgres \
 AIRCOST_TEST_POSTGRES_DATABASE=aircost_test \
 bash -ceu '
+test "$(rustc --version | cut -d " " -f 2)" = "1.98.1"
+test "$(node --version)" = "v24.21.0"
+test "$(psql "$AIRCOST_TEST_POSTGRES_URL" --no-psqlrc -Atc "SHOW server_version_num")" = "170011"
+case "$(psql "$AIRCOST_TEST_POSTGRES_URL" --no-psqlrc -Atc "SHOW server_version")" in
+  17.11*) ;;
+  *) exit 1 ;;
+esac
 cargo fmt --all -- --check
 node --check chrome-extension/background.js
 node --check chrome-extension/popup.js
