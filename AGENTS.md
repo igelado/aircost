@@ -12,6 +12,10 @@ application and administrative tooling are implemented in Rust.
 - `docs/llm_usage.md`: Gemini extraction, grounding, validation, and correction
   rules.
 - `docs/webapp.md`: web app and extension API notes.
+- `docs/maintainability.md`: prioritized maintainability, performance, and web
+  usability improvement register.
+- `docs/improvement-execution-plan.md`: branch ownership, dependency gates, and
+  merge-conflict controls for the improvement program.
 
 Read the relevant docs before changing valuation, schema, ingestion, or LLM
 prompts.

@@ -8,9 +8,10 @@ Use the following work-flow:
  1. Clone the target repository and work only on the cloned code. This is your private copy and
  you MUST never modify any other repository.
  2. Implement all code inside a branch of the repository. The branch name MUST be codex/<functionality>
- 3. Once the implementation is completed, create a Pull Request on the server, and make sure all
- pipelines pass, and the PR is mergeable.
- 4. Once the PR is ready to merge, merge it into main and remove the feature branch
+ 3. Once the implementation is completed, create a Pull Request on the server, make sure all
+ pipelines pass, inspect automated review feedback, and leave the PR mergeable.
+ 4. Report the merge-ready PR to the root integration owner. You MUST NOT merge the PR or delete
+ the feature branch; the root integration owner serializes rebases and merges across agents.
 You MUST adhere to the following coding style:
  1. Try to maximize code reuse by finding existing functionalities and implementing generic
  code you can reuse in multiple places
