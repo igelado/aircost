@@ -222,7 +222,33 @@ export function routeActivationIsCurrent(owner, current) {
 }
 
 export function preserveLiveRouteInput(source, focused) {
-  return source === "replace" && focused;
+  return (source === "replace" || source === "refresh") && focused;
+}
+
+export function listingEditorRouteIsSame(current, next) {
+  const owner = normalizeRoute(current);
+  const candidate = normalizeRoute(next);
+  if (owner.name !== "listings" || candidate.name !== "listings") {
+    return false;
+  }
+  return owner.selected === "new"
+    ? candidate.selected === "new"
+    : owner.listingId !== undefined && candidate.listingId === owner.listingId;
+}
+
+export function reviewProductRouteIsSame(current, next) {
+  const owner = normalizeRoute(current);
+  const candidate = normalizeRoute(next);
+  return owner.name === "review"
+    && owner.view === "products"
+    && owner.productId !== undefined
+    && candidate.name === "review"
+    && candidate.view === "products"
+    && candidate.productId === owner.productId;
+}
+
+export function confirmDirtyRouteChange(dirty, sameOwner, confirmDiscard) {
+  return !dirty || sameOwner || confirmDiscard();
 }
 
 export function reviewProductQueueNeedsLoad(route, hasCachedGroups) {
@@ -289,6 +315,20 @@ export function createHistoryRouter({ location, history, listen, apply, mayNavig
   }
   const navigationAllowed = typeof mayNavigate === "function" ? mayNavigate : () => true;
   let current = null;
+  let currentPosition = null;
+  let suppressedPosition = null;
+
+  function positionFromState(value) {
+    if (value?.aircostRoute === null || typeof value?.aircostRoute !== "object") {
+      return null;
+    }
+    const position = value?.aircostPosition;
+    return Number.isSafeInteger(position) && position >= 0 ? position : null;
+  }
+
+  function routeState(route, position) {
+    return { aircostRoute: route, aircostPosition: position };
+  }
 
   function write(route, mode, source) {
     const next = normalizeRoute(route);
@@ -296,22 +336,45 @@ export function createHistoryRouter({ location, history, listen, apply, mayNavig
       return false;
     }
     const method = mode === "replace" ? "replaceState" : "pushState";
-    history[method]({ aircostRoute: next }, "", formatRoute(next));
+    const nextPosition = mode === "replace" ? currentPosition : currentPosition + 1;
+    history[method](routeState(next, nextPosition), "", formatRoute(next));
     current = next;
+    currentPosition = nextPosition;
     return apply(next, { source });
   }
 
-  function restore() {
+  function restore(event) {
+    const targetPosition = positionFromState(event?.state);
+    if (suppressedPosition !== null && targetPosition === suppressedPosition) {
+      suppressedPosition = null;
+      return true;
+    }
+    suppressedPosition = null;
     const next = parseRoute(location.href);
     if (current !== null && !navigationAllowed(next, current, "popstate")) {
-      history.pushState({ aircostRoute: current }, "", formatRoute(current));
+      if (
+        targetPosition !== null
+        && targetPosition !== currentPosition
+        && typeof history.go === "function"
+      ) {
+        suppressedPosition = currentPosition;
+        history.go(currentPosition - targetPosition);
+      } else {
+        history.replaceState(
+          routeState(current, currentPosition),
+          "",
+          formatRoute(current),
+        );
+      }
       return false;
     }
+    const nextPosition = targetPosition ?? currentPosition;
     const canonicalUrl = formatRoute(next);
     if (`${location.pathname}${location.search}${location.hash}` !== canonicalUrl) {
-      history.replaceState({ aircostRoute: next }, "", canonicalUrl);
+      history.replaceState(routeState(next, nextPosition), "", canonicalUrl);
     }
     current = next;
+    currentPosition = nextPosition;
     apply(next, { source: "popstate" });
     return true;
   }
@@ -320,10 +383,9 @@ export function createHistoryRouter({ location, history, listen, apply, mayNavig
     start() {
       const initial = parseRoute(location.href);
       current = initial;
+      currentPosition = positionFromState(history.state) ?? 0;
       const canonicalUrl = formatRoute(initial);
-      if (`${location.pathname}${location.search}${location.hash}` !== canonicalUrl) {
-        history.replaceState({ aircostRoute: initial }, "", canonicalUrl);
-      }
+      history.replaceState(routeState(initial, currentPosition), "", canonicalUrl);
       listen("popstate", restore);
       apply(initial, { source: "startup" });
       return initial;

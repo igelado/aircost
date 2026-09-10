@@ -4,8 +4,10 @@ import test from "node:test";
 import {
   DESTINATIONS,
   catalogPageFallbackForResult,
+  confirmDirtyRouteChange,
   createHistoryRouter,
   formatRoute,
+  listingEditorRouteIsSame,
   parseRoute,
   preserveLiveRouteInput,
   reviewAreaForRoute,
@@ -15,6 +17,7 @@ import {
   reviewMutationInProgress,
   reviewProductFallbackForResult,
   reviewProductQueueNeedsLoad,
+  reviewProductRouteIsSame,
   routeActivationIsCurrent,
 } from "../routing.mjs";
 
@@ -192,8 +195,9 @@ test("reconciles shared cache before dropping a stale route continuation", async
   assert.equal(routeActivationIsCurrent(currentRoute, currentRoute), true);
 });
 
-test("preserves focused raw input only for its replace activation", () => {
+test("preserves focused raw input only for its owned live activation", () => {
   assert.equal(preserveLiveRouteInput("replace", true), true);
+  assert.equal(preserveLiveRouteInput("refresh", true), true);
   assert.equal(preserveLiveRouteInput("replace", false), false);
   for (const source of ["startup", "push", "popstate", undefined]) {
     assert.equal(
@@ -202,6 +206,84 @@ test("preserves focused raw input only for its replace activation", () => {
       `${source || "missing"} activation remains route-authoritative`,
     );
   }
+});
+
+test("prevents an older asynchronous operation from releasing a newer owner", async () => {
+  const firstOwner = {};
+  const secondOwner = {};
+  let activeOwner = firstOwner;
+  let busy = true;
+  let releaseFirst;
+  const firstCompletion = new Promise((resolve) => {
+    releaseFirst = resolve;
+  }).finally(() => {
+    if (routeActivationIsCurrent(firstOwner, activeOwner)) {
+      activeOwner = null;
+      busy = false;
+    }
+  });
+
+  activeOwner = secondOwner;
+  busy = true;
+  releaseFirst();
+  await firstCompletion;
+
+  assert.equal(activeOwner, secondOwner);
+  assert.equal(busy, true);
+});
+
+test("recognizes only the same listing or product editor route", () => {
+  assert.equal(
+    listingEditorRouteIsSame(parseRoute("/#/listings/new"), parseRoute("/#/listings/new")),
+    true,
+  );
+  assert.equal(
+    listingEditorRouteIsSame(parseRoute("/#/listings/42"), parseRoute("/#/listings/42")),
+    true,
+  );
+  assert.equal(
+    listingEditorRouteIsSame(parseRoute("/#/listings/42"), parseRoute("/#/listings/43")),
+    false,
+  );
+  assert.equal(
+    listingEditorRouteIsSame(parseRoute("/#/listings/new"), parseRoute("/#/listings")),
+    false,
+  );
+  assert.equal(
+    reviewProductRouteIsSame(
+      parseRoute("/#/review/products/28"),
+      parseRoute("/#/review/products/28"),
+    ),
+    true,
+  );
+  assert.equal(
+    reviewProductRouteIsSame(
+      parseRoute("/#/review/products/28"),
+      parseRoute("/#/review/products/29"),
+    ),
+    false,
+  );
+  assert.equal(
+    reviewProductRouteIsSame(
+      parseRoute("/#/review/products/28"),
+      parseRoute("/#/review/products"),
+    ),
+    false,
+  );
+});
+
+test("confirms only dirty departures and leaves rejected state owned", () => {
+  let confirmations = 0;
+  const confirmDiscard = () => {
+    confirmations += 1;
+    return false;
+  };
+  assert.equal(confirmDirtyRouteChange(false, false, confirmDiscard), true);
+  assert.equal(confirmDirtyRouteChange(true, true, confirmDiscard), true);
+  assert.equal(confirmations, 0);
+  assert.equal(confirmDirtyRouteChange(true, false, confirmDiscard), false);
+  assert.equal(confirmations, 1);
+  assert.equal(confirmDirtyRouteChange(true, false, () => true), true);
 });
 
 test("keeps raw input through replace but restores route text through browser history", () => {
@@ -334,35 +416,8 @@ test("clamps catalog pages from authoritative result bounds without losing detai
 test("restores complete route snapshots through Back and Forward without recursive writes", () => {
   const listeners = new Map();
   const applied = [];
-  const entries = ["/#/listings?manufacturer=Cessna"];
-  let index = 0;
   const location = fakeLocation();
-  setLocation(location, entries[index]);
-  const history = {
-    pushCount: 0,
-    replaceCount: 0,
-    pushState(_state, _title, url) {
-      this.pushCount += 1;
-      entries.splice(index + 1, entries.length, url);
-      index += 1;
-      setLocation(location, url);
-    },
-    replaceState(_state, _title, url) {
-      this.replaceCount += 1;
-      entries[index] = url;
-      setLocation(location, url);
-    },
-    back() {
-      index -= 1;
-      setLocation(location, entries[index]);
-      listeners.get("popstate")();
-    },
-    forward() {
-      index += 1;
-      setLocation(location, entries[index]);
-      listeners.get("popstate")();
-    },
-  };
+  const history = trackedHistory(location, listeners, "/#/listings?manufacturer=Cessna");
   const router = createHistoryRouter({
     location,
     history,
@@ -396,37 +451,104 @@ test("restores complete route snapshots through Back and Forward without recursi
     { url: "/#/review/listings/42?area=avionics", source: "popstate" },
   ]);
   assert.equal(history.pushCount, 4);
-  assert.equal(history.replaceCount, 0);
+  assert.equal(history.replaceCount, 1, "startup tags the current entry");
 });
 
-test("repairs a cancelled popstate without applying the rejected route", () => {
+test("repairs rejected Back and Forward without changing the history stack", () => {
   const listeners = new Map();
   const applied = [];
   const location = fakeLocation();
-  setLocation(location, "/#/review/listings/42?area=aircraft");
-  const pushed = [];
-  const history = {
-    pushState(_state, _title, url) {
-      pushed.push(url);
-      setLocation(location, url);
-    },
-    replaceState() {},
-  };
+  const history = trackedHistory(location, listeners, "/#/listings");
+  let mutationActive = false;
   const router = createHistoryRouter({
     location,
     history,
     listen: (name, listener) => listeners.set(name, listener),
     apply: (route) => applied.push(formatRoute(route)),
-    mayNavigate: (next, _current, source) => (
-      source !== "popstate" || next.name === "review"
-    ),
+    mayNavigate: (_next, _current, source) => source !== "popstate" || !mutationActive,
   });
   router.start();
-  setLocation(location, "/#/catalog");
-  listeners.get("popstate")();
+  router.navigate(parseRoute("/#/review/manual"));
+  router.navigate(parseRoute("/#/catalog"));
+  const originalStack = history.urls();
 
-  assert.deepEqual(applied, ["/#/review/listings/42?area=aircraft"]);
-  assert.deepEqual(pushed, ["/#/review/listings/42?area=aircraft"]);
+  mutationActive = true;
+  history.back();
+  assert.equal(location.hash, "#/catalog");
+  assert.deepEqual(history.urls(), originalStack);
+  assert.deepEqual(applied, ["/#/listings", "/#/review/manual", "/#/catalog"]);
+
+  mutationActive = false;
+  history.back();
+  assert.equal(location.hash, "#/review/manual");
+
+  mutationActive = true;
+  history.forward();
+  assert.equal(location.hash, "#/review/manual");
+  assert.deepEqual(history.urls(), originalStack);
+
+  mutationActive = false;
+  history.forward();
+  assert.equal(location.hash, "#/catalog");
+  assert.deepEqual(applied, [
+    "/#/listings",
+    "/#/review/manual",
+    "/#/catalog",
+    "/#/review/manual",
+    "/#/catalog",
+  ]);
+  assert.equal(history.pushCount, 2);
+});
+
+test("replace keeps position and Back then push forms a contiguous active stack", () => {
+  const listeners = new Map();
+  const location = fakeLocation();
+  const history = trackedHistory(location, listeners, "/#/listings");
+  const router = createHistoryRouter({
+    location,
+    history,
+    listen: (name, listener) => listeners.set(name, listener),
+    apply: () => {},
+  });
+  router.start();
+  router.navigate(parseRoute("/#/review/manual"));
+  router.navigate(parseRoute("/#/catalog"));
+  const catalogPosition = history.state.aircostPosition;
+  router.navigate(parseRoute("/#/catalog?search=Garmin"), { replace: true });
+  assert.equal(history.state.aircostPosition, catalogPosition);
+
+  history.back();
+  router.navigate(parseRoute("/#/values"));
+  assert.deepEqual(history.urls(), ["/#/listings", "/#/review/manual", "/#/values"]);
+  assert.equal(history.state.aircostPosition, 2);
+  history.back();
+  assert.equal(location.hash, "#/review/manual");
+  assert.equal(history.state.aircostPosition, 1);
+});
+
+test("restores an unowned rejected popstate without applying or pushing", () => {
+  const listeners = new Map();
+  const location = fakeLocation();
+  const applied = [];
+  const history = trackedHistory(location, listeners, "/#/review/manual");
+  const router = createHistoryRouter({
+    location,
+    history,
+    listen: (name, listener) => listeners.set(name, listener),
+    apply: (route) => applied.push(formatRoute(route)),
+    mayNavigate: () => false,
+  });
+  router.start();
+  const pushes = history.pushCount;
+  const replacements = history.replaceCount;
+  setLocation(location, "/#/catalog");
+  listeners.get("popstate")({ state: { aircostPosition: 0, foreignRoute: true } });
+
+  assert.equal(history.pushCount, pushes);
+  assert.equal(history.replaceCount, replacements + 1);
+  assert.equal(location.hash, "#/review/manual");
+  assert.equal(formatRoute(router.current()), "/#/review/manual");
+  assert.deepEqual(applied, ["/#/review/manual"]);
 });
 
 test("canonicalizes malformed URLs reached through browser history", () => {
@@ -452,11 +574,50 @@ test("canonicalizes malformed URLs reached through browser history", () => {
   listeners.get("popstate")();
 
   assert.equal(location.hash, "#/values");
-  assert.deepEqual(replaced, ["/#/values"]);
+  assert.deepEqual(replaced, ["/#/listings", "/#/values"]);
 });
 
 function fakeLocation() {
   return { href: "", pathname: "/", search: "", hash: "" };
+}
+
+function trackedHistory(location, listeners, initialUrl) {
+  const entries = [{ state: null, url: initialUrl }];
+  let index = 0;
+  setLocation(location, initialUrl);
+  return {
+    state: null,
+    pushCount: 0,
+    replaceCount: 0,
+    pushState(state, _title, url) {
+      this.pushCount += 1;
+      entries.splice(index + 1, entries.length, { state, url });
+      index += 1;
+      this.state = state;
+      setLocation(location, url);
+    },
+    replaceState(state, _title, url) {
+      this.replaceCount += 1;
+      entries[index] = { state, url };
+      this.state = state;
+      setLocation(location, url);
+    },
+    go(delta) {
+      index += delta;
+      this.state = entries[index].state;
+      setLocation(location, entries[index].url);
+      listeners.get("popstate")({ state: this.state });
+    },
+    back() {
+      this.go(-1);
+    },
+    forward() {
+      this.go(1);
+    },
+    urls() {
+      return entries.map((entry) => entry.url);
+    },
+  };
 }
 
 function setLocation(location, value) {

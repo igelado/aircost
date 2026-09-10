@@ -13,6 +13,13 @@ test("keeps listing form reset local instead of creating a duplicate route entry
     appJs,
     /elements\.resetForm\.addEventListener\("click", resetListingForm\)/,
   );
+  const guardStart = appJs.indexOf("function confirmListingRouteChange");
+  const guardEnd = appJs.indexOf("\nfunction markListingDraftDirty", guardStart);
+  assert.doesNotMatch(
+    appJs.slice(guardStart, guardEnd),
+    /listingDraftDirty = false/,
+    "checking one guard must not consume state before later guards accept",
+  );
 });
 
 test("organizes four addressable task links without unfinished destinations", () => {
@@ -39,7 +46,7 @@ test("uses one application history owner for task and review routing", () => {
   assert.doesNotMatch(reviewJs, /window\.(?:history|location)|popstate|FromLocation/);
 });
 
-test("keeps live search text only for focused replace activations", () => {
+test("keeps live search text only for focused owned refresh activations", () => {
   assert.match(appJs, /function applyAppRoute\(route, context = \{\}\)/);
   assert.match(
     appJs,
@@ -49,10 +56,59 @@ test("keeps live search text only for focused replace activations", () => {
     reviewJs,
     /preserveLiveRouteInput\(\s*source,\s*document\.activeElement === elements\.reviewPipelineSearch,/,
   );
+  const guardStart = reviewJs.indexOf("    confirmRouteChange(next) {");
+  const guardEnd = reviewJs.indexOf("\n    },", guardStart);
+  assert.doesNotMatch(
+    reviewJs.slice(guardStart, guardEnd),
+    /resetProductDraftDirty/,
+    "checking one guard must not consume state before later guards accept",
+  );
   assert.match(
     avionicsJs,
     /preserveLiveRouteInput\(\s*source,\s*document\.activeElement === elements\.avionicsSearch,/,
   );
+});
+
+test("guards dirty listing editors before closing or changing their route", () => {
+  assert.match(
+    appJs,
+    /mayNavigate: \(next, current\) => \(\s*confirmListingRouteChange\(next, current\)/,
+  );
+  assert.match(
+    appJs,
+    /elements\.listingForm\.addEventListener\("input", markListingDraftDirty\);\s*elements\.listingForm\.addEventListener\("change", markListingDraftDirty\);/,
+  );
+  assert.match(
+    appJs,
+    /function confirmListingRouteChange\(next, current\) \{[\s\S]*?listingEditorRouteIsSame\(current, next\)[\s\S]*?Discard the unsaved listing changes\?/,
+  );
+  assert.match(
+    appJs,
+    /function closeListingDialog\(\{ navigate = true \} = \{\}\) \{[\s\S]*?return navigateRoute\([\s\S]*?if \(elements\.listingDialog\.open\) \{\s*elements\.listingDialog\.close\(\);/,
+    "a rejected route change must return before the dialog is closed",
+  );
+  assert.match(appJs, /function editListing\([\s\S]*?state\.listingDraftDirty = false;/);
+  assert.match(appJs, /function resetListingForm\([\s\S]*?state\.listingDraftDirty = false;/);
+});
+
+test("guards real product drafts while preserving same-product activations", () => {
+  assert.match(
+    reviewJs,
+    /const sameProduct = reviewProductRouteIsSame\(state\.route, next\);[\s\S]*?Discard the unsaved product review changes\?/,
+  );
+  assert.match(
+    reviewJs,
+    /reviewProductAttestationForm\.addEventListener\(\s*"input",\s*markProductAttestationDirty,/,
+  );
+  assert.match(reviewJs, /scope\.addEventListener\("change", \(\) => \{[\s\S]*?markProductStructureDirty\(\);/);
+  assert.match(reviewJs, /quantity\.addEventListener\("input", \(\) => \{[\s\S]*?markProductStructureDirty\(\);/);
+  assert.match(
+    reviewJs,
+    /if \(state\.selectedProduct\?\.id === route\.productId\) \{\s*return \{ status: "loaded" \};/,
+    "a same-product activation must not reload and discard its drafts",
+  );
+  assert.match(reviewJs, /state\.productStructureDirty = false;\s*renderSelectedProduct\(\);/);
+  assert.match(reviewJs, /state\.selectedProduct\.attestationStatus = "current";\s*state\.productAttestationDirty = false;/);
 });
 
 test("falls back from absent product detail only through its route owner", () => {
@@ -81,15 +137,43 @@ test("canonicalizes catalog result pages before continuing detail activation", (
   );
 });
 
-test("releases the catalog deletion guard before canonical route replacement", () => {
+test("hands catalog deletion cleanup to the exact operation owner", () => {
   assert.match(
     avionicsJs,
-    /const outcome = avionicsDeletionOutcome\(payload, productId\);[\s\S]*?closeAvionicsDetail\(true, \{ updateRoute: false \}\);\s*state\.avionicsDeleting = false;\s*await navigate\(catalogRouteFromControls\(/,
+    /const deletionOwner = \{ productId \};[\s\S]*?state\.avionicsDeletionOwner = deletionOwner;\s*state\.avionicsDeleting = true;/,
   );
   assert.match(
     avionicsJs,
-    /finally \{\s*state\.avionicsDeleting = false;/,
-    "cleanup remains unconditional when deletion or follow-up refresh fails",
+    /closeAvionicsDetail\(true, \{ updateRoute: false \}\);\s*if \(!ownsDeletion\(\)\) \{\s*return;\s*\}\s*state\.avionicsDeleting = false;\s*await navigate\(catalogRouteFromControls\(/,
+    "the owning delete releases route navigation only after the response is committed",
+  );
+  assert.match(
+    avionicsJs,
+    /finally \{\s*if \(ownsDeletion\(\)\) \{\s*state\.avionicsDeletionOwner = null;\s*state\.avionicsDeleting = false;/,
+    "an older finally block cannot clear a newer delete operation",
+  );
+});
+
+test("preserves focused listing search text during its own asynchronous refresh", () => {
+  assert.match(
+    appJs,
+    /const routeOwner = appRouter\.current\(\);[\s\S]*?const route = appRouter\.current\(\);\s*if \(route\?\.name === "listings"\) \{\s*const context = routeActivationIsCurrent\(routeOwner, route\)\s*\? \{ source: "refresh" \}/,
+  );
+});
+
+test("keeps usable listing cache state across a failed refresh", () => {
+  const start = appJs.indexOf("async function loadListings()");
+  const end = appJs.indexOf("\nasync function loadAircraftOptions()", start);
+  assert.ok(start >= 0 && end > start);
+  const loader = appJs.slice(start, end);
+  assert.match(loader, /state\.listingsLoaded = true;/);
+  assert.doesNotMatch(loader, /catch \(error\) \{\s*state\.listingsLoaded = false;/);
+});
+
+test("reloads the manual review collection on every route re-entry", () => {
+  assert.match(
+    reviewJs,
+    /if \(route\.view === "manual"\) \{\s*setQueueMode\("listing", \{ load: false \}\);\s*const queueLoad = loadQueue\(\{\s*commitGuard: \(\) => routeActivationIsCurrent\(route, state\.route\),/,
   );
 });
 
@@ -134,11 +218,11 @@ test("drops stale listing, product-review, and catalog activation continuations"
   );
   assert.match(
     appJs,
-    /const response = await api\([\s\S]*?state\.listings = reconcileSavedListingCache\(state\.listings, response\?\.listing\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await loadListings\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await refreshAircraftAfterEstimateResponse\(response\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*navigateRoute\(/,
+    /const response = await api\([\s\S]*?state\.listings = reconcileSavedListingCache\(state\.listings, response\?\.listing\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*state\.listingDraftDirty = false;\s*await loadListings\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await refreshAircraftAfterEstimateResponse\(response\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*navigateRoute\(/,
   );
   assert.match(
     appJs,
-    /await api\(`\/api\/listings\/\$\{listing\.id\}`[\s\S]*?state\.listings = reconcileDeletedListingCache\(state\.listings, listing\.id\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await loadListings\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await loadAircraftOptions\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*navigateRoute\(/,
+    /await api\(`\/api\/listings\/\$\{listing\.id\}`[\s\S]*?state\.listings = reconcileDeletedListingCache\(state\.listings, listing\.id\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*state\.listingDraftDirty = false;\s*await loadListings\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await loadAircraftOptions\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*navigateRoute\(/,
   );
   assert.match(
     reviewJs,

@@ -2,8 +2,10 @@ import { initializeAvionicsInspector } from "/avionics.js";
 import { initializeReviewWorkspace } from "/review.js";
 import {
   catalogPageFallbackForResult,
+  confirmDirtyRouteChange,
   createHistoryRouter,
   destinationForRoute,
+  listingEditorRouteIsSame,
   parseRoute,
   preserveLiveRouteInput,
   routeActivationIsCurrent,
@@ -50,6 +52,7 @@ const state = {
   aircraftOptions: [],
   aircraftDetail: null,
   editingListingId: null,
+  listingDraftDirty: false,
   valuationStatus: null,
 };
 
@@ -92,8 +95,9 @@ document.addEventListener("DOMContentLoaded", () => {
     history: window.history,
     listen: (name, listener) => window.addEventListener(name, listener),
     apply: applyAppRoute,
-    mayNavigate: (next) => (
-      reviewWorkspace.confirmRouteChange(next)
+    mayNavigate: (next, current) => (
+      confirmListingRouteChange(next, current)
+      && reviewWorkspace.confirmRouteChange(next)
       && avionicsInspector.confirmRouteChange(next)
     ),
   });
@@ -226,6 +230,8 @@ function bindEvents() {
   });
   elements.resetForm.addEventListener("click", resetListingForm);
   elements.closeListingDialog.addEventListener("click", closeListingDialog);
+  elements.listingForm.addEventListener("input", markListingDraftDirty);
+  elements.listingForm.addEventListener("change", markListingDraftDirty);
   elements.listingDialog.addEventListener("cancel", (event) => {
     event.preventDefault();
     closeListingDialog();
@@ -269,7 +275,10 @@ function bindEvents() {
     });
   }
   elements.clearFilters.addEventListener("click", clearFilters);
-  elements.addAvionics.addEventListener("click", () => addAvionicsRow());
+  elements.addAvionics.addEventListener("click", () => {
+    addAvionicsRow();
+    markListingDraftDirty();
+  });
   elements.listingForm.addEventListener("submit", saveListing);
   elements.deleteListing.addEventListener("click", deleteCurrentListing);
   elements.listingTableBody.addEventListener("click", handleTableClick);
@@ -327,6 +336,22 @@ function applyAppRoute(route, context = {}) {
 
 function navigateRoute(route, { replace = false } = {}) {
   return appRouter.navigate(route, { replace });
+}
+
+function confirmListingRouteChange(next, current) {
+  const sameEditor = listingEditorRouteIsSame(current, next);
+  if (!confirmDirtyRouteChange(
+    state.listingDraftDirty,
+    sameEditor,
+    () => window.confirm("Discard the unsaved listing changes?"),
+  )) {
+    return false;
+  }
+  return true;
+}
+
+function markListingDraftDirty() {
+  state.listingDraftDirty = true;
 }
 
 function applyListingsRoute(route, context = {}) {
@@ -457,6 +482,7 @@ async function loadCurrentUser() {
 }
 
 async function loadListings() {
+  const routeOwner = appRouter.current();
   setListMessage("Loading listings...");
   setButtonBusy(elements.refreshListings, true);
   try {
@@ -466,12 +492,14 @@ async function loadListings() {
     populateFilterOptions();
     const route = appRouter.current();
     if (route?.name === "listings") {
-      applyListingsRoute(route);
+      const context = routeActivationIsCurrent(routeOwner, route)
+        ? { source: "refresh" }
+        : {};
+      applyListingsRoute(route, context);
     } else {
       renderListings();
     }
   } catch (error) {
-    state.listingsLoaded = false;
     setListMessage(error.message, true);
   } finally {
     setButtonBusy(elements.refreshListings, false);
@@ -1240,6 +1268,7 @@ function editListing(listing) {
     addAvionicsRow(item);
   }
   setFormMessage("");
+  state.listingDraftDirty = false;
   openListingDialog();
 }
 
@@ -1256,6 +1285,7 @@ function resetListingForm() {
   elements.avionicsList.replaceChildren();
   addAvionicsRow();
   setFormMessage("");
+  state.listingDraftDirty = false;
 }
 
 function openListingDialog() {
@@ -1267,15 +1297,22 @@ function openListingDialog() {
 }
 
 function closeListingDialog({ navigate = true } = {}) {
-  if (elements.listingDialog.open) {
-    elements.listingDialog.close();
-  }
-  if (navigate && appRouter.current()?.name === "listings") {
-    navigateRoute({
+  const route = appRouter.current();
+  if (
+    navigate
+    && route?.name === "listings"
+    && (route.selected === "new" || route.listingId)
+  ) {
+    return navigateRoute({
       name: "listings",
       filters: listingFiltersFromControls(),
     });
   }
+  if (elements.listingDialog.open) {
+    elements.listingDialog.close();
+  }
+  state.listingDraftDirty = false;
+  return true;
 }
 
 async function saveListing(event) {
@@ -1297,6 +1334,7 @@ async function saveListing(event) {
     if (!ownsRoute()) {
       return;
     }
+    state.listingDraftDirty = false;
     await loadListings();
     if (!ownsRoute()) {
       return;
@@ -1348,6 +1386,7 @@ async function deleteListing(listing) {
     if (!ownsRoute()) {
       return;
     }
+    state.listingDraftDirty = false;
     await loadListings();
     if (!ownsRoute()) {
       return;
@@ -1541,6 +1580,7 @@ function removeAvionicsButton(row) {
     if (!elements.avionicsList.children.length) {
       addAvionicsRow();
     }
+    markListingDraftDirty();
   });
   return button;
 }

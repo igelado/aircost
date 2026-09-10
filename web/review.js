@@ -54,6 +54,7 @@ import {
   validateAvionicsObservationCorrection,
 } from "/review/domain.mjs";
 import {
+  confirmDirtyRouteChange,
   preserveLiveRouteInput,
   reviewAreaForRoute,
   reviewListingIdForRoute,
@@ -62,6 +63,7 @@ import {
   reviewMutationInProgress,
   reviewProductFallbackForResult,
   reviewProductQueueNeedsLoad,
+  reviewProductRouteIsSame,
   routeActivationIsCurrent,
 } from "/routing.mjs";
 
@@ -117,6 +119,9 @@ const state = {
   productBusy: false,
   productBusyProductId: null,
   productActionSequence: 0,
+  productAttestationDirty: false,
+  productStructureDirty: false,
+  settingProductDraft: false,
   productStructureSearchTimer: null,
   productStructureSearchSequence: 0,
   detailRequestSequence: 0,
@@ -183,6 +188,14 @@ export function initializeReviewWorkspace(shared) {
       if (activeReviewMutation()) {
         return false;
       }
+      const sameProduct = reviewProductRouteIsSame(state.route, next);
+      if (!confirmDirtyRouteChange(
+        productDraftDirty(),
+        sameProduct,
+        () => window.confirm("Discard the unsaved product review changes?"),
+      )) {
+        return false;
+      }
       const listingId = currentListingId();
       if (
         listingId === null
@@ -235,6 +248,10 @@ function activateReviewRoute(route, { source } = {}) {
         if (!loaded || !routeActivationIsCurrent(route, state.route)) {
           return { status: "superseded" };
         }
+        if (state.selectedProduct?.id === route.productId) {
+          return { status: "loaded" };
+        }
+        closeProductReview();
         const result = await openProductReview(route.productId);
         await replaceAbsentProductRoute(result, route);
         return result;
@@ -244,7 +261,9 @@ function activateReviewRoute(route, { source } = {}) {
   }
   if (route.view === "manual") {
     setQueueMode("listing", { load: false });
-    const queueLoad = state.queueLoaded ? Promise.resolve() : loadQueue();
+    const queueLoad = loadQueue({
+      commitGuard: () => routeActivationIsCurrent(route, state.route),
+    });
     return Promise.allSettled([queueLoad]);
   }
 
@@ -449,6 +468,10 @@ function bindEvents() {
   elements.reviewProductAttestationForm.addEventListener(
     "submit",
     attestSelectedProduct,
+  );
+  elements.reviewProductAttestationForm.addEventListener(
+    "input",
+    markProductAttestationDirty,
   );
   elements.reviewProductValidate.addEventListener(
     "click",
@@ -1651,7 +1674,8 @@ async function openProductReview(productId) {
     };
     elements.reviewProductStructureMessage.textContent = "";
     state.productAssociations = detail.associations;
-    renderSelectedProduct();
+    renderSelectedProduct({ populateAttestation: true });
+    resetProductDraftDirty();
     return { status: "loaded" };
   } catch (error) {
     if (!productDetailRequestMayCommit(productId, sequence, state)) {
@@ -1661,6 +1685,7 @@ async function openProductReview(productId) {
       if (state.selectedProduct?.id === productId) {
         state.selectedProduct = null;
         state.productAssociations = [];
+        resetProductDraftDirty();
       }
       elements.reviewProductWorkspace.classList.add("is-hidden");
       elements.reviewProductActionMessage.textContent = "";
@@ -1694,11 +1719,12 @@ function closeProductReview() {
   state.productDetailRequestSequence += 1;
   state.selectedProduct = null;
   state.productAssociations = [];
+  resetProductDraftDirty();
   elements.reviewProductWorkspace.classList.add("is-hidden");
   elements.reviewProductActionMessage.textContent = "";
 }
 
-function renderSelectedProduct() {
+function renderSelectedProduct({ populateAttestation = false } = {}) {
   const selected = state.selectedProduct;
   if (!selected) {
     elements.reviewProductWorkspace.classList.add("is-hidden");
@@ -1747,19 +1773,45 @@ function renderSelectedProduct() {
   elements.reviewProductRecover.disabled = !current
     || summary.needsSourceRecovery === 0
     || state.productBusy;
-  if (!current) {
+  if (!current && populateAttestation) {
     const form = elements.reviewProductAttestationForm.elements;
     const draft = productAttestationDraft(product);
-    form.namedItem("identity_source_url").value = draft.sourceUrl;
-    form.namedItem("identity_source_title").value = draft.sourceTitle;
-    form.namedItem("identity_evidence_text").value = draft.evidenceText;
-    form.namedItem("identity_source_title").dispatchEvent(new Event("input"));
-    form.namedItem("identity_evidence_text").dispatchEvent(new Event("input"));
+    state.settingProductDraft = true;
+    try {
+      form.namedItem("identity_source_url").value = draft.sourceUrl;
+      form.namedItem("identity_source_title").value = draft.sourceTitle;
+      form.namedItem("identity_evidence_text").value = draft.evidenceText;
+      form.namedItem("identity_source_title").dispatchEvent(new Event("input"));
+      form.namedItem("identity_evidence_text").dispatchEvent(new Event("input"));
+    } finally {
+      state.settingProductDraft = false;
+    }
   }
   renderProductAssociationRows();
   elements.reviewProductActionMessage.textContent = current
     ? productAssociationActionSummary(summary)
     : "This OEM source is needed only for automated bulk validation. Reviewers can still approve each listing association directly from its avionics card.";
+}
+
+function productDraftDirty() {
+  return state.productAttestationDirty || state.productStructureDirty;
+}
+
+function resetProductDraftDirty() {
+  state.productAttestationDirty = false;
+  state.productStructureDirty = false;
+}
+
+function markProductAttestationDirty() {
+  if (!state.settingProductDraft && state.selectedProduct !== null) {
+    state.productAttestationDirty = true;
+  }
+}
+
+function markProductStructureDirty() {
+  if (state.selectedProduct !== null) {
+    state.productStructureDirty = true;
+  }
 }
 
 function productStructureDraft(product) {
@@ -1837,6 +1889,7 @@ function renderExistingProductStructureEditor() {
   scope.disabled = state.productBusy;
   scope.addEventListener("change", () => {
     draft.valuationScope = scope.value;
+    markProductStructureDirty();
     elements.reviewProductStructureMessage.textContent = "";
     renderExistingProductStructureEditor();
   });
@@ -1913,6 +1966,7 @@ function existingProductStructureComponent(component, selected, draft) {
   quantity.disabled = state.productBusy;
   quantity.addEventListener("input", () => {
     component.quantity = Number.parseInt(quantity.value, 10);
+    markProductStructureDirty();
     const validation = productStructureValidation(selected, draft);
     elements.reviewProductStructureMessage.textContent = validation.message;
   });
@@ -1926,6 +1980,7 @@ function existingProductStructureComponent(component, selected, draft) {
     draft.suiteComponents = draft.suiteComponents.filter(
       (candidate) => candidate.avionicsModelId !== component.avionicsModelId,
     );
+    markProductStructureDirty();
     elements.reviewProductStructureMessage.textContent = `${component.displayName} removed from the draft component set.`;
     renderExistingProductStructureEditor();
   });
@@ -2003,6 +2058,7 @@ async function searchExistingProductStructureComponents(query, sequence, results
         valuationScope: product.valuationScope,
         quantity: 1,
       });
+      markProductStructureDirty();
       elements.reviewProductStructureMessage.textContent = `${product.displayName} added to the draft component set.`;
       renderExistingProductStructureEditor();
     })));
@@ -2066,6 +2122,7 @@ async function saveExistingProductStructure(event) {
     };
     selected.catalogRevision = catalogRevision;
     selected.structureDraft = productStructureDraft(selected.product);
+    state.productStructureDirty = false;
     renderSelectedProduct();
     elements.reviewProductStructureMessage.textContent =
       `Saved ${productKindLabel(normalizedProduct(selected.product))} structure for catalog product ${selected.id}.`;
@@ -2201,6 +2258,7 @@ async function attestSelectedProduct(event) {
       return;
     }
     state.selectedProduct.attestationStatus = "current";
+    state.productAttestationDirty = false;
     elements.reviewProductActionMessage.textContent = result?.reused
       ? "The reusable product source was already current; no source fetch was needed."
       : "Reusable product source verified from the guarded manufacturer source without Gemini.";
@@ -2491,8 +2549,12 @@ function setProductBusy(busy) {
   renderProductQueue();
 }
 
-async function loadQueue({ quiet = false } = {}) {
+async function loadQueue({ quiet = false, commitGuard = null } = {}) {
   const sequence = ++state.queueRequestSequence;
+  const mayCommit = () => (
+    sequence === state.queueRequestSequence
+    && (commitGuard === null || commitGuard())
+  );
   if (!quiet) {
     setQueueMessage("Loading review queue…");
   }
@@ -2500,7 +2562,7 @@ async function loadQueue({ quiet = false } = {}) {
   setButtonBusy(elements.refreshReviews, true);
   try {
     const payload = await api(`/api/review/listings?limit=${QUEUE_LIMIT}&offset=0`);
-    if (sequence !== state.queueRequestSequence) {
+    if (!mayCommit()) {
       return false;
     }
     const reviews = Array.isArray(payload?.reviews) ? payload.reviews.slice() : [];
@@ -2509,7 +2571,7 @@ async function loadQueue({ quiet = false } = {}) {
       const page = await api(
         `/api/review/listings?limit=${QUEUE_LIMIT}&offset=${reviews.length}`,
       );
-      if (sequence !== state.queueRequestSequence) {
+      if (!mayCommit()) {
         return false;
       }
       const items = Array.isArray(page?.reviews) ? page.reviews : [];
@@ -2539,12 +2601,12 @@ async function loadQueue({ quiet = false } = {}) {
     }
     return true;
   } catch (error) {
-    if (sequence === state.queueRequestSequence) {
+    if (mayCommit()) {
       setQueueMessage(`Could not load review queue: ${error.message}`, true);
     }
     return false;
   } finally {
-    if (sequence === state.queueRequestSequence) {
+    if (mayCommit()) {
       elements.reviewResults.setAttribute("aria-busy", "false");
       setButtonBusy(elements.refreshReviews, false);
     }

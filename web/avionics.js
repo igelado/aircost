@@ -26,6 +26,7 @@ const state = {
   avionicsDetailTrigger: null,
   avionicsDetail: null,
   avionicsDeleting: false,
+  avionicsDeletionOwner: null,
   catalogRouteKey: null,
   route: { name: "catalog", filters: { page: 1 } },
 };
@@ -224,6 +225,9 @@ function bindEvents() {
     closeAvionicsDetail();
   });
   elements.avionicsDetailDialog.addEventListener("close", () => {
+    if (elements.avionicsDetailDialog.open) {
+      return;
+    }
     state.avionicsDetailRequestSequence += 1;
     state.avionicsDetail = null;
     state.avionicsDeleting = false;
@@ -664,6 +668,12 @@ async function deleteCurrentAvionicsProduct() {
     return;
   }
 
+  const deletionOwner = { productId };
+  const ownsDeletion = () => routeActivationIsCurrent(
+    deletionOwner,
+    state.avionicsDeletionOwner,
+  );
+  state.avionicsDeletionOwner = deletionOwner;
   state.avionicsDeleting = true;
   elements.closeAvionicsDetail.disabled = true;
   setButtonBusy(elements.deleteAvionicsProduct, true);
@@ -671,11 +681,17 @@ async function deleteCurrentAvionicsProduct() {
   removeAvionicsDeleteError();
   try {
     const payload = await api(`/api/avionics/${productId}`, { method: "DELETE" });
+    if (!ownsDeletion()) {
+      return;
+    }
     const outcome = avionicsDeletionOutcome(payload, productId);
     const page = state.avionicsItems.length === 1 && state.avionicsOffset > 0
       ? Math.max(1, (state.route.filters?.page || 1) - 1)
       : state.route.filters?.page || 1;
     closeAvionicsDetail(true, { updateRoute: false });
+    if (!ownsDeletion()) {
+      return;
+    }
     state.avionicsDeleting = false;
     await navigate(catalogRouteFromControls({
       page,
@@ -685,6 +701,9 @@ async function deleteCurrentAvionicsProduct() {
       Promise.resolve(refreshListings()),
       Promise.resolve(refreshReview()),
     ]);
+    if (!ownsDeletion()) {
+      return;
+    }
     const listingIds = outcome.affectedListingIds.length
       ? ` Listings: ${outcome.affectedListingIds.join(", ")}.`
       : "";
@@ -692,6 +711,9 @@ async function deleteCurrentAvionicsProduct() {
       `${outcome.productName} deleted. Removed associations from ${outcome.affectedListingCount} ${outcome.affectedListingCount === 1 ? "listing" : "listings"}.${listingIds}`,
     );
   } catch (error) {
+    if (!ownsDeletion()) {
+      return;
+    }
     const message = `Could not delete ${productName}: ${error.message}`;
     elements.avionicsDetailSubtitle.textContent = "Product deletion failed";
     const failure = detailState(message, true);
@@ -699,10 +721,13 @@ async function deleteCurrentAvionicsProduct() {
     elements.avionicsDetailBody.prepend(failure);
     setAvionicsMessage(message, true);
   } finally {
-    state.avionicsDeleting = false;
-    elements.closeAvionicsDetail.disabled = false;
-    setButtonBusy(elements.deleteAvionicsProduct, false);
-    elements.deleteAvionicsProduct.disabled = state.avionicsDetail === null;
+    if (ownsDeletion()) {
+      state.avionicsDeletionOwner = null;
+      state.avionicsDeleting = false;
+      elements.closeAvionicsDetail.disabled = false;
+      setButtonBusy(elements.deleteAvionicsProduct, false);
+      elements.deleteAvionicsProduct.disabled = state.avionicsDetail === null;
+    }
   }
 }
 
