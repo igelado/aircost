@@ -201,6 +201,33 @@ export function reviewAreaForRoute(route, fallback = null) {
     : fallback;
 }
 
+export function reviewMutationInProgress({
+  productBatch = false,
+  resolution = false,
+  aspectSave = false,
+  correctionSave = false,
+  automation = false,
+  associationValidation = false,
+} = {}) {
+  return productBatch
+    || resolution
+    || aspectSave
+    || correctionSave
+    || automation
+    || associationValidation;
+}
+
+export function reviewListingRouteOwner(route, generation) {
+  const listingId = reviewListingIdForRoute(route);
+  return listingId === null ? null : { generation, listingId };
+}
+
+export function reviewListingRouteOwnerIsCurrent(owner, route, generation) {
+  return owner !== null
+    && owner.generation === generation
+    && reviewListingIdForRoute(route) === owner.listingId;
+}
+
 export function createHistoryRouter({ location, history, listen, apply, mayNavigate }) {
   if (!location || !history || typeof listen !== "function" || typeof apply !== "function") {
     throw new Error("The history router requires location, history, listen, and apply.");

@@ -56,6 +56,9 @@ import {
 import {
   reviewAreaForRoute,
   reviewListingIdForRoute,
+  reviewListingRouteOwner,
+  reviewListingRouteOwnerIsCurrent,
+  reviewMutationInProgress,
 } from "/routing.mjs";
 
 const QUEUE_LIMIT = 100;
@@ -123,8 +126,10 @@ const state = {
   stale: false,
   resolving: false,
   savingAspectKey: null,
+  validatingAspectKey: null,
   automating: false,
   automationControlStates: new Map(),
+  routeGeneration: 0,
   route: { name: "review", view: "pipeline", search: "", filter: "all" },
 };
 
@@ -155,6 +160,7 @@ export function initializeReviewWorkspace(shared) {
       return activateReviewRoute(route);
     },
     deactivate() {
+      state.routeGeneration += 1;
       if (state.route?.view === "listing") {
         showQueue({ discardDraft: true, load: false });
       }
@@ -170,6 +176,9 @@ export function initializeReviewWorkspace(shared) {
       return refreshActiveQueue();
     },
     confirmRouteChange(next) {
+      if (activeReviewMutation()) {
+        return false;
+      }
       const listingId = currentListingId();
       if (
         listingId === null
@@ -185,6 +194,7 @@ export function initializeReviewWorkspace(shared) {
 }
 
 function activateReviewRoute(route) {
+  state.routeGeneration += 1;
   state.route = route;
   if (route.view !== "products") {
     closeProductReview();
@@ -235,6 +245,31 @@ function activateReviewRoute(route) {
     ? Promise.resolve()
     : resumeVerificationRun(state.activeVerificationRunId);
   return Promise.allSettled([pipelineLoad, runLoad]);
+}
+
+function activeReviewMutation() {
+  return reviewMutationInProgress({
+    productBatch: state.productBusy,
+    resolution: state.resolving,
+    aspectSave: state.savingAspectKey !== null,
+    correctionSave: Array.from(state.drafts.values()).some(
+      (draft) => draft.correction?.saving === true,
+    ),
+    automation: state.automating,
+    associationValidation: state.validatingAspectKey !== null,
+  });
+}
+
+function captureListingRouteOwner() {
+  return reviewListingRouteOwner(state.route, state.routeGeneration);
+}
+
+function listingRouteOwnerIsCurrent(owner) {
+  return reviewListingRouteOwnerIsCurrent(
+    owner,
+    state.route,
+    state.routeGeneration,
+  );
 }
 
 function collectElements() {
@@ -1304,6 +1339,8 @@ function updateOpenedListingRunProgress(run) {
 }
 
 async function reconcileCompletedVerificationRun(run, sequence) {
+  const routeGeneration = state.routeGeneration;
+  const routeOwner = captureListingRouteOwner();
   await Promise.allSettled([
     loadPipelineQueue({ quiet: true }),
     loadQueue({ quiet: true }),
@@ -1321,7 +1358,16 @@ async function reconcileCompletedVerificationRun(run, sequence) {
   renderVerificationRun();
   renderPipelineTable();
   renderPipelineSelection();
-  const listingId = currentListingId();
+  if (state.routeGeneration !== routeGeneration) {
+    return;
+  }
+  if (routeOwner === null) {
+    setQueueMessage(
+      `Automatic acceptance run #${run.id} ${run.status}. Review the terminal results below.`,
+    );
+    return;
+  }
+  const listingId = routeOwner.listingId;
   const item = state.activeVerificationRunItemByListing.get(listingId);
   if (!item) {
     setQueueMessage(
@@ -1331,7 +1377,13 @@ async function reconcileCompletedVerificationRun(run, sequence) {
   }
   const status = verificationRunStatusView(item.status);
   if (item.status === "verified") {
-    await leaveAutomaticallyVerifiedReview(listingId, state.reviews.slice(), status.label);
+    setAutomaticVerificationBusy(false);
+    await leaveAutomaticallyVerifiedReview(
+      listingId,
+      state.reviews.slice(),
+      status.label,
+      routeOwner,
+    );
     return;
   }
   const refreshedRow = pipelineRowForListing(listingId);
@@ -4255,6 +4307,7 @@ async function rebuildAvionicsReview() {
   )) {
     return;
   }
+  const routeOwner = captureListingRouteOwner();
   setAutomaticVerificationBusy(true);
   setWorkspaceMessage("Rebuilding avionics cards from the retained extraction…");
   try {
@@ -4267,6 +4320,9 @@ async function rebuildAvionicsReview() {
         }),
       },
     );
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     if (payload?.status === "blocked") {
       setWorkspaceMessage(
         `Cards were not changed. ${avionicsRebuildBlockMessage(payload.reason_code)}`,
@@ -4278,10 +4334,12 @@ async function rebuildAvionicsReview() {
       throw new Error("The server returned an invalid avionics rebuild result.");
     }
     if (payload.review_complete === true) {
+      setAutomaticVerificationBusy(false);
       await leaveAutomaticallyVerifiedReview(
         review.listing_id,
         state.reviews.slice(),
         "The rebuilt avionics review is complete",
+        routeOwner,
       );
       return;
     }
@@ -4296,22 +4354,38 @@ async function rebuildAvionicsReview() {
       "Avionics cards were rebuilt locally from the strict retained extraction.",
     );
   } catch (error) {
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     if (isStaleError(error)) {
       markStale(error.message);
     } else {
       setWorkspaceMessage(`Could not rebuild avionics cards: ${error.message}`, true);
     }
   } finally {
-    setAutomaticVerificationBusy(false);
+    if (listingRouteOwnerIsCurrent(routeOwner)) {
+      setAutomaticVerificationBusy(false);
+    }
   }
 }
 
-async function leaveAutomaticallyVerifiedReview(listingId, previousQueue, label) {
+async function leaveAutomaticallyVerifiedReview(
+  listingId,
+  previousQueue,
+  label,
+  routeOwner,
+) {
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
   state.correctionViews.clear();
   const queueRefreshed = await loadQueue({ quiet: true });
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   if (!queueRefreshed) {
     state.reviews = previousQueue.filter(
       (item) => positiveInteger(item?.listing_id) !== listingId,
@@ -4323,6 +4397,9 @@ async function leaveAutomaticallyVerifiedReview(listingId, previousQueue, label)
     Promise.resolve(refreshListings?.()),
     Promise.resolve(refreshAvionics?.()),
   ]);
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   const nextId = nextAfterResolved(previousQueue, listingId);
   if (nextId !== null) {
     await navigate(reviewListingRoute(nextId), { replace: true });
@@ -4420,6 +4497,7 @@ async function resolveReview() {
   };
   const previousQueue = state.reviews.slice();
   const resolvedListingId = review.listing_id;
+  const routeOwner = captureListingRouteOwner();
   state.resolving = true;
   updateProgress();
   setWorkspaceMessage("Saving the manual review and completing final enrichment…");
@@ -4429,6 +4507,9 @@ async function resolveReview() {
       method: "POST",
       body: JSON.stringify(request),
     });
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     const outcome = describeResolvedListingOutcome(payload, resolvedListingId);
     if (!outcome.terminal) {
       throw new Error(outcome.detail);
@@ -4438,6 +4519,9 @@ async function resolveReview() {
     state.aspectViews.clear();
     state.correctionViews.clear();
     const queueRefreshed = await loadQueue({ quiet: true });
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     if (!queueRefreshed) {
       state.reviews = previousQueue.filter(
         (item) => positiveInteger(item?.listing_id) !== resolvedListingId,
@@ -4449,6 +4533,10 @@ async function resolveReview() {
       Promise.resolve(refreshListings?.()),
       Promise.resolve(refreshAvionics?.()),
     ]);
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
+    state.resolving = false;
     const nextId = nextAfterResolved(previousQueue, resolvedListingId);
     if (nextId !== null) {
       await navigate(reviewListingRoute(nextId), { replace: true });
@@ -4462,12 +4550,18 @@ async function resolveReview() {
       );
     }
   } catch (error) {
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     if (isAvionicsCatalogConsolidated(error)) {
       state.resolving = false;
       await Promise.allSettled([
         loadQueue({ quiet: true }),
         Promise.resolve(refreshAvionics?.()),
       ]);
+      if (!listingRouteOwnerIsCurrent(routeOwner)) {
+        return;
+      }
       await openReview(resolvedListingId, {
         discardDraft: true,
         force: true,
@@ -4483,16 +4577,23 @@ async function resolveReview() {
     } else if (isStaleError(error)) {
       markStale(error.message);
     } else if (isFinalizationError(error)) {
+      state.resolving = false;
       await recoverCommittedResolution(
         resolvedListingId,
         `Review decisions were saved, but listing ${resolvedListingId} was quarantined during final enrichment: ${error.message}`,
+        routeOwner,
       );
     } else if (shouldReconcileResolution(error)) {
       const stillPending = await pendingReviewStatus(resolvedListingId);
+      if (!listingRouteOwnerIsCurrent(routeOwner)) {
+        return;
+      }
       if (stillPending === false) {
+        state.resolving = false;
         await recoverCommittedResolution(
           resolvedListingId,
           `Review decisions were saved, but the response was interrupted. Inspect listing ${resolvedListingId} to confirm its final enrichment state.`,
+          routeOwner,
         );
       } else {
         showAspectResolutionError(error);
@@ -4501,10 +4602,12 @@ async function resolveReview() {
       showAspectResolutionError(error);
     }
   } finally {
-    state.resolving = false;
-    setButtonBusy(elements.verifyListing, false);
-    syncAllAspectViews();
-    updateProgress();
+    if (listingRouteOwnerIsCurrent(routeOwner)) {
+      state.resolving = false;
+      setButtonBusy(elements.verifyListing, false);
+      syncAllAspectViews();
+      updateProgress();
+    }
   }
 }
 
@@ -4560,6 +4663,7 @@ async function saveIndividualAspectDecision(key) {
     return;
   }
 
+  const routeOwner = captureListingRouteOwner();
   state.savingAspectKey = key;
   draft.savingDecision = true;
   draft.decisionError = "";
@@ -4609,7 +4713,7 @@ async function saveIndividualAspectDecision(key) {
     }
     if (isCompletedReviewMaintenanceResponse(payload)) {
       state.savingAspectKey = null;
-      await leaveCompletedOneByOneReview(review.listing_id, payload);
+      await leaveCompletedOneByOneReview(review.listing_id, payload, routeOwner);
       return;
     }
     const refreshed = payload?.review;
@@ -4660,10 +4764,13 @@ async function validateExistingAssociation(key, button) {
     || !draft
     || targetId === null
     || !listingAssociationCanValidateLocally(draft.aspect)
+    || state.validatingAspectKey !== null
     || state.stale
   ) {
     return;
   }
+  const routeOwner = captureListingRouteOwner();
+  state.validatingAspectKey = key;
   button.disabled = true;
   setWorkspaceMessage(`Validating this listing association against catalog product ${targetId}…`);
   try {
@@ -4678,9 +4785,13 @@ async function validateExistingAssociation(key, button) {
         )),
       },
     );
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     const refreshed = payload?.review;
     if (isCompletedReviewMaintenanceResponse(payload)) {
-      await leaveCompletedOneByOneReview(review.listing_id, payload);
+      state.validatingAspectKey = null;
+      await leaveCompletedOneByOneReview(review.listing_id, payload, routeOwner);
       return;
     }
     if (!isReviewDetail(refreshed, review.listing_id)) {
@@ -4696,6 +4807,9 @@ async function validateExistingAssociation(key, button) {
       `The listing text matched catalog product ${targetId}. Review the remaining aspects.`,
     );
   } catch (error) {
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     if (isStaleError(error)) {
       markStale(error.message);
     } else {
@@ -4703,10 +4817,20 @@ async function validateExistingAssociation(key, button) {
       setWorkspaceMessage(`${outcome.label}: ${outcome.detail}`, true);
       button.disabled = false;
     }
+  } finally {
+    if (
+      listingRouteOwnerIsCurrent(routeOwner)
+      && state.validatingAspectKey === key
+    ) {
+      state.validatingAspectKey = null;
+    }
   }
 }
 
-async function leaveCompletedOneByOneReview(listingId, outcome) {
+async function leaveCompletedOneByOneReview(listingId, outcome, routeOwner) {
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
@@ -4717,10 +4841,16 @@ async function leaveCompletedOneByOneReview(listingId, outcome) {
   state.total = Math.max(0, state.total - 1);
   renderQueue();
   await loadQueue({ quiet: true });
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   await Promise.allSettled([
     Promise.resolve(refreshListings?.()),
     Promise.resolve(refreshAvionics?.()),
   ]);
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   await navigate(reviewQueueRoute("listing"), { replace: true });
   const listingReady = outcome?.listing_ready === true;
   const listingVerified = outcome?.listing_verified === true;
@@ -4758,7 +4888,10 @@ async function pendingReviewStatus(listingId) {
   }
 }
 
-async function recoverCommittedResolution(listingId, message) {
+async function recoverCommittedResolution(listingId, message, routeOwner) {
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
@@ -4769,10 +4902,16 @@ async function recoverCommittedResolution(listingId, message) {
   state.total = Math.max(0, state.total - 1);
   renderQueue();
   await loadQueue({ quiet: true });
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   await Promise.allSettled([
     Promise.resolve(refreshListings?.()),
     Promise.resolve(refreshAvionics?.()),
   ]);
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   await navigate(reviewQueueRoute("listing"), { replace: true });
   setQueueMessage(message, true);
 }

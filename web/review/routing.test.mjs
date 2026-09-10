@@ -8,6 +8,9 @@ import {
   parseRoute,
   reviewAreaForRoute,
   reviewListingIdForRoute,
+  reviewListingRouteOwner,
+  reviewListingRouteOwnerIsCurrent,
+  reviewMutationInProgress,
 } from "../routing.mjs";
 
 test("publishes the four frozen task destinations and panel IDs", () => {
@@ -92,6 +95,71 @@ test("keeps review area selection in router state instead of ambient URL helpers
     formatRoute({ name: "review", view: "listing", listingId: 42, area: "avionics" }),
     "/#/review/listings/42?area=avionics",
   );
+});
+
+test("locks routing for active review mutations but not passive loading", () => {
+  for (const owner of [
+    "productBatch",
+    "resolution",
+    "aspectSave",
+    "correctionSave",
+    "automation",
+    "associationValidation",
+  ]) {
+    assert.equal(reviewMutationInProgress({ [owner]: true }), true, owner);
+  }
+  assert.equal(reviewMutationInProgress(), false);
+  assert.equal(reviewMutationInProgress({ queueLoading: true }), false);
+});
+
+test("keeps the active review history entry while a product batch owns mutation", () => {
+  const location = fakeLocation();
+  setLocation(location, "/#/review/products/28");
+  let mutation = { productBatch: true };
+  const writes = [];
+  const router = createHistoryRouter({
+    location,
+    history: {
+      pushState(_state, _title, url) {
+        writes.push(url);
+        setLocation(location, url);
+      },
+      replaceState() {},
+    },
+    listen: () => {},
+    apply: () => {},
+    mayNavigate: () => !reviewMutationInProgress(mutation),
+  });
+  router.start();
+
+  assert.equal(router.navigate(parseRoute("/#/catalog")), false);
+  assert.equal(location.hash, "#/review/products/28");
+  assert.deepEqual(writes, []);
+
+  mutation = {};
+  router.navigate(parseRoute("/#/catalog"));
+  assert.equal(location.hash, "#/catalog");
+  assert.deepEqual(writes, ["/#/catalog"]);
+});
+
+test("invalidates asynchronous review completion when route ownership changes", () => {
+  const listing = parseRoute("/#/review/listings/42?area=aircraft");
+  const owner = reviewListingRouteOwner(listing, 7);
+  assert.deepEqual(owner, { generation: 7, listingId: 42 });
+  assert.equal(reviewListingRouteOwnerIsCurrent(owner, listing, 7), true);
+  assert.equal(
+    reviewListingRouteOwnerIsCurrent(
+      owner,
+      parseRoute("/#/review/listings/42?area=avionics"),
+      8,
+    ),
+    false,
+  );
+  assert.equal(
+    reviewListingRouteOwnerIsCurrent(owner, parseRoute("/#/listings"), 8),
+    false,
+  );
+  assert.equal(reviewListingRouteOwner(parseRoute("/#/review/manual"), 8), null);
 });
 
 test("restores complete route snapshots through Back and Forward without recursive writes", () => {

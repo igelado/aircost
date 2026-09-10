@@ -39,6 +39,28 @@ test("uses one application history owner for task and review routing", () => {
   assert.doesNotMatch(reviewJs, /window\.(?:history|location)|popstate|FromLocation/);
 });
 
+test("guards review mutations and stale asynchronous completion at the route boundary", () => {
+  assert.match(
+    reviewJs,
+    /confirmRouteChange\(next\) \{\s*if \(activeReviewMutation\(\)\) \{\s*return false;/,
+  );
+  for (const owner of [
+    "productBusy",
+    "resolving",
+    "savingAspectKey",
+    "correctionSave",
+    "automating",
+    "validatingAspectKey",
+  ]) {
+    assert.match(reviewJs, new RegExp(owner));
+  }
+  assert.match(reviewJs, /function listingRouteOwnerIsCurrent\(owner\)/);
+  assert.match(
+    reviewJs,
+    /shouldReconcileResolution\(error\)[\s\S]*?recoverCommittedResolution\(\s*resolvedListingId,\s*`Review decisions were saved, but the response was interrupted\.[\s\S]*?`,\s*routeOwner,\s*\)/,
+  );
+});
+
 test("uses a compact multi-capability dropdown in listing avionics rows", () => {
   assert.match(appJs, /function avionicsTypeDropdown\(values = \[\]\)/);
   assert.match(appJs, /querySelectorAll\('\[name="avionics_types"\]:checked'\)/);
