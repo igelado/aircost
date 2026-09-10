@@ -171,17 +171,7 @@ export function initializeReviewWorkspace(shared) {
       return activateReviewRoute(route, context);
     },
     deactivate() {
-      state.routeGeneration += 1;
-      if (state.route?.view === "listing") {
-        showQueue({ discardDraft: true, load: false });
-      }
-      closeProductReview();
-      state.route = {
-        name: "review",
-        view: "pipeline",
-        search: state.pipelineSearch,
-        filter: state.pipelineFilter,
-      };
+      deactivateReviewRoute();
     },
     refresh() {
       return refreshActiveQueue();
@@ -210,6 +200,15 @@ export function initializeReviewWorkspace(shared) {
       return confirmDiscardDraft();
     },
   });
+}
+
+function deactivateReviewRoute() {
+  state.routeGeneration += 1;
+  if (state.route?.view === "listing") {
+    showQueue({ discardDraft: true, load: false });
+  }
+  closeProductReview();
+  state.route = null;
 }
 
 function activateReviewRoute(route, { source } = {}) {

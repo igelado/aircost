@@ -244,7 +244,7 @@ test("preserves stale listing drafts across review area routes", async () => {
 });
 
 test("reloads pipeline only on startup and true collection re-entry", async () => {
-  const start = reviewJs.indexOf("function activateReviewRoute");
+  const start = reviewJs.indexOf("function deactivateReviewRoute");
   const end = reviewJs.indexOf("\nfunction activeReviewMutation", start);
   assert.ok(start >= 0 && end > start);
 
@@ -270,7 +270,7 @@ test("reloads pipeline only on startup and true collection re-entry", async () =
     && left.view === "pipeline"
     && right?.name === "review"
     && right.view === "pipeline";
-  const activate = Function(
+  const lifecycle = Function(
     "state",
     "elements",
     "document",
@@ -283,7 +283,7 @@ test("reloads pipeline only on startup and true collection re-entry", async () =
     "preserveLiveRouteInput",
     "reviewPipelineRouteIsSame",
     "resumeVerificationRun",
-    `${reviewJs.slice(start, end)}\nreturn activateReviewRoute;`,
+    `${reviewJs.slice(start, end)}\nreturn { activateReviewRoute, deactivateReviewRoute };`,
   )(
     state,
     elements,
@@ -301,6 +301,7 @@ test("reloads pipeline only on startup and true collection re-entry", async () =
       return Promise.resolve();
     },
   );
+  const activate = lifecycle.activateReviewRoute;
 
   const pipeline = { name: "review", view: "pipeline", search: "", filter: "all" };
   await activate(pipeline, { source: "push" });
@@ -314,7 +315,8 @@ test("reloads pipeline only on startup and true collection re-entry", async () =
   assert.deepEqual(resumedRuns, [7], "local controls issue no run-status request");
   assert.equal(requests[0].commitGuard(), true, "local controls retain request ownership");
 
-  await activate({ name: "review", view: "manual" }, { source: "push" });
+  lifecycle.deactivateReviewRoute();
+  assert.equal(state.route, null, "deactivation records that Review no longer owns the page");
   assert.equal(requests[0].commitGuard(), false, "leaving Pipeline invalidates its response");
   await activate(pipeline, { source: "popstate" });
   assert.equal(requests.length, 2, "returning to Pipeline refreshes again");

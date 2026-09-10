@@ -285,6 +285,10 @@ test("recognizes only the same listing or product editor route", () => {
     ),
     false,
   );
+  assert.equal(
+    reviewPipelineRouteIsSame(null, parseRoute("/#/review")),
+    false,
+  );
 });
 
 test("confirms only dirty departures and leaves rejected state owned", () => {
