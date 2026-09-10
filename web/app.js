@@ -1304,10 +1304,19 @@ function captureListingEditorFocus() {
     return { rowIndex, kind: "named", name: active.name };
   }
   if (active.name === "avionics_types") {
-    return { rowIndex, kind: "capability", value: active.value };
+    return {
+      rowIndex,
+      kind: "capability",
+      value: active.value,
+      disclosureOpen: active.closest("details")?.open === true,
+    };
   }
   if (active.tagName === "SUMMARY") {
-    return { rowIndex, kind: "capability-summary" };
+    return {
+      rowIndex,
+      kind: "capability-summary",
+      disclosureOpen: active.closest("details")?.open === true,
+    };
   }
   if (
     active.tagName === "BUTTON"
@@ -1324,6 +1333,7 @@ function restoreListingEditorFocus(token) {
   }
   const rows = Array.from(elements.avionicsList.querySelectorAll(".avionics-row"));
   const row = rows[token.rowIndex];
+  const disclosure = row?.querySelector("details.avionics-type-dropdown");
   let control = null;
   if (row && token.kind === "named") {
     control = row.querySelector(`[name="${token.name}"]`);
@@ -1335,11 +1345,41 @@ function restoreListingEditorFocus(token) {
   } else if (row && token.kind === "remove") {
     control = row.querySelector('button[aria-label="Remove avionics"]');
   }
-  if (!control?.isConnected || !elements.listingDialog.contains(control)) {
-    control = elements.listingForm.querySelector("input, select, textarea, button");
+  if (typeof token.disclosureOpen === "boolean" && disclosure?.isConnected) {
+    disclosure.open = token.disclosureOpen;
   }
-  if (control?.isConnected && elements.listingDialog.contains(control)) {
-    control.focus();
+
+  const controlIsVisible = (candidate) => (
+    typeof candidate?.getClientRects !== "function"
+    || candidate.getClientRects().length > 0
+  );
+  const focusControl = (candidate) => {
+    if (
+      !candidate?.isConnected
+      || !elements.listingDialog.contains(candidate)
+      || !controlIsVisible(candidate)
+    ) {
+      return false;
+    }
+    candidate.focus();
+    return document.activeElement === candidate;
+  };
+  if (focusControl(control)) {
+    return;
+  }
+  if (
+    typeof token.disclosureOpen === "boolean"
+    && focusControl(row?.querySelector("summary"))
+  ) {
+    return;
+  }
+  const fallbacks = Array.from(
+    elements.listingForm.querySelectorAll("input, select, textarea, button, summary"),
+  ).filter((candidate) => !elements.avionicsList.contains(candidate));
+  for (const fallback of fallbacks) {
+    if (focusControl(fallback)) {
+      return;
+    }
   }
 }
 

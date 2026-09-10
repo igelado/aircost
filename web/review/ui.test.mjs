@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 
 const indexHtml = readFileSync(new URL("../index.html", import.meta.url), "utf8");
@@ -366,6 +367,7 @@ test("restores dynamic avionics focus after a clean background rebind", () => {
   const document = { activeElement: null };
   const makeControl = ({ name = "", value = "", tagName = "INPUT", ariaLabel = "" }) => ({
     ariaLabel,
+    disclosure: null,
     dynamic: true,
     isConnected: true,
     name,
@@ -373,19 +375,33 @@ test("restores dynamic avionics focus after a clean background rebind", () => {
     tagName,
     value,
     closest(selector) {
-      return selector === ".avionics-row" ? this.row : null;
+      if (selector === ".avionics-row") {
+        return this.row;
+      }
+      return selector === "details" ? this.disclosure : null;
     },
     focus() {
+      if (this.name === "avionics_types" && this.disclosure?.open !== true) {
+        return;
+      }
       document.activeElement = this;
     },
     getAttribute(attribute) {
       return attribute === "aria-label" ? this.ariaLabel : null;
     },
   });
-  const makeRow = (controls) => {
+  const makeRow = (controls, { disclosureOpen = false } = {}) => {
+    const disclosure = {
+      isConnected: true,
+      open: disclosureOpen,
+    };
     const row = {
       controls,
+      disclosure,
       querySelector(selector) {
+        if (selector === "details.avionics-type-dropdown") {
+          return disclosure;
+        }
         if (selector === "summary") {
           return controls.find((control) => control.tagName === "SUMMARY") || null;
         }
@@ -401,21 +417,26 @@ test("restores dynamic avionics focus after a clean background rebind", () => {
           : [];
       },
     };
-    controls.forEach((control) => { control.row = row; });
+    controls.forEach((control) => {
+      control.row = row;
+      if (control.name === "avionics_types" || control.tagName === "SUMMARY") {
+        control.disclosure = disclosure;
+      }
+    });
     return row;
   };
   const cases = [
     { name: "avionics_manufacturer" },
     { name: "avionics_model" },
     { name: "avionics_quantity" },
-    { name: "avionics_types", value: "gps" },
-    { tagName: "SUMMARY" },
+    { name: "avionics_types", value: "gps", disclosureOpen: true },
+    { tagName: "SUMMARY", disclosureOpen: true },
     { tagName: "BUTTON", ariaLabel: "Remove avionics" },
   ];
 
   for (const descriptor of cases) {
     const oldTarget = makeControl(descriptor);
-    const oldRow = makeRow([oldTarget]);
+    const oldRow = makeRow([oldTarget], descriptor);
     const newTarget = makeControl(descriptor);
     const newRow = makeRow([newTarget]);
     let rows = [makeRow([]), oldRow];
@@ -430,7 +451,7 @@ test("restores dynamic avionics focus after a clean background rebind", () => {
         open: true,
         contains: (control) => control?.isConnected === true,
       },
-      listingForm: { querySelector: () => fallback },
+      listingForm: { querySelectorAll: () => [fallback] },
     };
     const focus = Function(
       "elements",
@@ -445,11 +466,16 @@ test("restores dynamic avionics focus after a clean background rebind", () => {
     rows = [makeRow([]), newRow];
     focus.restoreListingEditorFocus(token);
     assert.equal(document.activeElement, newTarget, `${JSON.stringify(descriptor)} restores`);
+    if (descriptor.disclosureOpen === true) {
+      assert.equal(newRow.disclosure.open, true, "the rebuilt disclosure is reopened");
+    }
   }
 
   const oldCapability = makeControl({ name: "avionics_types", value: "gps" });
-  const oldRow = makeRow([oldCapability]);
+  const oldRow = makeRow([oldCapability], { disclosureOpen: true });
+  const replacementSummary = makeControl({ tagName: "SUMMARY" });
   const replacementRow = makeRow([
+    replacementSummary,
     makeControl({ name: "avionics_types", value: "navigation" }),
   ]);
   let rows = [oldRow];
@@ -465,7 +491,7 @@ test("restores dynamic avionics focus after a clean background rebind", () => {
       open: true,
       contains: (control) => control?.isConnected === true && control !== outside,
     },
-    listingForm: { querySelector: () => fallback },
+    listingForm: { querySelectorAll: () => [fallback] },
   };
   const focus = Function(
     "elements",
@@ -478,12 +504,89 @@ test("restores dynamic avionics focus after a clean background rebind", () => {
   oldCapability.isConnected = false;
   rows = [replacementRow];
   focus.restoreListingEditorFocus(missingToken);
-  assert.equal(document.activeElement, fallback, "a removed exact control uses a safe fallback");
+  assert.equal(
+    document.activeElement,
+    replacementSummary,
+    "a removed capability uses its visible summary fallback",
+  );
+
+  replacementSummary.isConnected = false;
+  rows = [makeRow([])];
+  focus.restoreListingEditorFocus(missingToken);
+  assert.equal(document.activeElement, fallback, "a removed disclosure uses a safe form fallback");
 
   document.activeElement = outside;
   assert.equal(focus.captureListingEditorFocus(), null);
   focus.restoreListingEditorFocus(null);
   assert.equal(document.activeElement, outside, "outside-editor focus is untouched");
+});
+
+test("reopens rebuilt avionics details before restoring native Chromium focus", {
+  skip: ![
+    "/snap/bin/chromium",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+  ].some((path) => existsSync(path)),
+}, () => {
+  const chromium = [
+    "/snap/bin/chromium",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+  ].find((path) => existsSync(path));
+  const start = appJs.indexOf("function captureListingEditorFocus");
+  const end = appJs.indexOf("\nfunction editListing", start);
+  assert.ok(start >= 0 && end > start);
+  const functions = appJs.slice(start, end).replaceAll("</script>", "<\\/script>");
+  const html = `<!doctype html>
+    <body>
+      <dialog id="dialog" open>
+        <form id="form">
+          <input id="fallback">
+          <div id="avionics-list">
+            <div class="avionics-row">
+              <details class="avionics-type-dropdown" open>
+                <summary>Capabilities</summary>
+                <input id="old-capability" name="avionics_types" value="gps">
+              </details>
+            </div>
+          </div>
+        </form>
+      </dialog>
+      <script>
+        const elements = {
+          listingDialog: document.querySelector("#dialog"),
+          listingForm: document.querySelector("#form"),
+          avionicsList: document.querySelector("#avionics-list"),
+        };
+        ${functions}
+        document.querySelector("#old-capability").focus();
+        const token = captureListingEditorFocus();
+        elements.avionicsList.innerHTML = \`
+          <div class="avionics-row">
+            <details class="avionics-type-dropdown">
+              <summary>Capabilities</summary>
+              <input id="new-capability" name="avionics_types" value="gps">
+            </details>
+          </div>\`;
+        restoreListingEditorFocus(token);
+        document.body.dataset.focus = document.activeElement.id;
+        document.body.dataset.open = String(
+          document.querySelector("details.avionics-type-dropdown").open,
+        );
+      <\/script>
+    </body>`;
+  const result = spawnSync(chromium, [
+    "--headless=new",
+    "--no-sandbox",
+    "--disable-gpu",
+    "--dump-dom",
+    `data:text/html;charset=utf-8,${encodeURIComponent(html)}`,
+  ], { encoding: "utf8", timeout: 20_000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /data-focus="new-capability"/);
+  assert.match(result.stdout, /data-open="true"/);
 });
 
 test("all listing editors retain the global in-flight Save lock", () => {
