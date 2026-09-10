@@ -144,7 +144,7 @@ rebase between merges, then enable the gate in `MNT-018F`.
 | MNT-001A | `architect` -> `coder` (Rawls review) — `codex/mnt-001a-atomic-valuation-writes` | MNT-007B, MNT-018F | `src/valuation/{dataset,store}.rs` and failure injection; no aircraft identity cutover |
 | MNT-001B | `architect` -> `coder` (Lovelace review) — `codex/mnt-001b-atomic-listing-writes` | MNT-007B, MNT-009A, MNT-018F | listing mutation/fact/finalization unit of work and failure injection; no module extraction |
 | MNT-004 | `architect` -> `coder` (Rawls review) — `codex/mnt-004-bounded-list-reads` | MNT-001A, MNT-001B, MNT-009B | listing/catalog page queries, `src/cleanup.rs`, page DTO/handler wiring, query-count tests |
-| MNT-010 | `coder` (Leibniz review) — `codex/mnt-010-shared-domain-vocabularies` | MNT-003, MNT-009B | one versioned vocabulary source, generators/artifacts, parity fixtures; generated files cease manual ownership |
+| MNT-010 | `coder` (Leibniz review) — `codex/mnt-010-shared-domain-vocabularies` | MNT-003, MNT-009B | one versioned vocabulary source, generators/artifacts, parity fixtures, `web/app.js`, and `chrome-extension/popup.js`; generated files cease manual ownership |
 | MNT-006A | `architect` -> `coder` (Lovelace review) — `codex/mnt-006a-canonical-identity-dual-read` | MNT-001A, MNT-001B, MNT-003, MNT-004 | canonical direct writes/reads, paired migration, mismatch instrumentation, documented rollback/export |
 | MNT-006B | `architect` -> `coder` (Lovelace review) — `codex/mnt-006b-remove-legacy-identity` | MNT-006A plus recorded zero-mismatch observation on SQLite and PostgreSQL | destructive cutover migration and deletion of projections/placeholders/triggers/legacy columns; never start on synthetic evidence alone |
 | MNT-022 | `architect` -> `coder` (Leibniz review) — `codex/mnt-022-catalog-mutation-authorizations` | MNT-003, MNT-006B, MNT-007B, MNT-010 | consolidation/authorization tables, guards, claims, triggers, paired migrations and parity projection |
@@ -218,13 +218,14 @@ otherwise start:
 5. **Capture/replay:** `src/plugin.rs` and replay lifecycle files. Order:
    MNT-012 -> MNT-023 -> MNT-019.
 6. **Shared web shell:** `web/index.html`, `web/app.css`, `web/app.js`, and
-   static-asset wiring. Run only one Boole/Gauss web branch at a time unless
-   both changed-file fences have been proven disjoint after controller
-   extraction.
-7. **Extension popup:** `chrome-extension/popup.*`. Order: MNT-016A -> WEB-010
-   -> WEB-011 -> WEB-013 -> MNT-016B -> WEB-012. MNT-016A primarily owns
-   `background.js` and may run beside main-web work, but its minimal popup shim
-   reserves this queue until merge.
+   static-asset wiring. Initial order: WEB-002 -> WEB-001 -> MNT-010 ->
+   MNT-015A -> WEB-008 -> MNT-015B. Run only one later Boole/Gauss web branch
+   at a time unless both changed-file fences have been proven disjoint after
+   controller extraction.
+7. **Extension popup:** `chrome-extension/popup.*`. Order: MNT-010 -> MNT-016A
+   -> WEB-010 -> WEB-011 -> WEB-013 -> MNT-016B -> WEB-012. MNT-016A primarily
+   owns `background.js` and may run beside main-web work, but its minimal popup
+   shim reserves this queue until merge.
 8. **CI/Cargo:** `.github/workflows/test.yml`, `Cargo.toml`, `Cargo.lock`,
    toolchain/lint files. Parfit schedules these serially; a feature dependency
    addition waits or receives an explicit temporary fence.
