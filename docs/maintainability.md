@@ -41,10 +41,12 @@ invariants, and an objective definition of done.
 - A fresh empty web app was rendered at 1440 x 1000 and 390 x 844. The mobile
   render has overlapping primary navigation, and the desktop listing toolbar
   compresses ten filtering/action controls into one row.
-- The checked-in development database currently fails startup contract
-  validation. Applying the migration named by the error to a disposable copy
-  also fails because the recorded contract and physical table shape disagree.
-  The original database was not modified.
+- During this audit, the ignored local development database at the default
+  `data/aircost.sqlite3` path failed startup contract validation. Applying the
+  migration named by the error to a disposable copy also failed because the
+  recorded contract and physical table shape disagree. The original database
+  was not modified, and a fresh checkout cannot reproduce this data-specific
+  observation because the database is deliberately not committed.
 
 Measurements are evidence, not permanent targets. Record new before/after
 measurements when an item is completed.
@@ -220,10 +222,12 @@ Evidence:
   lines. Runtime source also embeds historical migration/object definitions,
   contrary to the repository rule that runtime code remain migration-free.
 - A focused fresh-schema reinitialization test took about 15 seconds.
-- During this audit, startup told the operator to apply
+- During this audit, startup against the ignored local
+  `data/aircost.sqlite3` told the operator to apply
   `20260725_identity_deduplication_postconditions`; applying that exact file to
-  a disposable database copy failed because its recorded contract and physical
-  `avionics_manufacturer_identities` columns disagree.
+  a disposable copy of the same database failed because its recorded contract
+  and physical `avionics_manufacturer_identities` columns disagree. This is a
+  local data-shape observation, not a reproducible fresh-checkout fixture.
 
 Desired simplification:
 
