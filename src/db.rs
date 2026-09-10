@@ -16969,7 +16969,7 @@ mod tests {
             .unwrap();
         pool.execute("CREATE SCHEMA attacker_schema").await.unwrap();
         pool.execute(
-            "ALTER FUNCTION public.require_source_identity_correction_receipt() \
+            "ALTER FUNCTION public.preserve_aircraft_listing_identity_correction() \
              SET search_path = attacker_schema, public",
         )
         .await
@@ -16979,7 +16979,7 @@ mod tests {
             .await
             .unwrap());
         pool.execute(
-            "ALTER FUNCTION public.require_source_identity_correction_receipt() \
+            "ALTER FUNCTION public.preserve_aircraft_listing_identity_correction() \
              SET search_path = pg_catalog",
         )
         .await
@@ -16990,7 +16990,7 @@ mod tests {
             .unwrap());
 
         pool.execute(
-            "ALTER FUNCTION public.require_source_identity_correction_receipt() \
+            "ALTER FUNCTION public.preserve_aircraft_listing_identity_correction() \
              SET SCHEMA attacker_schema",
         )
         .await
@@ -17001,7 +17001,7 @@ mod tests {
             .unwrap());
 
         pool.execute(
-            "ALTER FUNCTION attacker_schema.require_source_identity_correction_receipt() \
+            "ALTER FUNCTION attacker_schema.preserve_aircraft_listing_identity_correction() \
              SET SCHEMA public",
         )
         .await
