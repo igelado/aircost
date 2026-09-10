@@ -57,6 +57,18 @@ test("guards review mutations and stale asynchronous completion at the route bou
   assert.match(reviewJs, /function listingRouteOwnerIsCurrent\(owner\)/);
   assert.match(
     reviewJs,
+    /finally \{\s*state\.resolving = false;\s*if \(listingRouteOwnerIsCurrent\(routeOwner\)\)/,
+  );
+  assert.match(
+    reviewJs,
+    /setAutomaticVerificationBusy\(false, \{\s*updateView: listingRouteOwnerIsCurrent\(routeOwner\),\s*\}\)/,
+  );
+  assert.match(
+    reviewJs,
+    /finally \{\s*if \(state\.validatingAspectKey === key\) \{\s*state\.validatingAspectKey = null;/,
+  );
+  assert.match(
+    reviewJs,
     /shouldReconcileResolution\(error\)[\s\S]*?recoverCommittedResolution\(\s*resolvedListingId,\s*`Review decisions were saved, but the response was interrupted\.[\s\S]*?`,\s*routeOwner,\s*\)/,
   );
 });

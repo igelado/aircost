@@ -4363,9 +4363,9 @@ async function rebuildAvionicsReview() {
       setWorkspaceMessage(`Could not rebuild avionics cards: ${error.message}`, true);
     }
   } finally {
-    if (listingRouteOwnerIsCurrent(routeOwner)) {
-      setAutomaticVerificationBusy(false);
-    }
+    setAutomaticVerificationBusy(false, {
+      updateView: listingRouteOwnerIsCurrent(routeOwner),
+    });
   }
 }
 
@@ -4414,7 +4414,7 @@ async function leaveAutomaticallyVerifiedReview(
   );
 }
 
-function setAutomaticVerificationBusy(busy) {
+function setAutomaticVerificationBusy(busy, { updateView = true } = {}) {
   if (state.automating === busy) {
     return;
   }
@@ -4436,8 +4436,10 @@ function setAutomaticVerificationBusy(busy) {
     }
   }
   state.automationControlStates.clear();
-  updateProgress();
-  updateNextButton();
+  if (updateView) {
+    updateProgress();
+    updateNextButton();
+  }
 }
 
 async function resolveReview() {
@@ -4602,8 +4604,8 @@ async function resolveReview() {
       showAspectResolutionError(error);
     }
   } finally {
+    state.resolving = false;
     if (listingRouteOwnerIsCurrent(routeOwner)) {
-      state.resolving = false;
       setButtonBusy(elements.verifyListing, false);
       syncAllAspectViews();
       updateProgress();
@@ -4818,10 +4820,7 @@ async function validateExistingAssociation(key, button) {
       button.disabled = false;
     }
   } finally {
-    if (
-      listingRouteOwnerIsCurrent(routeOwner)
-      && state.validatingAspectKey === key
-    ) {
+    if (state.validatingAspectKey === key) {
       state.validatingAspectKey = null;
     }
   }
