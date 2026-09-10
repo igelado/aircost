@@ -189,14 +189,11 @@ run_postgres_contracts() {
     printf 'Running isolated PostgreSQL Rust contract (%s): %s\n' \
       "$target" "$test_name"
     reset_postgres_database
-
-    if [[ "$target" == aircost-admin ]]; then
-      psql "$AIRCOST_TEST_POSTGRES_URL" \
-        --no-psqlrc \
-        --set=ON_ERROR_STOP=1 \
-        --file="$repository_root/schema/postgres.sql" \
-        >/dev/null
-    fi
+    psql "$AIRCOST_TEST_POSTGRES_URL" \
+      --no-psqlrc \
+      --set=ON_ERROR_STOP=1 \
+      --file="$repository_root/schema/postgres.sql" \
+      >/dev/null
 
     (
       cd "$repository_root"

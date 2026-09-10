@@ -15357,7 +15357,10 @@ mod tests {
         .await
         .unwrap();
         let expected = postgres_receipt_snapshot(pool).await;
-        assert_eq!(expected.len(), 24);
+        assert_eq!(
+            expected.len(),
+            canonical_startup_migration_contract_receipts(DatabaseKind::Postgres).len() + 1
+        );
         assert!(expected
             .iter()
             .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
@@ -15642,7 +15645,10 @@ mod tests {
             .connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(postgres_receipt_snapshot(&inspection).await.len(), 23);
+        assert_eq!(
+            postgres_receipt_snapshot(&inspection).await.len(),
+            canonical_startup_migration_contract_receipts(DatabaseKind::Postgres).len()
+        );
         inspection.close().await;
     }
 
