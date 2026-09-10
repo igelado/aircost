@@ -5,28 +5,12 @@ on:
   push:
     branches:
       - main
-      - agent/**
+      - codex/**
 
 jobs:
-  test:
-    name: test
+  fast:
+    name: fast
     runs-on: ubuntu-latest
-    env:
-      AIRCOST_TEST_POSTGRES_URL: postgres://postgres:aircost@localhost:5432/aircost_test
-
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_DB: aircost_test
-          POSTGRES_PASSWORD: aircost
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
 
     steps:
       - name: Check out repository
@@ -53,55 +37,88 @@ jobs:
           node --test web/review/*.test.mjs
 
       - name: Run unit tests
-        run: cargo test
-
-      - name: Check PostgreSQL listing replay contract
-        run: |
-          cargo test postgres_listing_replay_fresh_migrated_idempotent_and_hostile_search_path -- --ignored --nocapture --test-threads=1
-          cargo test postgres_listing_replay_installed_at_survives_two_normal_startups -- --ignored --nocapture --test-threads=1
-          cargo test postgres_listing_replay_startup_rejects_weakened_column_constraint_and_index -- --ignored --nocapture --test-threads=1
-          cargo test postgres_listing_replay_rerun_rejects_unexpected_indexes_and_triggers -- --ignored --nocapture --test-threads=1
-          cargo test postgres_active_replay_freeze_rejects_truncate_cascade -- --ignored --nocapture --test-threads=1
-          cargo test postgres_replay_inventory_orders_repeatable_read_and_read_committed_writers -- --ignored --nocapture --test-threads=1
-          cargo test postgres_production_acquire_and_release_uses_backend_placeholders -- --ignored --nocapture --test-threads=1
-          cargo test postgres_replay_ledger_rejects_invalid_state_outcome_pairings -- --ignored --nocapture --test-threads=1
-
-      - name: Check PostgreSQL grounded avionics capability contract
-        run: |
-          cargo test postgres_grounded_capability_functions_resist_hostile_search_path_and_tampering -- --ignored --nocapture --test-threads=1
-
-      - name: Check PostgreSQL catalog seed contract
-        run: |
-          cargo test postgres_round_trip_fences_writers_preserves_replay_and_rejects_rerun -- --ignored --nocapture --test-threads=1
-          cargo test postgres_sequence_reset_covers_identity_and_serial_owned_ids -- --ignored --nocapture --test-threads=1
-
-      - name: Check historical migration provenance
-        run: bash tests/schema/test_historical_migration_provenance.sh
-
-      - name: Check listing aircraft identity migration
-        run: bash tests/schema/test_listing_aircraft_identity.sh
-
-      - name: Check PostgreSQL FAA reference migration
-        run: bash tests/schema/test_faa_reference_reachability_postgres.sh
-
-      - name: Check FAA record hash-domain migration
-        run: bash tests/schema/test_faa_record_hash_domain.sh
-
-      - name: Check PostgreSQL FAA reference startup attestation
-        run: >-
-          cargo test postgres_faa_reference_startup_attests_exact_objects --
-          --ignored --nocapture --test-threads=1
-
-      - name: Check FAA diagnostic read-only boundaries
-        run: |
-          cargo test diagnostic_postgres_connections_default_to_read_only -- --ignored --nocapture --test-threads=1
-          cargo test --bin aircost-admin import_faa_registry_dry_run_keeps_postgres_rows_and_markers_unchanged -- --ignored --nocapture --test-threads=1
-
-      - name: Check avionics reuse-v2 migration
-        run: bash tests/schema/test_avionics_product_reuse_v2.sh
-
-      - name: Check grounded avionics consolidation migration
-        run: bash tests/schema/test_avionics_grounded_exact_consolidation.sh
+        run: cargo test --locked
 
       - name: Check build
-        run: cargo check
+        run: cargo check --locked
+
+  sqlite-contracts:
+    name: sqlite-contracts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify schema test tools
+        run: |
+          command -v rg
+          command -v sqlite3
+
+      - name: Run SQLite schema contracts
+        run: bash tests/schema/run.sh sqlite
+
+  postgres-contracts:
+    name: postgres-contracts
+    runs-on: ubuntu-latest
+    env:
+      AIRCOST_TEST_POSTGRES_URL: postgres://postgres:aircost@localhost:5432/aircost_test
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: aircost_test
+          POSTGRES_PASSWORD: aircost
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify database test tools
+        run: |
+          command -v rg
+          command -v sqlite3
+          command -v psql
+
+      - name: Verify ignored Rust test inventory
+        run: |
+          : "${AIRCOST_TEST_POSTGRES_URL:?AIRCOST_TEST_POSTGRES_URL is required}"
+          bash tests/schema/rust_test_inventory.sh
+
+      - name: Run PostgreSQL Rust contracts
+        run: |
+          : "${AIRCOST_TEST_POSTGRES_URL:?AIRCOST_TEST_POSTGRES_URL is required}"
+          cargo test --locked postgres -- --ignored --nocapture --test-threads=1
+
+      - name: Run PostgreSQL schema contracts
+        run: |
+          : "${AIRCOST_TEST_POSTGRES_URL:?AIRCOST_TEST_POSTGRES_URL is required}"
+          bash tests/schema/run.sh postgres
+
+  dnn:
+    name: dnn
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run DNN feature tests
+        run: cargo test --locked --features dnn
+
+      - name: Check DNN feature build
+        run: cargo check --locked --features dnn
