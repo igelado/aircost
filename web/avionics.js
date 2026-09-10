@@ -244,12 +244,17 @@ function bindEvents() {
   elements.avionicsDetailDialog.addEventListener("close", finishAvionicsDetailClose);
 }
 
-async function loadAvionicsWorkspace(forceOptions = false, { source } = {}) {
+async function loadAvionicsWorkspace(
+  forceOptions = false,
+  { source, searchValue } = {},
+) {
   if (forceOptions || !state.avionicsOptionsLoaded) {
     await loadAvionicsOptions();
   }
   const filters = state.route?.filters || {};
-  if (!preserveLiveRouteInput(
+  if (typeof searchValue === "string") {
+    elements.avionicsSearch.value = searchValue;
+  } else if (!preserveLiveRouteInput(
     source,
     document.activeElement === elements.avionicsSearch,
   )) {
@@ -262,15 +267,25 @@ async function loadAvionicsWorkspace(forceOptions = false, { source } = {}) {
   await loadAvionics();
 }
 
-async function loadAvionicsOptions() {
+async function loadAvionicsOptions({ commitGuard = null } = {}) {
+  const mayCommit = () => (
+    typeof commitGuard !== "function" || commitGuard()
+  );
   try {
     const payload = await api("/api/avionics/options");
+    if (!mayCommit()) {
+      return false;
+    }
     updateAvionicsFilterOptions(payload?.options || {});
     state.avionicsOptionsLoaded = true;
   } catch (error) {
+    if (!mayCommit()) {
+      return false;
+    }
     state.avionicsOptionsLoaded = false;
     setAvionicsMessage(`Catalog filters unavailable: ${error.message}`, true);
   }
+  return true;
 }
 
 function updateAvionicsFilterOptions(options) {
@@ -334,22 +349,43 @@ function scheduleAvionicsSearch() {
 async function refreshAvionicsFromControls() {
   const hadPendingSearch = state.avionicsSearchTimer !== null;
   const previousRouteKey = state.catalogRouteKey;
+  const refreshOwner = state.route;
+  const liveSearch = elements.avionicsSearch.value;
   const route = catalogRouteFromControls({
     page: hadPendingSearch ? 1 : state.route?.filters?.page || 1,
     productId: state.route?.productId || null,
   });
   cancelAvionicsSearch();
+  const optionsCommitted = await loadAvionicsOptions({
+    commitGuard: () => (
+      routeActivationIsCurrent(refreshOwner, state.route)
+      && elements.avionicsSearch.value === liveSearch
+    ),
+  });
+  if (!optionsCommitted) {
+    return false;
+  }
   const activation = navigate(route, { replace: true });
   if (activation === false) {
     return false;
   }
   const routeOwner = state.route;
+  const routedSearch = state.route?.filters?.search || "";
+  if (elements.avionicsSearch.value === routedSearch) {
+    elements.avionicsSearch.value = liveSearch;
+  }
   await activation;
   if (!routeActivationIsCurrent(routeOwner, state.route)) {
     return false;
   }
+  if (elements.avionicsSearch.value !== liveSearch) {
+    return false;
+  }
   if (state.catalogRouteKey === previousRouteKey) {
-    await loadAvionicsWorkspace(true, { source: "refresh" });
+    await loadAvionicsWorkspace(false, {
+      source: "refresh",
+      searchValue: liveSearch,
+    });
   }
   return true;
 }

@@ -45,6 +45,7 @@ test("resetting an edited listing replaces its route with creation", () => {
     "setFormMessage",
     "navigateRoute",
     "listingFiltersFromControls",
+    "synchronizeListingSaveDisabled",
     `${appJs.slice(start, end)}\nreturn resetListingForm;`,
   )(
     state,
@@ -54,6 +55,7 @@ test("resetting an edited listing replaces its route with creation", () => {
     () => {},
     (route, options) => navigations.push({ route, options }),
     () => ({ search: "Cessna" }),
+    () => false,
   );
 
   reset();
@@ -139,6 +141,77 @@ test("guards dirty listing editors before closing or changing their route", () =
   );
   assert.match(appJs, /function editListing\([\s\S]*?state\.listingDraftDirty = false;/);
   assert.match(appJs, /function resetListingForm\([\s\S]*?state\.listingDraftDirty = false;/);
+});
+
+test("all listing editors retain the global in-flight Save lock", () => {
+  const start = appJs.indexOf("function synchronizeListingSaveDisabled");
+  const end = appJs.indexOf("\nfunction openListingDialog", start);
+  assert.ok(start >= 0 && end > start);
+
+  const compile = (state) => {
+    const elements = {
+      listingFormTitle: {},
+      formModeStatus: {},
+      deleteListing: {
+        disabled: false,
+        classList: { add() {}, toggle() {} },
+      },
+      saveListing: { disabled: false },
+      listingForm: { reset() {} },
+      avionicsList: { replaceChildren() {} },
+    };
+    const editors = Function(
+      "state",
+      "elements",
+      "setField",
+      "addAvionicsRow",
+      "setFormMessage",
+      "openListingDialog",
+      "navigateRoute",
+      "listingFiltersFromControls",
+      `${appJs.slice(start, end)}\nreturn { editListing, resetListingForm };`,
+    )(
+      state,
+      elements,
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      () => ({}),
+    );
+    return { editors, elements };
+  };
+
+  const editState = {
+    editingListingId: 7,
+    listingEditorVerified: false,
+    listingSaveOwner: {},
+  };
+  const edit = compile(editState);
+  edit.editors.editListing({ id: 7, is_verified: false });
+  assert.equal(edit.elements.saveListing.disabled, true);
+
+  const newState = {
+    editingListingId: null,
+    listingEditorVerified: false,
+    listingSaveOwner: {},
+  };
+  const creation = compile(newState);
+  creation.editors.resetListingForm({ updateRoute: false });
+  assert.equal(creation.elements.saveListing.disabled, true);
+
+  const other = compile(editState);
+  other.editors.editListing({ id: 8, is_verified: false });
+  assert.equal(other.elements.saveListing.disabled, true);
+  const returned = compile(editState);
+  returned.editors.editListing({ id: 7, is_verified: false });
+  assert.equal(returned.elements.saveListing.disabled, true);
+
+  editState.listingSaveOwner = null;
+  const released = compile(editState);
+  released.editors.editListing({ id: 7, is_verified: false });
+  assert.equal(released.elements.saveListing.disabled, false);
 });
 
 test("guards real product drafts while preserving same-product activations", () => {
@@ -542,27 +615,33 @@ test("catalog refresh flushes pending live searches without a late route write",
   const searchEnd = avionicsJs.indexOf("\nasync function loadAvionics", searchStart);
   assert.ok(searchStart >= 0 && searchEnd > searchStart);
 
-  const compile = ({ search, route, routeKey, onNavigate }) => {
+  const compile = ({ search, route, routeKey, onNavigate, onLoadOptions }) => {
     let nextTimer = 1;
     const timers = new Map();
+    const searchInput = { value: search };
     const state = {
       avionicsSearchTimer: null,
       catalogRouteKey: routeKey,
       route,
     };
     const navigations = [];
+    const optionRefreshes = [];
+    const activationResultLoads = [];
     const reloads = [];
     const controls = Function(
       "state",
+      "elements",
       "window",
       "navigate",
       "catalogRouteFromControls",
       "routeActivationIsCurrent",
+      "loadAvionicsOptions",
       "loadAvionicsWorkspace",
       `${avionicsJs.slice(searchStart, searchEnd)}\n`
         + "return { scheduleAvionicsSearch, refreshAvionicsFromControls };",
     )(
       state,
+      { avionicsSearch: searchInput },
       {
         setTimeout(callback) {
           const timer = nextTimer;
@@ -576,18 +655,42 @@ test("catalog refresh flushes pending live searches without a late route write",
       },
       (nextRoute, options) => {
         navigations.push({ route: nextRoute, options });
-        state.route = nextRoute;
-        return onNavigate?.(state, nextRoute) ?? Promise.resolve();
+        state.route = {
+          ...nextRoute,
+          filters: {
+            ...nextRoute.filters,
+            search: nextRoute.filters.search.trim(),
+          },
+        };
+        searchInput.value = state.route.filters.search;
+        const activation = onNavigate?.(state, nextRoute) ?? Promise.resolve();
+        if (state.catalogRouteKey !== routeKey) {
+          activationResultLoads.push(nextRoute);
+        }
+        return activation;
       },
       ({ page, productId }) => ({
         name: "catalog",
-        filters: { search, page },
+        filters: { search: searchInput.value, page },
         ...(productId === null ? {} : { productId }),
       }),
       (owner, current) => owner === current,
+      (options) => {
+        optionRefreshes.push(options);
+        return onLoadOptions?.(state, options) ?? Promise.resolve(options.commitGuard());
+      },
       (force, context) => reloads.push({ force, context }),
     );
-    return { controls, state, timers, navigations, reloads };
+    return {
+      activationResultLoads,
+      controls,
+      navigations,
+      optionRefreshes,
+      reloads,
+      searchInput,
+      state,
+      timers,
+    };
   };
 
   for (const search of ["GNS 430", ""]) {
@@ -608,6 +711,7 @@ test("catalog refresh flushes pending live searches without a late route write",
     assert.equal(harness.timers.size, 1);
     assert.equal(await harness.controls.refreshAvionicsFromControls(), true);
     assert.equal(harness.timers.size, 0);
+    assert.equal(harness.optionRefreshes.length, 1);
     assert.deepEqual(harness.navigations, [{
       route: {
         name: "catalog",
@@ -616,29 +720,74 @@ test("catalog refresh flushes pending live searches without a late route write",
       },
       options: { replace: true },
     }]);
-    assert.deepEqual(harness.reloads, [], "the changed route activation performs the reload");
+    assert.equal(harness.activationResultLoads.length, 1);
+    assert.deepEqual(harness.reloads, [], "the changed route activation performs one result load");
   }
 
+  let releaseUnchanged;
   const unchanged = compile({
-    search: "GNS",
+    search: "GNS ",
     route: { name: "catalog", filters: { search: "GNS", page: 2 } },
     routeKey: "same-route",
+    onNavigate() {
+      return new Promise((resolve) => { releaseUnchanged = resolve; });
+    },
   });
-  assert.equal(await unchanged.controls.refreshAvionicsFromControls(), true);
+  unchanged.controls.scheduleAvionicsSearch();
+  const unchangedRefresh = unchanged.controls.refreshAvionicsFromControls();
+  await Promise.resolve();
+  assert.equal(
+    unchanged.searchInput.value,
+    "GNS ",
+    "raw input is restored before the route activation finishes",
+  );
+  releaseUnchanged();
+  assert.equal(await unchangedRefresh, true);
+  assert.equal(unchanged.optionRefreshes.length, 1);
   assert.deepEqual(unchanged.navigations, [{
-    route: { name: "catalog", filters: { search: "GNS", page: 2 } },
+    route: { name: "catalog", filters: { search: "GNS ", page: 1 } },
     options: { replace: true },
   }]);
   assert.deepEqual(
     unchanged.reloads,
-    [{ force: true, context: { source: "refresh" } }],
+    [{
+      force: false,
+      context: { source: "refresh", searchValue: "GNS " },
+    }],
     "an unchanged route still performs a focused-input-safe forced refresh",
+  );
+  assert.equal(unchanged.activationResultLoads.length, 0);
+  assert.equal(unchanged.searchInput.value, "GNS ");
+  unchanged.searchInput.value += "430";
+  assert.equal(unchanged.searchInput.value, "GNS 430");
+
+  let releaseSupersededInput;
+  const supersededInput = compile({
+    search: "GNS ",
+    route: { name: "catalog", filters: { search: "GNS", page: 2 } },
+    routeKey: "same-route",
+    onNavigate() {
+      return new Promise((resolve) => { releaseSupersededInput = resolve; });
+    },
+  });
+  supersededInput.controls.scheduleAvionicsSearch();
+  const supersededRefresh = supersededInput.controls.refreshAvionicsFromControls();
+  await Promise.resolve();
+  supersededInput.searchInput.value = "GNS 4";
+  releaseSupersededInput();
+  assert.equal(await supersededRefresh, false);
+  assert.equal(supersededInput.searchInput.value, "GNS 4");
+  assert.deepEqual(
+    supersededInput.reloads,
+    [],
+    "a newer keystroke owns the input and suppresses the old forced result load",
   );
 
   const loadStart = avionicsJs.indexOf("async function loadAvionicsWorkspace");
   const loadEnd = avionicsJs.indexOf("\nasync function loadAvionicsOptions", loadStart);
   assert.ok(loadStart >= 0 && loadEnd > loadStart);
   const searchInput = { value: "GNS " };
+  const refreshButton = {};
   const loadCalls = [];
   const loadWorkspace = Function(
     "state",
@@ -657,35 +806,42 @@ test("catalog refresh flushes pending live searches without a late route write",
     },
     {
       avionicsSearch: searchInput,
+      refreshAvionics: refreshButton,
       avionicsCompletenessFilter: {},
       avionicsStatusFilter: {},
       avionicsCapabilityFilter: {},
     },
-    { activeElement: searchInput },
+    { activeElement: refreshButton },
     (source, focused) => source === "refresh" && focused,
     () => loadCalls.push("options"),
     () => {},
     () => loadCalls.push("catalog"),
   );
-  await loadWorkspace(true, { source: "refresh" });
+  await loadWorkspace(false, { source: "refresh", searchValue: "GNS " });
   assert.equal(searchInput.value, "GNS ");
-  assert.deepEqual(loadCalls, ["options", "catalog"]);
+  searchInput.value += "430";
+  assert.equal(searchInput.value, "GNS 430");
+  assert.deepEqual(loadCalls, ["catalog"]);
 
-  let releaseNavigation;
+  let releaseOptions;
   const departed = compile({
     search: "GTN",
     route: { name: "catalog", filters: { search: "", page: 2 } },
     routeKey: "catalog-route",
-    onNavigate() {
-      return new Promise((resolve) => { releaseNavigation = resolve; });
+    onLoadOptions(_state, options) {
+      return new Promise((resolve) => {
+        releaseOptions = () => resolve(options.commitGuard());
+      });
     },
   });
   departed.controls.scheduleAvionicsSearch();
   const refresh = departed.controls.refreshAvionicsFromControls();
   departed.state.route = { name: "review", view: "pipeline" };
-  releaseNavigation();
+  releaseOptions();
   assert.equal(await refresh, false);
   assert.equal(departed.timers.size, 0);
+  assert.equal(departed.optionRefreshes.length, 1);
+  assert.deepEqual(departed.navigations, []);
   assert.deepEqual(departed.reloads, [], "route exit suppresses the late forced reload");
 });
 
@@ -1180,7 +1336,14 @@ test("renders reconciled creates and edits only on the current Listings destinat
   const end = appJs.indexOf("\nasync function deleteCurrentListing", start);
   assert.ok(start >= 0 && end > start);
 
-  const run = async ({ editingListingId, responseListing, destination }) => {
+  const run = async ({
+    editingListingId,
+    responseListing,
+    destination,
+    destinationEditingListingId = editingListingId,
+    destinationSaveDisabled = null,
+    attemptSecondSubmit = false,
+  }) => {
     const originalRoute = {
       name: "listings",
       ...(editingListingId === null ? { selected: "new" } : { listingId: editingListingId }),
@@ -1189,18 +1352,23 @@ test("renders reconciled creates and edits only on the current Listings destinat
     let currentRoute = originalRoute;
     let resolveSave;
     const applied = [];
+    const busyTransitions = [];
     const forbidden = [];
     const requests = [];
+    const saveButton = { disabled: false };
     const state = {
       listings: [{ id: 7, label: "old" }],
       editingListingId,
+      listingEditorVerified: false,
       listingDraftDirty: true,
+      listingSaveOwner: null,
     };
     const save = Function(
       "state",
       "elements",
       "appRouter",
       "routeActivationIsCurrent",
+      "synchronizeListingSaveDisabled",
       "setFormMessage",
       "setButtonBusy",
       "readListingForm",
@@ -1214,11 +1382,19 @@ test("renders reconciled creates and edits only on the current Listings destinat
       `${appJs.slice(start, end)}\nreturn saveListing;`,
     )(
       state,
-      { saveListing: {} },
+      { saveListing: saveButton },
       { current: () => currentRoute },
       (owner, current) => owner === current,
+      () => {
+        saveButton.disabled = state.listingEditorVerified
+          || state.listingSaveOwner !== null;
+        busyTransitions.push(saveButton.disabled);
+      },
       () => {},
-      () => {},
+      (button, busy) => {
+        button.disabled = busy;
+        busyTransitions.push(busy);
+      },
       () => ({ manufacturer: "Piper" }),
       (path, options) => {
         requests.push({ path, options });
@@ -1243,9 +1419,17 @@ test("renders reconciled creates and edits only on the current Listings destinat
 
     const pending = save({ preventDefault() {} });
     currentRoute = destination;
+    state.editingListingId = destinationEditingListingId;
+    if (destinationSaveDisabled !== null) {
+      state.listingEditorVerified = destinationSaveDisabled;
+      saveButton.disabled = destinationSaveDisabled;
+    }
+    const secondSubmit = attemptSecondSubmit
+      ? save({ preventDefault() {} })
+      : Promise.resolve();
     resolveSave({ listing: responseListing });
-    await pending;
-    return { applied, forbidden, requests, state };
+    await Promise.all([pending, secondSubmit]);
+    return { applied, busyTransitions, forbidden, requests, saveButton, state };
   };
 
   const filteredRoute = { name: "listings", filters: { search: "Piper" } };
@@ -1265,12 +1449,56 @@ test("renders reconciled creates and edits only on the current Listings destinat
     editingListingId: 7,
     responseListing: { id: 7, label: "updated" },
     destination: editedRoute,
+    destinationEditingListingId: 9,
+    destinationSaveDisabled: true,
+    attemptSecondSubmit: true,
   });
   assert.equal(edited.state.listings[0].label, "updated");
   assert.deepEqual(edited.applied, [editedRoute]);
   assert.equal(edited.requests[0].path, "/api/listings/7");
   assert.equal(edited.state.listingDraftDirty, true);
+  assert.equal(edited.saveButton.disabled, true);
+  assert.deepEqual(
+    edited.busyTransitions,
+    [true, true],
+    "save A cannot re-enable the verified listing B editor",
+  );
+  assert.equal(edited.requests.length, 1, "save B is blocked while save A is pending");
   assert.deepEqual(edited.forbidden, []);
+
+  const sameEditorRoute = {
+    name: "listings",
+    listingId: 7,
+    filters: { search: "new filter" },
+  };
+  const sameEditor = await run({
+    editingListingId: 7,
+    responseListing: { id: 7, label: "updated" },
+    destination: sameEditorRoute,
+    attemptSecondSubmit: true,
+  });
+  assert.deepEqual(sameEditor.applied, [sameEditorRoute]);
+  assert.equal(sameEditor.saveButton.disabled, false);
+  assert.deepEqual(
+    sameEditor.busyTransitions,
+    [true, false],
+    "a filter-only replacement for the same editor releases its Save control",
+  );
+  assert.equal(sameEditor.state.listingSaveOwner, null);
+  assert.equal(sameEditor.requests.length, 1, "the same editor cannot submit twice");
+
+  const sameCreation = await run({
+    editingListingId: null,
+    responseListing: { id: 8, label: "created" },
+    destination: {
+      name: "listings",
+      selected: "new",
+      filters: { search: "new filter" },
+    },
+    attemptSecondSubmit: true,
+  });
+  assert.equal(sameCreation.requests.length, 1, "the re-entered new editor cannot submit twice");
+  assert.deepEqual(sameCreation.busyTransitions, [true, false]);
 
   const crossTask = await run({
     editingListingId: null,

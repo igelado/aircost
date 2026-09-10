@@ -52,7 +52,9 @@ const state = {
   aircraftOptions: [],
   aircraftDetail: null,
   editingListingId: null,
+  listingEditorVerified: false,
   listingDraftDirty: false,
+  listingSaveOwner: null,
   valuationStatus: null,
 };
 
@@ -1235,15 +1237,21 @@ function handleTableClick(event) {
   }
 }
 
+function synchronizeListingSaveDisabled() {
+  elements.saveListing.disabled = state.listingEditorVerified
+    || state.listingSaveOwner !== null;
+}
+
 function editListing(listing) {
   state.editingListingId = listing.id;
+  state.listingEditorVerified = listing.is_verified === true;
   elements.listingFormTitle.textContent = `Edit listing ${listing.id}`;
   elements.formModeStatus.textContent = listing.is_verified
     ? "Verified listings cannot be changed here."
     : "Changes update this unverified listing.";
   elements.deleteListing.classList.toggle("is-hidden", listing.is_verified);
   elements.deleteListing.disabled = listing.is_verified;
-  elements.saveListing.disabled = listing.is_verified;
+  synchronizeListingSaveDisabled();
 
   setField("manufacturer", listing.aircraft?.manufacturer);
   setField("model", listing.aircraft?.model);
@@ -1271,12 +1279,13 @@ function editListing(listing) {
 function resetListingForm({ updateRoute = true } = {}) {
   const wasEditing = state.editingListingId !== null;
   state.editingListingId = null;
+  state.listingEditorVerified = false;
   elements.listingForm.reset();
   elements.listingFormTitle.textContent = "New aircraft";
   elements.formModeStatus.textContent = "Manual entries are saved as unverified.";
   elements.deleteListing.classList.add("is-hidden");
   elements.deleteListing.disabled = false;
-  elements.saveListing.disabled = false;
+  synchronizeListingSaveDisabled();
   setField("currency", "USD");
   setField("status", "active");
   elements.avionicsList.replaceChildren();
@@ -1321,7 +1330,12 @@ function closeListingDialog({ navigate = true } = {}) {
 
 async function saveListing(event) {
   event.preventDefault();
+  if (state.listingSaveOwner !== null) {
+    return;
+  }
   const routeOwner = appRouter.current();
+  const saveOwner = {};
+  state.listingSaveOwner = saveOwner;
   const ownsRoute = () => routeActivationIsCurrent(routeOwner, appRouter.current());
   setFormMessage("Saving listing...");
   setButtonBusy(elements.saveListing, true);
@@ -1358,7 +1372,10 @@ async function saveListing(event) {
       setFormMessage(error.message, true);
     }
   } finally {
-    setButtonBusy(elements.saveListing, false);
+    if (state.listingSaveOwner === saveOwner) {
+      state.listingSaveOwner = null;
+      synchronizeListingSaveDisabled();
+    }
   }
 }
 
