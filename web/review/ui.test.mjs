@@ -398,6 +398,69 @@ test("canonicalizes catalog result pages before continuing detail activation", (
   );
 });
 
+test("catalog deactivation cancels a pending routed search", () => {
+  const deactivateStart = avionicsJs.indexOf("function deactivateAvionicsInspector");
+  const deactivateEnd = avionicsJs.indexOf("\nasync function applyCatalogRoute", deactivateStart);
+  const searchStart = avionicsJs.indexOf("function scheduleAvionicsSearch");
+  const searchEnd = avionicsJs.indexOf("\nasync function loadAvionics", searchStart);
+  assert.ok(deactivateStart >= 0 && deactivateEnd > deactivateStart);
+  assert.ok(searchStart >= 0 && searchEnd > searchStart);
+
+  let nextTimer = 1;
+  const timers = new Map();
+  const navigations = [];
+  const state = {
+    avionicsSearchTimer: null,
+    route: { name: "catalog", filters: { page: 1 } },
+  };
+  const window = {
+    setTimeout(callback) {
+      const timer = nextTimer;
+      nextTimer += 1;
+      timers.set(timer, callback);
+      return timer;
+    },
+    clearTimeout(timer) {
+      timers.delete(timer);
+    },
+  };
+  const lifecycle = Function(
+    "state",
+    "window",
+    "navigate",
+    "catalogRouteFromControls",
+    "closeAvionicsDetail",
+    `${avionicsJs.slice(deactivateStart, deactivateEnd)}\n`
+      + `${avionicsJs.slice(searchStart, searchEnd)}\n`
+      + "return { deactivateAvionicsInspector, scheduleAvionicsSearch };",
+  )(
+    state,
+    window,
+    (route, options) => navigations.push({ route, options }),
+    () => ({ name: "catalog", filters: { search: "GNS", page: 1 } }),
+    () => {},
+  );
+  const runTimers = () => {
+    const pending = Array.from(timers.values());
+    timers.clear();
+    pending.forEach((callback) => callback());
+  };
+
+  lifecycle.scheduleAvionicsSearch();
+  assert.equal(timers.size, 1);
+  lifecycle.deactivateAvionicsInspector();
+  runTimers();
+  assert.equal(state.avionicsSearchTimer, null);
+  assert.deepEqual(navigations, [], "a deactivated search cannot route back to Catalog");
+
+  lifecycle.scheduleAvionicsSearch();
+  runTimers();
+  assert.deepEqual(navigations, [{
+    route: { name: "catalog", filters: { search: "GNS", page: 1 } },
+    options: { replace: true },
+  }]);
+});
+
 test("hands catalog deletion cleanup to the exact operation owner", () => {
   assert.match(
     avionicsJs,

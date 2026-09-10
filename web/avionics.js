@@ -63,8 +63,7 @@ export function initializeAvionicsInspector(shared) {
       return applyCatalogRoute(route, context);
     },
     deactivate() {
-      state.route = { ...state.route };
-      closeAvionicsDetail(false, { updateRoute: false });
+      deactivateAvionicsInspector();
     },
     confirmRouteChange(next) {
       return !state.avionicsDeleting
@@ -75,6 +74,12 @@ export function initializeAvionicsInspector(shared) {
       return loadAvionicsWorkspace(true);
     },
   });
+}
+
+function deactivateAvionicsInspector() {
+  cancelAvionicsSearch();
+  state.route = { ...state.route };
+  closeAvionicsDetail(false, { updateRoute: false });
 }
 
 async function applyCatalogRoute(route, { source } = {}) {
