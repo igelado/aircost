@@ -73,6 +73,25 @@ test("guards review mutations and stale asynchronous completion at the route bou
   );
 });
 
+test("drops stale listing, product-review, and catalog activation continuations", () => {
+  assert.match(
+    appJs,
+    /const routeOwner = appRouter\.current\(\);\s*const ownsRoute = \(\) => routeActivationIsCurrent\(routeOwner, appRouter\.current\(\)\);/,
+  );
+  assert.match(
+    appJs,
+    /await refreshAircraftAfterEstimateResponse\(response\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*navigateRoute\(/,
+  );
+  assert.match(
+    reviewJs,
+    /Promise\.resolve\(queueLoad\)\.then\(\(loaded\) => \(\s*loaded\s*&& routeActivationIsCurrent\(route, state\.route\)/,
+  );
+  assert.match(
+    avionicsJs,
+    /await loadAvionicsOptions\(\);\s*\}\s*if \(!routeActivationIsCurrent\(route, state\.route\)\) \{\s*return;/,
+  );
+});
+
 test("uses a compact multi-capability dropdown in listing avionics rows", () => {
   assert.match(appJs, /function avionicsTypeDropdown\(values = \[\]\)/);
   assert.match(appJs, /querySelectorAll\('\[name="avionics_types"\]:checked'\)/);

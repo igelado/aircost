@@ -59,6 +59,7 @@ import {
   reviewListingRouteOwner,
   reviewListingRouteOwnerIsCurrent,
   reviewMutationInProgress,
+  routeActivationIsCurrent,
 } from "/routing.mjs";
 
 const QUEUE_LIMIT = 100;
@@ -222,7 +223,12 @@ function activateReviewRoute(route) {
       ? Promise.resolve(true)
       : loadProductQueue();
     const detailLoad = route.productId
-      ? Promise.resolve(queueLoad).then(() => openProductReview(route.productId))
+      ? Promise.resolve(queueLoad).then((loaded) => (
+        loaded
+        && routeActivationIsCurrent(route, state.route)
+          ? openProductReview(route.productId)
+          : { status: "superseded" }
+      ))
       : Promise.resolve(closeProductReview());
     return Promise.allSettled([queueLoad, detailLoad]);
   }

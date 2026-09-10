@@ -9,6 +9,7 @@ let setButtonBusy;
 let refreshListings;
 let refreshReview;
 let navigate;
+let routeActivationIsCurrent;
 
 const state = {
   avionicsItems: [],
@@ -46,6 +47,7 @@ export function initializeAvionicsInspector(shared) {
     refreshListings,
     refreshReview,
     navigate,
+    routeActivationIsCurrent,
   } = shared);
   collectElements();
   bindEvents();
@@ -79,6 +81,9 @@ async function applyCatalogRoute(route) {
   if (!state.avionicsOptionsLoaded) {
     await loadAvionicsOptions();
   }
+  if (!routeActivationIsCurrent(route, state.route)) {
+    return;
+  }
   setCatalogSelectValue(elements.avionicsStatusFilter, filters.status);
   setCatalogSelectValue(elements.avionicsCapabilityFilter, filters.capability);
   const routeKey = JSON.stringify(filters);
@@ -87,7 +92,7 @@ async function applyCatalogRoute(route) {
     state.catalogRouteKey = routeKey;
     await loadAvionics();
   }
-  if (state.route !== route) {
+  if (!routeActivationIsCurrent(route, state.route)) {
     return;
   }
   if (route.productId) {

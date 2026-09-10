@@ -4,6 +4,7 @@ import {
   createHistoryRouter,
   destinationForRoute,
   parseRoute,
+  routeActivationIsCurrent,
 } from "/routing.mjs";
 
 const USER_HEADER = "developer";
@@ -69,6 +70,7 @@ document.addEventListener("DOMContentLoaded", () => {
     refreshListings: loadListings,
     refreshReview: () => reviewWorkspace.refresh(),
     navigate: navigateRoute,
+    routeActivationIsCurrent,
   });
   reviewWorkspace = initializeReviewWorkspace({
     api,
@@ -1269,6 +1271,8 @@ function closeListingDialog({ navigate = true } = {}) {
 
 async function saveListing(event) {
   event.preventDefault();
+  const routeOwner = appRouter.current();
+  const ownsRoute = () => routeActivationIsCurrent(routeOwner, appRouter.current());
   setFormMessage("Saving listing...");
   setButtonBusy(elements.saveListing, true);
   try {
@@ -1280,15 +1284,26 @@ async function saveListing(event) {
       method,
       body: JSON.stringify({ listing }),
     });
+    if (!ownsRoute()) {
+      return;
+    }
     await loadListings();
+    if (!ownsRoute()) {
+      return;
+    }
     await refreshAircraftAfterEstimateResponse(response);
+    if (!ownsRoute()) {
+      return;
+    }
     navigateRoute({
       name: "listings",
       filters: listingFiltersFromControls(),
     }, { replace: true });
     setListMessage(isEditing ? "Listing updated." : "Listing created.");
   } catch (error) {
-    setFormMessage(error.message, true);
+    if (ownsRoute()) {
+      setFormMessage(error.message, true);
+    }
   } finally {
     setButtonBusy(elements.saveListing, false);
   }
@@ -1315,20 +1330,33 @@ async function deleteListing(listing) {
   } else {
     setListMessage("Deleting listing...");
   }
+  const routeOwner = appRouter.current();
+  const ownsRoute = () => routeActivationIsCurrent(routeOwner, appRouter.current());
   try {
     await api(`/api/listings/${listing.id}`, { method: "DELETE" });
+    if (!ownsRoute()) {
+      return;
+    }
     await loadListings();
+    if (!ownsRoute()) {
+      return;
+    }
     await loadAircraftOptions();
+    if (!ownsRoute()) {
+      return;
+    }
     navigateRoute({
       name: "listings",
       filters: listingFiltersFromControls(),
     }, { replace: true });
     setListMessage("Listing deleted.");
   } catch (error) {
-    if (elements.listingDialog.open) {
-      setFormMessage(error.message, true);
-    } else {
-      setListMessage(error.message, true);
+    if (ownsRoute()) {
+      if (elements.listingDialog.open) {
+        setFormMessage(error.message, true);
+      } else {
+        setListMessage(error.message, true);
+      }
     }
   }
 }

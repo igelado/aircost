@@ -11,6 +11,7 @@ import {
   reviewListingRouteOwner,
   reviewListingRouteOwnerIsCurrent,
   reviewMutationInProgress,
+  routeActivationIsCurrent,
 } from "../routing.mjs";
 
 test("publishes the four frozen task destinations and panel IDs", () => {
@@ -160,6 +161,28 @@ test("invalidates asynchronous review completion when route ownership changes", 
     false,
   );
   assert.equal(reviewListingRouteOwner(parseRoute("/#/review/manual"), 8), null);
+});
+
+test("drops a deferred continuation after a newer route activation", async () => {
+  const firstRoute = parseRoute("/#/review/products/28");
+  let currentRoute = firstRoute;
+  let release;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  });
+  let committed = false;
+  const continuation = pending.then(() => {
+    if (routeActivationIsCurrent(firstRoute, currentRoute)) {
+      committed = true;
+    }
+  });
+
+  currentRoute = parseRoute("/#/review/products/29");
+  release();
+  await continuation;
+
+  assert.equal(committed, false);
+  assert.equal(routeActivationIsCurrent(currentRoute, currentRoute), true);
 });
 
 test("restores complete route snapshots through Back and Forward without recursive writes", () => {

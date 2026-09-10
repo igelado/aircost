@@ -217,6 +217,10 @@ export function reviewMutationInProgress({
     || associationValidation;
 }
 
+export function routeActivationIsCurrent(owner, current) {
+  return owner === current;
+}
+
 export function reviewListingRouteOwner(route, generation) {
   const listingId = reviewListingIdForRoute(route);
   return listingId === null ? null : { generation, listingId };
