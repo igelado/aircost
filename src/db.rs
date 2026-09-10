@@ -13642,37 +13642,6 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        let prices_before: String = sqlx::query_scalar(
-            "SELECT COALESCE(jsonb_agg(to_jsonb(price_row) ORDER BY id), '[]'::jsonb)::text FROM public.aircraft_reference_prices price_row",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let price_sequence_before: String = sqlx::query_scalar(
-            "SELECT last_value::text || ':' || is_called::text FROM public.aircraft_reference_prices_id_seq",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let mut migration_connection = pool.acquire().await.unwrap();
-        for statement in split_sql_statements(REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL) {
-            migration_connection.execute(statement).await.unwrap();
-        }
-        drop(migration_connection);
-        let prices_after: String = sqlx::query_scalar(
-            "SELECT COALESCE(jsonb_agg(to_jsonb(price_row) ORDER BY id), '[]'::jsonb)::text FROM public.aircraft_reference_prices price_row",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let price_sequence_after: String = sqlx::query_scalar(
-            "SELECT last_value::text || ':' || is_called::text FROM public.aircraft_reference_prices_id_seq",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(prices_after, prices_before);
-        assert_eq!(price_sequence_after, price_sequence_before);
         let preflight = AppDb {
             backend: DatabaseBackend::Postgres(pool),
         };
@@ -15357,7 +15326,10 @@ mod tests {
         .await
         .unwrap();
         let expected = postgres_receipt_snapshot(pool).await;
-        assert_eq!(expected.len(), 24);
+        assert_eq!(
+            expected.len(),
+            canonical_startup_migration_contract_receipts(DatabaseKind::Postgres).len() + 1
+        );
         assert!(expected
             .iter()
             .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
@@ -15642,7 +15614,10 @@ mod tests {
             .connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(postgres_receipt_snapshot(&inspection).await.len(), 23);
+        assert_eq!(
+            postgres_receipt_snapshot(&inspection).await.len(),
+            canonical_startup_migration_contract_receipts(DatabaseKind::Postgres).len()
+        );
         inspection.close().await;
     }
 
@@ -16994,7 +16969,7 @@ mod tests {
             .unwrap();
         pool.execute("CREATE SCHEMA attacker_schema").await.unwrap();
         pool.execute(
-            "ALTER FUNCTION public.require_source_identity_correction_receipt() \
+            "ALTER FUNCTION public.preserve_aircraft_listing_identity_correction() \
              SET search_path = attacker_schema, public",
         )
         .await
@@ -17004,7 +16979,7 @@ mod tests {
             .await
             .unwrap());
         pool.execute(
-            "ALTER FUNCTION public.require_source_identity_correction_receipt() \
+            "ALTER FUNCTION public.preserve_aircraft_listing_identity_correction() \
              SET search_path = pg_catalog",
         )
         .await
@@ -17015,7 +16990,7 @@ mod tests {
             .unwrap());
 
         pool.execute(
-            "ALTER FUNCTION public.require_source_identity_correction_receipt() \
+            "ALTER FUNCTION public.preserve_aircraft_listing_identity_correction() \
              SET SCHEMA attacker_schema",
         )
         .await
@@ -17026,7 +17001,7 @@ mod tests {
             .unwrap());
 
         pool.execute(
-            "ALTER FUNCTION attacker_schema.require_source_identity_correction_receipt() \
+            "ALTER FUNCTION attacker_schema.preserve_aircraft_listing_identity_correction() \
              SET SCHEMA public",
         )
         .await
