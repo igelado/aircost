@@ -127,7 +127,7 @@ explicit plan amendment.
 | MNT-018F | `coder` (Parfit review) — `codex/mnt-018f-enforce-quality-gate` | MNT-018C, MNT-018D, MNT-018E | CI/lint policy and canonical `-D warnings` command only |
 | MNT-017 | `architect` -> `coder` (Parfit review) — `codex/mnt-017-cli-doc-registry` | MNT-003, MNT-018F | `src/admin.rs`, command docs, proposal lifecycle headers; add a CLI dependency only for measured net simplification |
 | MNT-020A | `coder` (Parfit review) — `codex/mnt-020a-compatibility-inventory` | MNT-017 | inventory, consumers, warnings, telemetry/deployment evidence, removal gates; no premature removal |
-| MNT-020B | `coder` (Parfit review) — `codex/mnt-020b-remove-expired-compatibility` | MNT-020A, MNT-002, MNT-015B | remove only paths whose consumer/removal evidence is satisfied, including tests/docs/adapters |
+| MNT-020B | `coder` (Parfit review) — `codex/mnt-020b-remove-expired-compatibility` | MNT-020A, MNT-002, MNT-015B, MNT-025 | remove only paths whose consumer/removal evidence is satisfied, including tests/docs/adapters |
 
 `MNT-018C`, `MNT-018D`, and `MNT-018E` are the only intentionally parallel
 Rust-wide cleanup branches. Their file fences are disjoint: MNT-018C owns all
@@ -212,7 +212,7 @@ otherwise start:
    -> MNT-012 -> MNT-023 -> MNT-008A/B/C/D.
 3. **Review/verification:** `src/listing/review**`,
    `src/listing/verification.rs`, `src/avionics/verification.rs`, and review
-   protocol files. Order: MNT-002 -> MNT-011 -> MNT-025.
+   protocol files. Order: MNT-002 -> MNT-011 -> MNT-025 -> MNT-020B.
 4. **Catalog mutation:** avionics consolidation/deletion and guard triggers.
    Order: MNT-022 -> MNT-021.
 5. **Capture/replay:** `src/plugin.rs` and replay lifecycle files. Order:
@@ -221,9 +221,10 @@ otherwise start:
    static-asset wiring. Run only one Boole/Gauss web branch at a time unless
    both changed-file fences have been proven disjoint after controller
    extraction.
-7. **Extension popup:** `chrome-extension/popup.*`. Order: WEB-010 -> WEB-011
-   -> WEB-013 -> MNT-016B -> WEB-012. `MNT-016A` owns `background.js` and may
-   run beside main-web work.
+7. **Extension popup:** `chrome-extension/popup.*`. Order: MNT-016A -> WEB-010
+   -> WEB-011 -> WEB-013 -> MNT-016B -> WEB-012. MNT-016A primarily owns
+   `background.js` and may run beside main-web work, but its minimal popup shim
+   reserves this queue until merge.
 8. **CI/Cargo:** `.github/workflows/test.yml`, `Cargo.toml`, `Cargo.lock`,
    toolchain/lint files. Parfit schedules these serially; a feature dependency
    addition waits or receives an explicit temporary fence.
@@ -254,8 +255,9 @@ initial and major gates are:
 7. **Schema/review train:** after the observation gate, serialize MNT-006B,
    MNT-022, MNT-002, and MNT-011.
 8. **Domain expansion wave:** after MNT-011, run disjoint MNT-014, MNT-024,
-   MNT-025, MNT-020B, and eligible web work in parallel. Then land MNT-013,
-   MNT-021, MNT-012, and MNT-023 subject to their hotspot queues.
+   and eligible web work in parallel. Serialize MNT-025 and then MNT-020B in
+   the review queue. Then land MNT-013, MNT-021, MNT-012, and MNT-023 subject
+   to their hotspot queues.
 9. **Removal/storage train:** serialize MNT-008A/B/C/D, then MNT-019.
 10. **Web finish:** serialize remaining task flows, WEB-009B, WEB-010,
     WEB-011, WEB-006, WEB-013, MNT-016B, and WEB-012. Land WEB-014 last.

@@ -1558,7 +1558,12 @@ Acceptance criteria:
 - [ ] Visual captures cover representative widths/states without becoming the
       only assertion mechanism.
 
-## Staged execution plan
+## Historical staged execution sketch (superseded)
+
+Do not schedule work from the phase list below. It records the first audit
+grouping and does not express implementation prerequisites or shared-file
+serialization. The authoritative branch order, split units, and conflict
+barriers are in `docs/improvement-execution-plan.md`.
 
 ### Phase 1 — Correctness and reliable feedback
 
