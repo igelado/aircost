@@ -205,8 +205,7 @@ function collectElements() {
 
 function bindEvents() {
   elements.refreshAvionics.addEventListener("click", () => {
-    cancelAvionicsSearch();
-    loadAvionicsWorkspace(true);
+    refreshAvionicsFromControls();
   });
   elements.avionicsSearch.addEventListener("input", scheduleAvionicsSearch);
   for (const filter of [
@@ -245,12 +244,17 @@ function bindEvents() {
   elements.avionicsDetailDialog.addEventListener("close", finishAvionicsDetailClose);
 }
 
-async function loadAvionicsWorkspace(forceOptions = false) {
+async function loadAvionicsWorkspace(forceOptions = false, { source } = {}) {
   if (forceOptions || !state.avionicsOptionsLoaded) {
     await loadAvionicsOptions();
   }
   const filters = state.route?.filters || {};
-  elements.avionicsSearch.value = filters.search || "";
+  if (!preserveLiveRouteInput(
+    source,
+    document.activeElement === elements.avionicsSearch,
+  )) {
+    elements.avionicsSearch.value = filters.search || "";
+  }
   elements.avionicsCompletenessFilter.value = filters.completeness || "";
   setCatalogSelectValue(elements.avionicsStatusFilter, filters.status);
   setCatalogSelectValue(elements.avionicsCapabilityFilter, filters.capability);
@@ -325,6 +329,29 @@ function scheduleAvionicsSearch() {
     state.avionicsSearchTimer = null;
     navigate(catalogRouteFromControls({ page: 1 }), { replace: true });
   }, 250);
+}
+
+async function refreshAvionicsFromControls() {
+  const hadPendingSearch = state.avionicsSearchTimer !== null;
+  const previousRouteKey = state.catalogRouteKey;
+  const route = catalogRouteFromControls({
+    page: hadPendingSearch ? 1 : state.route?.filters?.page || 1,
+    productId: state.route?.productId || null,
+  });
+  cancelAvionicsSearch();
+  const activation = navigate(route, { replace: true });
+  if (activation === false) {
+    return false;
+  }
+  const routeOwner = state.route;
+  await activation;
+  if (!routeActivationIsCurrent(routeOwner, state.route)) {
+    return false;
+  }
+  if (state.catalogRouteKey === previousRouteKey) {
+    await loadAvionicsWorkspace(true, { source: "refresh" });
+  }
+  return true;
 }
 
 function cancelAvionicsSearch() {

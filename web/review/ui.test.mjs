@@ -537,6 +537,158 @@ test("catalog deactivation cancels a pending routed search", () => {
   }]);
 });
 
+test("catalog refresh flushes pending live searches without a late route write", async () => {
+  const searchStart = avionicsJs.indexOf("function scheduleAvionicsSearch");
+  const searchEnd = avionicsJs.indexOf("\nasync function loadAvionics", searchStart);
+  assert.ok(searchStart >= 0 && searchEnd > searchStart);
+
+  const compile = ({ search, route, routeKey, onNavigate }) => {
+    let nextTimer = 1;
+    const timers = new Map();
+    const state = {
+      avionicsSearchTimer: null,
+      catalogRouteKey: routeKey,
+      route,
+    };
+    const navigations = [];
+    const reloads = [];
+    const controls = Function(
+      "state",
+      "window",
+      "navigate",
+      "catalogRouteFromControls",
+      "routeActivationIsCurrent",
+      "loadAvionicsWorkspace",
+      `${avionicsJs.slice(searchStart, searchEnd)}\n`
+        + "return { scheduleAvionicsSearch, refreshAvionicsFromControls };",
+    )(
+      state,
+      {
+        setTimeout(callback) {
+          const timer = nextTimer;
+          nextTimer += 1;
+          timers.set(timer, callback);
+          return timer;
+        },
+        clearTimeout(timer) {
+          timers.delete(timer);
+        },
+      },
+      (nextRoute, options) => {
+        navigations.push({ route: nextRoute, options });
+        state.route = nextRoute;
+        return onNavigate?.(state, nextRoute) ?? Promise.resolve();
+      },
+      ({ page, productId }) => ({
+        name: "catalog",
+        filters: { search, page },
+        ...(productId === null ? {} : { productId }),
+      }),
+      (owner, current) => owner === current,
+      (force, context) => reloads.push({ force, context }),
+    );
+    return { controls, state, timers, navigations, reloads };
+  };
+
+  for (const search of ["GNS 430", ""]) {
+    const harness = compile({
+      search,
+      route: {
+        name: "catalog",
+        filters: { search: "GNS", page: 3 },
+        productId: 9,
+      },
+      routeKey: "old-route",
+      onNavigate(state) {
+        state.catalogRouteKey = "new-route";
+        return Promise.resolve();
+      },
+    });
+    harness.controls.scheduleAvionicsSearch();
+    assert.equal(harness.timers.size, 1);
+    assert.equal(await harness.controls.refreshAvionicsFromControls(), true);
+    assert.equal(harness.timers.size, 0);
+    assert.deepEqual(harness.navigations, [{
+      route: {
+        name: "catalog",
+        filters: { search, page: 1 },
+        productId: 9,
+      },
+      options: { replace: true },
+    }]);
+    assert.deepEqual(harness.reloads, [], "the changed route activation performs the reload");
+  }
+
+  const unchanged = compile({
+    search: "GNS",
+    route: { name: "catalog", filters: { search: "GNS", page: 2 } },
+    routeKey: "same-route",
+  });
+  assert.equal(await unchanged.controls.refreshAvionicsFromControls(), true);
+  assert.deepEqual(unchanged.navigations, [{
+    route: { name: "catalog", filters: { search: "GNS", page: 2 } },
+    options: { replace: true },
+  }]);
+  assert.deepEqual(
+    unchanged.reloads,
+    [{ force: true, context: { source: "refresh" } }],
+    "an unchanged route still performs a focused-input-safe forced refresh",
+  );
+
+  const loadStart = avionicsJs.indexOf("async function loadAvionicsWorkspace");
+  const loadEnd = avionicsJs.indexOf("\nasync function loadAvionicsOptions", loadStart);
+  assert.ok(loadStart >= 0 && loadEnd > loadStart);
+  const searchInput = { value: "GNS " };
+  const loadCalls = [];
+  const loadWorkspace = Function(
+    "state",
+    "elements",
+    "document",
+    "preserveLiveRouteInput",
+    "loadAvionicsOptions",
+    "setCatalogSelectValue",
+    "loadAvionics",
+    `${avionicsJs.slice(loadStart, loadEnd)}\nreturn loadAvionicsWorkspace;`,
+  )(
+    {
+      avionicsOptionsLoaded: true,
+      avionicsLimit: 20,
+      route: { name: "catalog", filters: { search: "GNS", page: 1 } },
+    },
+    {
+      avionicsSearch: searchInput,
+      avionicsCompletenessFilter: {},
+      avionicsStatusFilter: {},
+      avionicsCapabilityFilter: {},
+    },
+    { activeElement: searchInput },
+    (source, focused) => source === "refresh" && focused,
+    () => loadCalls.push("options"),
+    () => {},
+    () => loadCalls.push("catalog"),
+  );
+  await loadWorkspace(true, { source: "refresh" });
+  assert.equal(searchInput.value, "GNS ");
+  assert.deepEqual(loadCalls, ["options", "catalog"]);
+
+  let releaseNavigation;
+  const departed = compile({
+    search: "GTN",
+    route: { name: "catalog", filters: { search: "", page: 2 } },
+    routeKey: "catalog-route",
+    onNavigate() {
+      return new Promise((resolve) => { releaseNavigation = resolve; });
+    },
+  });
+  departed.controls.scheduleAvionicsSearch();
+  const refresh = departed.controls.refreshAvionicsFromControls();
+  departed.state.route = { name: "review", view: "pipeline" };
+  releaseNavigation();
+  assert.equal(await refresh, false);
+  assert.equal(departed.timers.size, 0);
+  assert.deepEqual(departed.reloads, [], "route exit suppresses the late forced reload");
+});
+
 test("catalog deactivation suppresses hidden trigger focus", () => {
   const deactivateStart = avionicsJs.indexOf("function deactivateAvionicsInspector");
   const deactivateEnd = avionicsJs.indexOf("\nasync function applyCatalogRoute", deactivateStart);
@@ -877,11 +1029,11 @@ test("drops stale listing, product-review, and catalog activation continuations"
   );
   assert.match(
     appJs,
-    /const response = await api\([\s\S]*?state\.listings = reconcileSavedListingCache\(state\.listings, response\?\.listing\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*state\.listingDraftDirty = false;\s*await loadListings\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await refreshAircraftAfterEstimateResponse\(response\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*navigateRoute\(/,
+    /const response = await api\([\s\S]*?state\.listings = reconcileSavedListingCache\(state\.listings, response\?\.listing\);\s*if \(!ownsRoute\(\)\) \{\s*applyReconciledListingsRoute\(\);\s*return;\s*\}\s*state\.listingDraftDirty = false;\s*await loadListings\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await refreshAircraftAfterEstimateResponse\(response\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*navigateRoute\(/,
   );
   assert.match(
     appJs,
-    /await api\(`\/api\/listings\/\$\{listing\.id\}`[\s\S]*?state\.listings = reconcileDeletedListingCache\(state\.listings, listing\.id\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*state\.listingDraftDirty = false;\s*await loadListings\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await loadAircraftOptions\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*navigateRoute\(/,
+    /await api\(`\/api\/listings\/\$\{listing\.id\}`[\s\S]*?state\.listings = reconcileDeletedListingCache\(state\.listings, listing\.id\);\s*if \(!ownsRoute\(\)\) \{\s*applyReconciledListingsRoute\(\);\s*return;\s*\}\s*state\.listingDraftDirty = false;\s*await loadListings\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*await loadAircraftOptions\(\);\s*if \(!ownsRoute\(\)\) \{\s*return;\s*\}\s*navigateRoute\(/,
   );
   assert.match(
     reviewJs,
@@ -931,6 +1083,202 @@ test("reconciles stale listing saves and deletes without changing load semantics
     appJs.slice(start, end),
     /listingsLoaded|renderListings|navigateRoute/,
   );
+});
+
+test("renders a reconciled delete only on the current Listings destination", async () => {
+  const start = appJs.indexOf("async function deleteListing");
+  const end = appJs.indexOf("\nfunction reconcileSavedListingCache", start);
+  assert.ok(start >= 0 && end > start);
+
+  const scenario = () => {
+    const originalRoute = {
+      name: "listings",
+      filters: { search: "Cessna" },
+    };
+    let currentRoute = originalRoute;
+    let resolveDelete;
+    const applied = [];
+    const forbidden = [];
+    const state = {
+      listings: [{ id: 1 }, { id: 2 }],
+      listingDraftDirty: true,
+    };
+    const remove = Function(
+      "state",
+      "window",
+      "elements",
+      "setFormMessage",
+      "setListMessage",
+      "appRouter",
+      "routeActivationIsCurrent",
+      "api",
+      "reconcileDeletedListingCache",
+      "applyListingsRoute",
+      "loadListings",
+      "loadAircraftOptions",
+      "navigateRoute",
+      "listingFiltersFromControls",
+      `${appJs.slice(start, end)}\nreturn deleteListing;`,
+    )(
+      state,
+      { confirm: () => true },
+      { listingDialog: { open: false } },
+      () => {},
+      () => {},
+      { current: () => currentRoute },
+      (owner, current) => owner === current,
+      () => new Promise((resolve) => { resolveDelete = resolve; }),
+      (listings, listingId) => listings.filter((item) => item.id !== listingId),
+      (route, context) => applied.push({ route, context }),
+      () => forbidden.push("listings GET"),
+      () => forbidden.push("aircraft options GET"),
+      () => forbidden.push("history write"),
+      () => ({}),
+    );
+    return {
+      applied,
+      forbidden,
+      originalRoute,
+      remove,
+      resolveDelete: () => resolveDelete(),
+      setCurrentRoute(route) {
+        currentRoute = route;
+      },
+      state,
+    };
+  };
+
+  const sameDestination = scenario();
+  const pendingListingDelete = sameDestination.remove({ id: 1 });
+  const filteredRoute = {
+    name: "listings",
+    filters: { search: "Piper" },
+  };
+  sameDestination.setCurrentRoute(filteredRoute);
+  sameDestination.resolveDelete();
+  await pendingListingDelete;
+  assert.deepEqual(sameDestination.state.listings, [{ id: 2 }]);
+  assert.deepEqual(sameDestination.applied, [{
+    route: filteredRoute,
+    context: { source: "refresh" },
+  }]);
+  assert.deepEqual(sameDestination.forbidden, []);
+  assert.equal(sameDestination.state.listingDraftDirty, true);
+
+  const otherTask = scenario();
+  const pendingCrossTaskDelete = otherTask.remove({ id: 1 });
+  otherTask.setCurrentRoute({ name: "values", filters: {} });
+  otherTask.resolveDelete();
+  await pendingCrossTaskDelete;
+  assert.deepEqual(otherTask.state.listings, [{ id: 2 }]);
+  assert.deepEqual(otherTask.applied, [], "a cross-task route receives no Listings DOM work");
+  assert.deepEqual(otherTask.forbidden, []);
+});
+
+test("renders reconciled creates and edits only on the current Listings destination", async () => {
+  const start = appJs.indexOf("async function saveListing");
+  const end = appJs.indexOf("\nasync function deleteCurrentListing", start);
+  assert.ok(start >= 0 && end > start);
+
+  const run = async ({ editingListingId, responseListing, destination }) => {
+    const originalRoute = {
+      name: "listings",
+      ...(editingListingId === null ? { selected: "new" } : { listingId: editingListingId }),
+      filters: { search: "old" },
+    };
+    let currentRoute = originalRoute;
+    let resolveSave;
+    const applied = [];
+    const forbidden = [];
+    const requests = [];
+    const state = {
+      listings: [{ id: 7, label: "old" }],
+      editingListingId,
+      listingDraftDirty: true,
+    };
+    const save = Function(
+      "state",
+      "elements",
+      "appRouter",
+      "routeActivationIsCurrent",
+      "setFormMessage",
+      "setButtonBusy",
+      "readListingForm",
+      "api",
+      "reconcileSavedListingCache",
+      "applyReconciledListingsRoute",
+      "loadListings",
+      "refreshAircraftAfterEstimateResponse",
+      "navigateRoute",
+      "listingFiltersFromControls",
+      `${appJs.slice(start, end)}\nreturn saveListing;`,
+    )(
+      state,
+      { saveListing: {} },
+      { current: () => currentRoute },
+      (owner, current) => owner === current,
+      () => {},
+      () => {},
+      () => ({ manufacturer: "Piper" }),
+      (path, options) => {
+        requests.push({ path, options });
+        return new Promise((resolve) => { resolveSave = resolve; });
+      },
+      (listings, listing) => [
+        listing,
+        ...listings.filter((item) => item.id !== listing.id),
+      ],
+      () => {
+        if (currentRoute?.name === "listings") {
+          applied.push(currentRoute);
+          return true;
+        }
+        return false;
+      },
+      () => forbidden.push("listings GET"),
+      () => forbidden.push("aircraft refresh"),
+      () => forbidden.push("history write"),
+      () => ({}),
+    );
+
+    const pending = save({ preventDefault() {} });
+    currentRoute = destination;
+    resolveSave({ listing: responseListing });
+    await pending;
+    return { applied, forbidden, requests, state };
+  };
+
+  const filteredRoute = { name: "listings", filters: { search: "Piper" } };
+  const created = await run({
+    editingListingId: null,
+    responseListing: { id: 8, label: "created" },
+    destination: filteredRoute,
+  });
+  assert.deepEqual(created.state.listings.map((listing) => listing.id), [8, 7]);
+  assert.deepEqual(created.applied, [filteredRoute]);
+  assert.equal(created.requests[0].path, "/api/listings");
+  assert.equal(created.state.listingDraftDirty, true);
+  assert.deepEqual(created.forbidden, []);
+
+  const editedRoute = { name: "listings", listingId: 9, filters: { search: "Beech" } };
+  const edited = await run({
+    editingListingId: 7,
+    responseListing: { id: 7, label: "updated" },
+    destination: editedRoute,
+  });
+  assert.equal(edited.state.listings[0].label, "updated");
+  assert.deepEqual(edited.applied, [editedRoute]);
+  assert.equal(edited.requests[0].path, "/api/listings/7");
+  assert.equal(edited.state.listingDraftDirty, true);
+  assert.deepEqual(edited.forbidden, []);
+
+  const crossTask = await run({
+    editingListingId: null,
+    responseListing: { id: 8, label: "created" },
+    destination: { name: "review", view: "pipeline" },
+  });
+  assert.deepEqual(crossTask.applied, []);
+  assert.deepEqual(crossTask.forbidden, []);
 });
 
 test("uses a compact multi-capability dropdown in listing avionics rows", () => {

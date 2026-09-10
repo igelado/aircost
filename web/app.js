@@ -1336,6 +1336,7 @@ async function saveListing(event) {
     });
     state.listings = reconcileSavedListingCache(state.listings, response?.listing);
     if (!ownsRoute()) {
+      applyReconciledListingsRoute();
       return;
     }
     state.listingDraftDirty = false;
@@ -1388,6 +1389,7 @@ async function deleteListing(listing) {
     await api(`/api/listings/${listing.id}`, { method: "DELETE" });
     state.listings = reconcileDeletedListingCache(state.listings, listing.id);
     if (!ownsRoute()) {
+      applyReconciledListingsRoute();
       return;
     }
     state.listingDraftDirty = false;
@@ -1413,6 +1415,15 @@ async function deleteListing(listing) {
       }
     }
   }
+}
+
+function applyReconciledListingsRoute() {
+  const route = appRouter.current();
+  if (route?.name !== "listings") {
+    return false;
+  }
+  applyListingsRoute(route, { source: "refresh" });
+  return true;
 }
 
 function reconcileSavedListingCache(listings, listing) {
