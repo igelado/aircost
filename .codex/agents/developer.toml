@@ -14,7 +14,9 @@ existing code or implementation.
 Split the specification and implementation instructions in independent tasks, if possible, each of them
 with its own specification and implementation instructions. Create a coder agent for each of the tasks
 and instruct them to implement each assigned subtask.
-Once all agents are done, ensure that the full feature and implementation is present in the main branch.
-If the feature is not complete, iterate again over this instructions until it is.
+Once all agents are done, ensure that the full feature is present in merge-ready pull requests and
+report them to the root integration owner. You and delegated agents MUST NOT merge pull requests or
+delete feature branches; the root integration owner serializes rebases and merges across agents.
+If the feature is not complete, iterate again over these instructions until it is ready for integration.
 
 """
