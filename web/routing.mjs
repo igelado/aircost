@@ -225,6 +225,13 @@ export function preserveLiveRouteInput(source, focused) {
   return source === "replace" && focused;
 }
 
+export function reviewProductQueueNeedsLoad(route, hasCachedGroups) {
+  const normalized = normalizeRoute(route);
+  return normalized.name === "review"
+    && normalized.view === "products"
+    && (normalized.productId === undefined || !hasCachedGroups);
+}
+
 export function reviewProductFallbackForResult(result, owner, current) {
   if (result?.status !== "absent" || !routeActivationIsCurrent(owner, current)) {
     return null;
@@ -235,6 +242,34 @@ export function reviewProductFallbackForResult(result, owner, current) {
       && route.productId !== undefined
     ? { name: "review", view: "products" }
     : null;
+}
+
+export function catalogPageFallbackForResult(owner, current, total, limit) {
+  if (!routeActivationIsCurrent(owner, current)) {
+    return null;
+  }
+  const route = normalizeRoute(current);
+  const resultTotal = Number(total);
+  const resultLimit = positiveInteger(limit);
+  if (
+    route.name !== "catalog"
+    || !Number.isSafeInteger(resultTotal)
+    || resultTotal < 0
+    || resultLimit === null
+  ) {
+    return null;
+  }
+  const lastPage = resultTotal === 0 ? 1 : Math.ceil(resultTotal / resultLimit);
+  if (route.filters.page <= lastPage) {
+    return null;
+  }
+  return {
+    ...route,
+    filters: {
+      ...route.filters,
+      page: lastPage,
+    },
+  };
 }
 
 export function reviewListingRouteOwner(route, generation) {

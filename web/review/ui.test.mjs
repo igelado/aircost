@@ -67,6 +67,20 @@ test("falls back from absent product detail only through its route owner", () =>
   );
 });
 
+test("reloads product collections but reuses detail caches under route ownership", () => {
+  assert.match(
+    reviewJs,
+    /reviewProductQueueNeedsLoad\(\s*route,\s*state\.productGroups\.length > 0,\s*\)\s*\? loadProductQueue\(\{\s*commitGuard: \(\) => routeActivationIsCurrent\(route, state\.route\),/,
+  );
+});
+
+test("canonicalizes catalog result pages before continuing detail activation", () => {
+  assert.match(
+    avionicsJs,
+    /const pageFallback = state\.avionicsLoaded[\s\S]*?catalogPageFallbackForResult\(\s*route,\s*state\.route,\s*state\.avionicsTotal,\s*state\.avionicsLimit,[\s\S]*?const navigated = await navigate\(pageFallback, \{ replace: true \}\);\s*if \(navigated !== false\) \{\s*return;/,
+  );
+});
+
 test("releases the catalog deletion guard before canonical route replacement", () => {
   assert.match(
     avionicsJs,

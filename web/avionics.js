@@ -1,4 +1,5 @@
 let api;
+let catalogPageFallbackForResult;
 let finiteNumber;
 let formatCurrency;
 let formatDate;
@@ -38,6 +39,7 @@ export function initializeAvionicsInspector(shared) {
   }
   ({
     api,
+    catalogPageFallbackForResult,
     finiteNumber,
     formatCurrency,
     formatDate,
@@ -101,6 +103,20 @@ async function applyCatalogRoute(route, { source } = {}) {
   }
   if (!routeActivationIsCurrent(route, state.route)) {
     return;
+  }
+  const pageFallback = state.avionicsLoaded
+    ? catalogPageFallbackForResult(
+      route,
+      state.route,
+      state.avionicsTotal,
+      state.avionicsLimit,
+    )
+    : null;
+  if (pageFallback !== null) {
+    const navigated = await navigate(pageFallback, { replace: true });
+    if (navigated !== false) {
+      return;
+    }
   }
   if (route.productId) {
     const openId = positiveInteger(state.avionicsDetail?.summary?.id, null);

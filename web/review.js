@@ -61,6 +61,7 @@ import {
   reviewListingRouteOwnerIsCurrent,
   reviewMutationInProgress,
   reviewProductFallbackForResult,
+  reviewProductQueueNeedsLoad,
   routeActivationIsCurrent,
 } from "/routing.mjs";
 
@@ -221,9 +222,14 @@ function activateReviewRoute(route, { source } = {}) {
   showQueue({ discardDraft: true, load: false });
   if (route.view === "products") {
     setQueueMode("product", { load: false });
-    const queueLoad = state.productGroups.length
-      ? Promise.resolve(true)
-      : loadProductQueue();
+    const queueLoad = reviewProductQueueNeedsLoad(
+      route,
+      state.productGroups.length > 0,
+    )
+      ? loadProductQueue({
+        commitGuard: () => routeActivationIsCurrent(route, state.route),
+      })
+      : Promise.resolve(true);
     const detailLoad = route.productId
       ? Promise.resolve(queueLoad).then(async (loaded) => {
         if (!loaded || !routeActivationIsCurrent(route, state.route)) {

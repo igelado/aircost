@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   DESTINATIONS,
+  catalogPageFallbackForResult,
   createHistoryRouter,
   formatRoute,
   parseRoute,
@@ -13,6 +14,7 @@ import {
   reviewListingRouteOwnerIsCurrent,
   reviewMutationInProgress,
   reviewProductFallbackForResult,
+  reviewProductQueueNeedsLoad,
   routeActivationIsCurrent,
 } from "../routing.mjs";
 
@@ -279,6 +281,54 @@ test("replaces an absent product detail only while its exact route owns activati
     reviewProductFallbackForResult({ status: "absent" }, collection, collection),
     null,
   );
+});
+
+test("reloads product collections while reusing a usable detail-route cache", async () => {
+  const collection = parseRoute("/#/review/products");
+  assert.equal(reviewProductQueueNeedsLoad(collection, true), true);
+  assert.equal(reviewProductQueueNeedsLoad(parseRoute("/#/review/products"), false), true);
+  assert.equal(reviewProductQueueNeedsLoad(parseRoute("/#/review/products/28"), true), false);
+  assert.equal(reviewProductQueueNeedsLoad(parseRoute("/#/review/products/28"), false), true);
+  assert.equal(reviewProductQueueNeedsLoad(parseRoute("/#/review/manual"), false), false);
+
+  let release;
+  let current = collection;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  }).then(() => routeActivationIsCurrent(collection, current));
+  current = parseRoute("/#/review/manual");
+  release();
+  assert.equal(await pending, false, "a late collection load cannot commit after route exit");
+});
+
+test("clamps catalog pages from authoritative result bounds without losing detail", async () => {
+  const emptyOwner = parseRoute("/#/catalog?page=999");
+  assert.equal(
+    formatRoute(catalogPageFallbackForResult(emptyOwner, emptyOwner, 0, 20)),
+    "/#/catalog",
+  );
+
+  const detailOwner = parseRoute("/#/catalog/28?search=Garmin&page=999");
+  assert.equal(
+    formatRoute(catalogPageFallbackForResult(detailOwner, detailOwner, 45, 20)),
+    "/#/catalog/28?search=Garmin&page=3",
+  );
+  const validLastPage = parseRoute("/#/catalog?page=3");
+  assert.equal(
+    catalogPageFallbackForResult(validLastPage, validLastPage, 45, 20),
+    null,
+  );
+
+  let release;
+  let current = detailOwner;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  }).then(({ total, limit }) => (
+    catalogPageFallbackForResult(detailOwner, current, total, limit)
+  ));
+  current = parseRoute("/#/catalog?page=2");
+  release({ total: 45, limit: 20 });
+  assert.equal(await pending, null, "a late page result cannot replace the newer route");
 });
 
 test("restores complete route snapshots through Back and Forward without recursive writes", () => {

@@ -1,6 +1,7 @@
 import { initializeAvionicsInspector } from "/avionics.js";
 import { initializeReviewWorkspace } from "/review.js";
 import {
+  catalogPageFallbackForResult,
   createHistoryRouter,
   destinationForRoute,
   parseRoute,
@@ -61,6 +62,7 @@ document.addEventListener("DOMContentLoaded", () => {
   collectElements();
   avionicsInspector = initializeAvionicsInspector({
     api,
+    catalogPageFallbackForResult,
     finiteNumber,
     formatCurrency,
     formatDate,
