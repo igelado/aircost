@@ -474,15 +474,21 @@ async function applyValuesRoute(route) {
   if (!state.aircraftOptions.length) {
     state.aircraftDetail = null;
     clearAircraftDetail();
+    if (route.variantId) {
+      return navigateRoute({ name: "values" }, { replace: true });
+    }
     return;
   }
-  if (!route.variantId) {
+  const selectDefaultVariant = () => {
     elements.aircraftManufacturer.selectedIndex = 0;
     populateAircraftModelSelect();
     elements.aircraftModel.selectedIndex = 0;
     populateAircraftVariantSelect();
     elements.aircraftVariant.selectedIndex = 0;
-    const variantId = selectedInteger(elements.aircraftVariant);
+    return selectedInteger(elements.aircraftVariant);
+  };
+  if (!route.variantId) {
+    const variantId = selectDefaultVariant();
     if (variantId === null) {
       state.aircraftDetail = null;
       clearAircraftDetail();
@@ -494,10 +500,11 @@ async function applyValuesRoute(route) {
     (candidate) => Number(candidate.variant_id) === route.variantId,
   );
   if (!option) {
-    state.aircraftDetail = null;
-    clearAircraftDetail();
-    setAircraftMessage(`Aircraft variant ${route.variantId} was not found.`, true);
-    return;
+    const variantId = selectDefaultVariant();
+    return navigateRoute(
+      variantId === null ? { name: "values" } : { name: "values", variantId },
+      { replace: true },
+    );
   }
   elements.aircraftManufacturer.value = String(option.manufacturer_id);
   populateAircraftModelSelect();

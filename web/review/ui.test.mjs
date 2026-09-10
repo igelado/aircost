@@ -1658,12 +1658,29 @@ test("canonicalizes the default aircraft selection before its single detail load
   assert.deepEqual(reload.navigations, [], "a selected-ID reload is already canonical");
   assert.deepEqual(reload.detailLoads, ["42"]);
 
+  const missing = compile([{ manufacturer_id: 1, model_id: 2, variant_id: 42 }]);
+  await missing.apply({ name: "values", variantId: 99 });
+  assert.deepEqual(missing.navigations, [{
+    route: { name: "values", variantId: 42 },
+    options: { replace: true },
+  }], "a missing ID is replaced by the valid selected detail without pushing history");
+  assert.deepEqual(missing.detailLoads, ["42"], "only the canonical activation loads detail");
+
   const empty = compile([]);
   await empty.apply({ name: "values" });
   assert.deepEqual(empty.navigations, []);
   assert.deepEqual(empty.detailLoads, []);
   assert.equal(empty.state.aircraftDetail, null);
   assert.equal(empty.clearCount(), 1);
+
+  const emptyMissing = compile([]);
+  await emptyMissing.apply({ name: "values", variantId: 99 });
+  assert.deepEqual(emptyMissing.navigations, [{
+    route: { name: "values" },
+    options: { replace: true },
+  }]);
+  assert.deepEqual(emptyMissing.detailLoads, []);
+  assert.equal(emptyMissing.clearCount(), 2, "the collection activation remains unselected");
 });
 
 test("reloads the manual review collection on every route re-entry", () => {
