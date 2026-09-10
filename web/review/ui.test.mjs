@@ -264,6 +264,7 @@ test("rebinds a clean re-entered listing after deferred save reconciliation", as
     let currentRoute = { name: "listings", listingId: 7, filters: { search: "old" } };
     let releaseSave;
     const edits = [];
+    const restoredFocus = [];
     const apply = Function(
       "state",
       "elements",
@@ -276,7 +277,9 @@ test("rebinds a clean re-entered listing after deferred save reconciliation", as
       "setFormMessage",
       "setListMessage",
       "closeListingDialog",
+      "captureListingEditorFocus",
       "editListing",
+      "restoreListingEditorFocus",
       "navigateRoute",
       `${appJs.slice(start, end)}\nreturn applyListingsRoute;`,
     )(
@@ -291,6 +294,7 @@ test("rebinds a clean re-entered listing after deferred save reconciliation", as
       () => {},
       () => {},
       () => {},
+      () => ({ rowIndex: 0, kind: "named", name: "avionics_model" }),
       (listing, options) => {
         edits.push({ listing, options });
         state.editingListingId = listing.id;
@@ -299,6 +303,7 @@ test("rebinds a clean re-entered listing after deferred save reconciliation", as
         state.saveDisabled = state.listingSaveOwner !== null;
         elements.listingDialog.open = true;
       },
+      (token) => restoredFocus.push(token),
       () => {},
     );
     const saveResponse = new Promise((resolve) => { releaseSave = resolve; });
@@ -324,7 +329,7 @@ test("rebinds a clean re-entered listing after deferred save reconciliation", as
     }
     releaseSave({ id: 7, label: "committed" });
     await pendingSave;
-    return { edits, reentryRoute, saveOwner, state };
+    return { edits, restoredFocus, reentryRoute, saveOwner, state };
   };
 
   const clean = await run({ dirtyAfterReentry: false });
@@ -337,6 +342,11 @@ test("rebinds a clean re-entered listing after deferred save reconciliation", as
     listing: { id: 7, label: "committed" },
     options: { focus: false },
   });
+  assert.deepEqual(clean.restoredFocus, [{
+    rowIndex: 0,
+    kind: "named",
+    name: "avionics_model",
+  }]);
 
   const dirty = await run({ dirtyAfterReentry: true });
   assert.equal(dirty.state.listings[0].label, "committed", "the cache still reconciles");
@@ -345,6 +355,135 @@ test("rebinds a clean re-entered listing after deferred save reconciliation", as
   assert.equal(dirty.state.listingSaveOwner, dirty.saveOwner);
   assert.equal(dirty.state.saveDisabled, true);
   assert.equal(dirty.edits.length, 1, "a newer dirty draft is not rebound");
+  assert.deepEqual(dirty.restoredFocus, []);
+});
+
+test("restores dynamic avionics focus after a clean background rebind", () => {
+  const start = appJs.indexOf("function captureListingEditorFocus");
+  const end = appJs.indexOf("\nfunction editListing", start);
+  assert.ok(start >= 0 && end > start);
+
+  const document = { activeElement: null };
+  const makeControl = ({ name = "", value = "", tagName = "INPUT", ariaLabel = "" }) => ({
+    ariaLabel,
+    dynamic: true,
+    isConnected: true,
+    name,
+    row: null,
+    tagName,
+    value,
+    closest(selector) {
+      return selector === ".avionics-row" ? this.row : null;
+    },
+    focus() {
+      document.activeElement = this;
+    },
+    getAttribute(attribute) {
+      return attribute === "aria-label" ? this.ariaLabel : null;
+    },
+  });
+  const makeRow = (controls) => {
+    const row = {
+      controls,
+      querySelector(selector) {
+        if (selector === "summary") {
+          return controls.find((control) => control.tagName === "SUMMARY") || null;
+        }
+        if (selector === 'button[aria-label="Remove avionics"]') {
+          return controls.find((control) => control.ariaLabel === "Remove avionics") || null;
+        }
+        const name = selector.match(/^\[name="([^"]+)"\]$/)?.[1];
+        return controls.find((control) => control.name === name) || null;
+      },
+      querySelectorAll(selector) {
+        return selector === '[name="avionics_types"]'
+          ? controls.filter((control) => control.name === "avionics_types")
+          : [];
+      },
+    };
+    controls.forEach((control) => { control.row = row; });
+    return row;
+  };
+  const cases = [
+    { name: "avionics_manufacturer" },
+    { name: "avionics_model" },
+    { name: "avionics_quantity" },
+    { name: "avionics_types", value: "gps" },
+    { tagName: "SUMMARY" },
+    { tagName: "BUTTON", ariaLabel: "Remove avionics" },
+  ];
+
+  for (const descriptor of cases) {
+    const oldTarget = makeControl(descriptor);
+    const oldRow = makeRow([oldTarget]);
+    const newTarget = makeControl(descriptor);
+    const newRow = makeRow([newTarget]);
+    let rows = [makeRow([]), oldRow];
+    const fallback = makeControl({ name: "manufacturer" });
+    fallback.dynamic = false;
+    const elements = {
+      avionicsList: {
+        contains: (control) => control.dynamic && control.isConnected,
+        querySelectorAll: () => rows,
+      },
+      listingDialog: {
+        open: true,
+        contains: (control) => control?.isConnected === true,
+      },
+      listingForm: { querySelector: () => fallback },
+    };
+    const focus = Function(
+      "elements",
+      "document",
+      `${appJs.slice(start, end)}\n`
+        + "return { captureListingEditorFocus, restoreListingEditorFocus };",
+    )(elements, document);
+
+    document.activeElement = oldTarget;
+    const token = focus.captureListingEditorFocus();
+    oldTarget.isConnected = false;
+    rows = [makeRow([]), newRow];
+    focus.restoreListingEditorFocus(token);
+    assert.equal(document.activeElement, newTarget, `${JSON.stringify(descriptor)} restores`);
+  }
+
+  const oldCapability = makeControl({ name: "avionics_types", value: "gps" });
+  const oldRow = makeRow([oldCapability]);
+  const replacementRow = makeRow([
+    makeControl({ name: "avionics_types", value: "navigation" }),
+  ]);
+  let rows = [oldRow];
+  const fallback = makeControl({ name: "manufacturer" });
+  fallback.dynamic = false;
+  const outside = { isConnected: true };
+  const elements = {
+    avionicsList: {
+      contains: (control) => control.dynamic && control.isConnected,
+      querySelectorAll: () => rows,
+    },
+    listingDialog: {
+      open: true,
+      contains: (control) => control?.isConnected === true && control !== outside,
+    },
+    listingForm: { querySelector: () => fallback },
+  };
+  const focus = Function(
+    "elements",
+    "document",
+    `${appJs.slice(start, end)}\n`
+      + "return { captureListingEditorFocus, restoreListingEditorFocus };",
+  )(elements, document);
+  document.activeElement = oldCapability;
+  const missingToken = focus.captureListingEditorFocus();
+  oldCapability.isConnected = false;
+  rows = [replacementRow];
+  focus.restoreListingEditorFocus(missingToken);
+  assert.equal(document.activeElement, fallback, "a removed exact control uses a safe fallback");
+
+  document.activeElement = outside;
+  assert.equal(focus.captureListingEditorFocus(), null);
+  focus.restoreListingEditorFocus(null);
+  assert.equal(document.activeElement, outside, "outside-editor focus is untouched");
 });
 
 test("all listing editors retain the global in-flight Save lock", () => {

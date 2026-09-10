@@ -401,7 +401,11 @@ function applyListingsRoute(route, context = {}) {
       || !elements.listingDialog.open
       || rebindCleanEditor
     ) {
+      const focusToken = rebindCleanEditor ? captureListingEditorFocus() : null;
       editListing(listing, { focus: !rebindCleanEditor });
+      if (rebindCleanEditor) {
+        restoreListingEditorFocus(focusToken);
+      }
     }
     return;
   }
@@ -1275,6 +1279,68 @@ function handleTableClick(event) {
 function synchronizeListingSaveDisabled() {
   elements.saveListing.disabled = state.listingEditorVerified
     || state.listingSaveOwner !== null;
+}
+
+function captureListingEditorFocus() {
+  const active = document.activeElement;
+  if (
+    !elements.listingDialog.open
+    || !elements.listingDialog.contains(active)
+    || !elements.avionicsList.contains(active)
+  ) {
+    return null;
+  }
+  const row = active.closest?.(".avionics-row");
+  const rows = Array.from(elements.avionicsList.querySelectorAll(".avionics-row"));
+  const rowIndex = rows.indexOf(row);
+  if (rowIndex < 0) {
+    return null;
+  }
+  if ([
+    "avionics_manufacturer",
+    "avionics_model",
+    "avionics_quantity",
+  ].includes(active.name)) {
+    return { rowIndex, kind: "named", name: active.name };
+  }
+  if (active.name === "avionics_types") {
+    return { rowIndex, kind: "capability", value: active.value };
+  }
+  if (active.tagName === "SUMMARY") {
+    return { rowIndex, kind: "capability-summary" };
+  }
+  if (
+    active.tagName === "BUTTON"
+    && active.getAttribute("aria-label") === "Remove avionics"
+  ) {
+    return { rowIndex, kind: "remove" };
+  }
+  return null;
+}
+
+function restoreListingEditorFocus(token) {
+  if (token === null) {
+    return;
+  }
+  const rows = Array.from(elements.avionicsList.querySelectorAll(".avionics-row"));
+  const row = rows[token.rowIndex];
+  let control = null;
+  if (row && token.kind === "named") {
+    control = row.querySelector(`[name="${token.name}"]`);
+  } else if (row && token.kind === "capability") {
+    control = Array.from(row.querySelectorAll('[name="avionics_types"]'))
+      .find((candidate) => candidate.value === token.value) || null;
+  } else if (row && token.kind === "capability-summary") {
+    control = row.querySelector("summary");
+  } else if (row && token.kind === "remove") {
+    control = row.querySelector('button[aria-label="Remove avionics"]');
+  }
+  if (!control?.isConnected || !elements.listingDialog.contains(control)) {
+    control = elements.listingForm.querySelector("input, select, textarea, button");
+  }
+  if (control?.isConnected && elements.listingDialog.contains(control)) {
+    control.focus();
+  }
 }
 
 function editListing(listing, { focus = true } = {}) {
