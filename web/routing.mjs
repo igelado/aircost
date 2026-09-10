@@ -318,7 +318,13 @@ export function reviewListingRouteOwnerIsCurrent(owner, route, generation) {
     && reviewListingIdForRoute(route) === owner.listingId;
 }
 
-export function createHistoryRouter({ location, history, listen, apply, mayNavigate }) {
+export function createHistoryRouter({
+  location,
+  history,
+  listen,
+  apply,
+  mayNavigate,
+}) {
   if (!location || !history || typeof listen !== "function" || typeof apply !== "function") {
     throw new Error("The history router requires location, history, listen, and apply.");
   }
@@ -326,22 +332,33 @@ export function createHistoryRouter({ location, history, listen, apply, mayNavig
   let current = null;
   let currentPosition = null;
   let suppressedPosition = null;
+  let epochSequence = 0;
+  const epochSeed = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  let currentEpoch = nextEpoch();
+
+  function nextEpoch() {
+    epochSequence += 1;
+    return `${epochSeed}:${epochSequence}`;
+  }
 
   function positionFromState(value) {
     if (
       value?.aircostRouterVersion !== 1
+      || value.aircostEpoch !== currentEpoch
       || value.aircostRoute === null
       || typeof value.aircostRoute !== "object"
     ) {
       return null;
     }
     const position = value?.aircostPosition;
-    return Number.isSafeInteger(position) && position >= 0 ? position : null;
+    return Number.isSafeInteger(position) ? position : null;
   }
 
   function routeState(route, position) {
     return {
       aircostRouterVersion: 1,
+      aircostEpoch: currentEpoch,
       aircostRoute: route,
       aircostPosition: position,
     };
@@ -362,17 +379,26 @@ export function createHistoryRouter({ location, history, listen, apply, mayNavig
 
   function restore(event) {
     const next = parseRoute(location.href);
-    let targetPosition = positionFromState(event?.state);
+    const targetPosition = positionFromState(event?.state);
     if (targetPosition === null) {
-      // Startup and every router-owned write are tagged. A state-less
-      // same-document target is therefore a newly created fragment entry
-      // adjacent to the active entry; adopt it without appending history.
-      targetPosition = currentPosition + 1;
-      history.replaceState(
-        routeState(next, targetPosition),
-        "",
-        formatRoute(next),
-      );
+      suppressedPosition = null;
+      const allowed = current === null
+        || navigationAllowed(next, current, "popstate");
+      currentEpoch = nextEpoch();
+      currentPosition = 0;
+      history.replaceState(routeState(next, currentPosition), "", formatRoute(next));
+      if (!allowed) {
+        // PopStateEvent does not expose traversal direction. Rebase an unknown
+        // entry as the retained Back target, then put the still-active route
+        // directly after it. This intentionally prunes an unknowable forward
+        // tail instead of guessing a delta and walking the wrong direction.
+        currentPosition = 1;
+        history.pushState(routeState(current, currentPosition), "", formatRoute(current));
+        return false;
+      }
+      current = next;
+      apply(next, { source: "popstate" });
+      return true;
     }
     if (suppressedPosition !== null && targetPosition === suppressedPosition) {
       suppressedPosition = null;
@@ -405,7 +431,7 @@ export function createHistoryRouter({ location, history, listen, apply, mayNavig
     start() {
       const initial = parseRoute(location.href);
       current = initial;
-      currentPosition = positionFromState(history.state) ?? 0;
+      currentPosition = 0;
       const canonicalUrl = formatRoute(initial);
       history.replaceState(routeState(initial, currentPosition), "", canonicalUrl);
       listen("popstate", restore);

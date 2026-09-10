@@ -545,13 +545,32 @@ test("replace keeps position and Back then push forms a contiguous active stack"
   assert.equal(history.state.aircostPosition, 1);
 });
 
-test("adopts and repairs new unowned fragment entries without corrupting history", () => {
-  for (const externalState of [null, { aircostPosition: 99, foreignRoute: true }]) {
+test("rebases a rejected pre-router stateless Back target into a coherent owned stack", () => {
+  for (const externalState of [
+    null,
+    {
+      aircostRouterVersion: 1,
+      aircostEpoch: "stale-epoch",
+      aircostRoute: parseRoute("/#/listings"),
+      aircostPosition: 99,
+    },
+  ]) {
     const listeners = new Map();
     const location = fakeLocation();
     const applied = [];
     let mutationActive = true;
-    const history = trackedHistory(location, listeners, "/#/review/manual");
+    const history = trackedHistory(
+      location,
+      listeners,
+      "/#/review/manual",
+      {
+        entries: [
+          { state: externalState, url: "/#/listings" },
+          { state: null, url: "/#/review/manual" },
+        ],
+        index: 1,
+      },
+    );
     const router = createHistoryRouter({
       location,
       history,
@@ -562,21 +581,146 @@ test("adopts and repairs new unowned fragment entries without corrupting history
     router.start();
     const pushes = history.pushCount;
     const replacements = history.replaceCount;
-    history.pushExternal("/#/catalog", externalState);
+    history.back();
 
-    assert.equal(history.pushCount, pushes);
+    assert.equal(history.pushCount, pushes + 1, "the fallback adds one coherent owner entry");
     assert.equal(history.replaceCount, replacements + 1);
-    assert.deepEqual(history.urls(), ["/#/review/manual", "/#/catalog"]);
+    assert.deepEqual(history.urls(), ["/#/listings", "/#/review/manual"]);
+    assert.deepEqual(history.positions(), [0, 1]);
+    assert.equal(history.epochs()[0], history.epochs()[1]);
     assert.equal(location.hash, "#/review/manual");
     assert.equal(formatRoute(router.current()), "/#/review/manual");
     assert.deepEqual(applied, ["/#/review/manual"]);
 
+    history.back();
+    assert.equal(location.hash, "#/review/manual", "a repeated rejection repairs by owned position");
+    assert.equal(history.pushCount, pushes + 1, "a repeated guard adds no duplicate entry");
+    assert.equal(history.replaceCount, replacements + 1);
+
     mutationActive = false;
+    history.back();
+    assert.equal(location.hash, "#/listings");
+    assert.equal(formatRoute(router.current()), "/#/listings");
     history.forward();
-    assert.equal(location.hash, "#/catalog");
-    assert.equal(formatRoute(router.current()), "/#/catalog");
-    assert.deepEqual(applied, ["/#/review/manual", "/#/catalog"]);
+    assert.equal(location.hash, "#/review/manual");
+    assert.deepEqual(applied, ["/#/review/manual", "/#/listings", "/#/review/manual"]);
   }
+});
+
+test("rebases a rejected newly-created stateless Forward target without guessing direction", () => {
+  const listeners = new Map();
+  const location = fakeLocation();
+  const applied = [];
+  let mutationActive = true;
+  const history = trackedHistory(location, listeners, "/#/review/manual");
+  const router = createHistoryRouter({
+    location,
+    history,
+    listen: (name, listener) => listeners.set(name, listener),
+    apply: (route) => applied.push(formatRoute(route)),
+    mayNavigate: () => !mutationActive,
+  });
+  router.start();
+  const pushes = history.pushCount;
+  history.pushExternal("/#/catalog");
+
+  assert.equal(location.hash, "#/review/manual");
+  assert.equal(formatRoute(router.current()), "/#/review/manual");
+  assert.deepEqual(applied, ["/#/review/manual"]);
+  assert.deepEqual(history.urls(), ["/#/review/manual", "/#/catalog", "/#/review/manual"]);
+  assert.deepEqual(history.positions(), [0, 0, 1]);
+  assert.notEqual(history.epochs()[0], history.epochs()[1]);
+  assert.equal(history.epochs()[1], history.epochs()[2]);
+  assert.equal(history.pushCount, pushes + 1);
+
+  history.back();
+  assert.equal(location.hash, "#/review/manual");
+  assert.equal(history.pushCount, pushes + 1, "the owned retry uses go, not another push");
+
+  mutationActive = false;
+  history.back();
+  assert.equal(location.hash, "#/catalog");
+  assert.equal(formatRoute(router.current()), "/#/catalog");
+  assert.deepEqual(applied, ["/#/review/manual", "/#/catalog"]);
+});
+
+test("adopts foreign Back and Forward targets in place and owns later guard repair", () => {
+  for (const direction of ["back", "forward"]) {
+    const listeners = new Map();
+    const location = fakeLocation();
+    const applied = [];
+    let mutationActive = false;
+    const history = direction === "back"
+      ? trackedHistory(location, listeners, "/#/review/manual", {
+        entries: [
+          { state: null, url: "/#/listings" },
+          { state: null, url: "/#/review/manual" },
+        ],
+        index: 1,
+      })
+      : trackedHistory(location, listeners, "/#/review/manual");
+    const router = createHistoryRouter({
+      location,
+      history,
+      listen: (name, listener) => listeners.set(name, listener),
+      apply: (route) => applied.push(formatRoute(route)),
+      mayNavigate: () => !mutationActive,
+    });
+    router.start();
+    const pushes = history.pushCount;
+    if (direction === "back") {
+      history.back();
+    } else {
+      history.pushExternal("/#/listings");
+    }
+    assert.equal(location.hash, "#/listings");
+    assert.equal(formatRoute(router.current()), "/#/listings");
+    assert.equal(history.state.aircostPosition, 0);
+    assert.equal(history.pushCount, pushes, "accepted adoption does not push");
+
+    router.navigate(parseRoute("/#/values"));
+    mutationActive = true;
+    history.back();
+    assert.equal(location.hash, "#/values", "the adopted target repairs as an owned Back entry");
+    assert.deepEqual(applied.slice(-1), ["/#/values"]);
+
+    mutationActive = false;
+    history.back();
+    assert.equal(location.hash, "#/listings");
+    assert.equal(formatRoute(router.current()), "/#/listings");
+  }
+});
+
+test("rebases a rejected multi-entry foreign jump without an untrusted history delta", () => {
+  const listeners = new Map();
+  const location = fakeLocation();
+  const applied = [];
+  const history = trackedHistory(location, listeners, "/#/review/manual", {
+    entries: [
+      { state: null, url: "/#/listings" },
+      { state: null, url: "/#/catalog" },
+      { state: null, url: "/#/review/manual" },
+    ],
+    index: 2,
+  });
+  const router = createHistoryRouter({
+    location,
+    history,
+    listen: (name, listener) => listeners.set(name, listener),
+    apply: (route) => applied.push(formatRoute(route)),
+    mayNavigate: () => false,
+  });
+  router.start();
+  const initialGoCount = history.goCount;
+  history.go(-2);
+
+  assert.equal(history.goCount, initialGoCount + 1, "repair never guesses another traversal delta");
+  assert.deepEqual(history.urls(), ["/#/listings", "/#/review/manual"]);
+  assert.deepEqual(history.positions(), [0, 1]);
+  assert.equal(history.epochs()[0], history.epochs()[1]);
+  assert.equal(location.hash, "#/review/manual");
+  assert.equal(formatRoute(router.current()), "/#/review/manual");
+  assert.deepEqual(applied, ["/#/review/manual"]);
 });
 
 test("canonicalizes malformed URLs reached through browser history", () => {
@@ -609,12 +753,15 @@ function fakeLocation() {
   return { href: "", pathname: "/", search: "", hash: "" };
 }
 
-function trackedHistory(location, listeners, initialUrl) {
-  const entries = [{ state: null, url: initialUrl }];
-  let index = 0;
+function trackedHistory(location, listeners, initialUrl, options = {}) {
+  const entries = options.entries
+    ? options.entries.map((entry) => ({ ...entry }))
+    : [{ state: null, url: initialUrl }];
+  let index = options.index ?? 0;
   setLocation(location, initialUrl);
   return {
-    state: null,
+    state: entries[index].state,
+    goCount: 0,
     pushCount: 0,
     replaceCount: 0,
     pushState(state, _title, url) {
@@ -631,6 +778,7 @@ function trackedHistory(location, listeners, initialUrl) {
       setLocation(location, url);
     },
     go(delta) {
+      this.goCount += 1;
       index += delta;
       this.state = entries[index].state;
       setLocation(location, entries[index].url);
@@ -651,6 +799,12 @@ function trackedHistory(location, listeners, initialUrl) {
     },
     urls() {
       return entries.map((entry) => entry.url);
+    },
+    positions() {
+      return entries.map((entry) => entry.state?.aircostPosition ?? null);
+    },
+    epochs() {
+      return entries.map((entry) => entry.state?.aircostEpoch ?? null);
     },
   };
 }
