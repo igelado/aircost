@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,10 +10,7 @@ const appCss = readFileSync(new URL("../app.css", import.meta.url), "utf8");
 const appJs = readFileSync(new URL("../app.js", import.meta.url), "utf8");
 const avionicsJs = readFileSync(new URL("../avionics.js", import.meta.url), "utf8");
 const reviewJs = readFileSync(new URL("../review.js", import.meta.url), "utf8");
-const chromiumPath = [
-  process.env.AIRCOST_TEST_CHROMIUM_PATH,
-  "/snap/bin/chromium",
-].find((path) => path && existsSync(path));
+const chromiumPath = process.env.AIRCOST_TEST_CHROMIUM_PATH;
 
 test("keeps listing form reset explicit without creating a duplicate route entry", () => {
   assert.match(
@@ -580,6 +577,7 @@ test("reopens rebuilt avionics details before restoring native Chromium focus", 
       "--disable-background-networking",
       "--disable-breakpad",
       "--disable-component-update",
+      "--disable-crashpad",
       "--disable-crash-reporter",
       "--disable-default-apps",
       "--disable-extensions",
