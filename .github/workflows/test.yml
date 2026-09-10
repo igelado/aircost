@@ -9,14 +9,34 @@ on:
 jobs:
   fast:
     name: fast
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Verify pinned toolchains
+        run: |
+          rust_expected="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          node_expected="$(tr -d '[:space:]' < .node-version)"
+          test "$(rustc --version | awk '{print $2}')" = "$rust_expected"
+          test "$(node --version)" = "v$node_expected"
+          . /etc/os-release
+          test "$VERSION_ID" = "24.04"
+          printf 'runner image: %s %s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -43,11 +63,11 @@ jobs:
 
   sqlite-contracts:
     name: sqlite-contracts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install schema test tools
         run: |
@@ -61,7 +81,7 @@ jobs:
 
   postgres-contracts:
     name: postgres-contracts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       AIRCOST_TEST_POSTGRES_URL: postgres://postgres:aircost@localhost:5432/aircost_test
       AIRCOST_TEST_POSTGRES_ADMIN_URL: postgres://postgres:aircost@localhost:5432/postgres
@@ -69,7 +89,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:17
+        image: postgres:17.11-trixie@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
         env:
           POSTGRES_DB: aircost_test
           POSTGRES_PASSWORD: aircost
@@ -83,10 +103,13 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
 
       - name: Install database test tools
         run: |
@@ -95,6 +118,21 @@ jobs:
           command -v psql
           command -v rg
           command -v sqlite3
+
+      - name: Verify PostgreSQL version
+        run: |
+          test "$(
+            psql "$AIRCOST_TEST_POSTGRES_URL" \
+              --no-psqlrc -Atc 'SHOW server_version_num'
+          )" = "170011"
+          case "$(
+            psql "$AIRCOST_TEST_POSTGRES_URL" \
+              --no-psqlrc -Atc 'SHOW server_version'
+          )" in
+            17.11*) ;;
+            *) exit 1 ;;
+          esac
+          psql --version
 
       - name: Verify ignored Rust test inventory
         run: |
@@ -113,14 +151,17 @@ jobs:
 
   dnn:
     name: dnn
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
 
       - name: Run DNN feature tests
         run: cargo test --locked --features dnn

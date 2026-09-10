@@ -53,6 +53,44 @@ GEMINI_API_KEY=... cargo run --bin aircost-admin -- enrich-avionics --limit 10 -
 GEMINI_API_KEY=... cargo run --bin aircost-admin -- enrich-avionics --limit 10 --apply
 ```
 
+## Development versions and verification
+
+AirCost uses Rust 1.98.1 from `rust-toolchain.toml` and Node.js 24.21.0 LTS
+from `.node-version`. CI runs on the GitHub-hosted `ubuntu-24.04` OS family and
+uses the PostgreSQL 17.11 service image. GitHub refreshes hosted images within
+an OS family, so CI logs the concrete image build instead of treating that
+rolling build as a selectable version.
+
+Apply the checked-in Rust and Node versions before running the canonical
+verification command below. The PostgreSQL URLs must identify a disposable
+PostgreSQL 17.11 database because the contract runner drops and recreates the
+named database between tests.
+
+```bash
+AIRCOST_TEST_POSTGRES_URL=postgres://postgres:aircost@localhost:5432/aircost_test \
+AIRCOST_TEST_POSTGRES_ADMIN_URL=postgres://postgres:aircost@localhost:5432/postgres \
+AIRCOST_TEST_POSTGRES_DATABASE=aircost_test \
+bash -ceu '
+cargo fmt --all -- --check
+node --check chrome-extension/background.js
+node --check chrome-extension/popup.js
+node --test chrome-extension/*.test.mjs
+node --check web/app.js
+node --check web/avionics.js
+node --check web/review.js
+node --check web/review/domain.mjs
+node --test web/review/*.test.mjs
+cargo test --locked
+cargo check --locked
+bash tests/schema/run.sh sqlite
+bash tests/schema/rust_test_inventory.sh
+bash tests/schema/rust_test_inventory.sh run-postgres
+bash tests/schema/run.sh postgres
+cargo test --locked --features dnn
+cargo check --locked --features dnn
+'
+```
+
 ## Research Basis
 
 - Aircraft Bluebook explains that published average retail values are market values for average/mid-time used aircraft and that engine-time adjustments are based on TBO, with run-out deductions capped at 100% TBO: https://aircraftbluebook.com/user-guide
