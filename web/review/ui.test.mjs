@@ -104,6 +104,11 @@ test("guards real product drafts while preserving same-product activations", () 
   assert.match(reviewJs, /quantity\.addEventListener\("input", \(\) => \{[\s\S]*?markProductStructureDirty\(\);/);
   assert.match(
     reviewJs,
+    /const previousRoute = state\.route;[\s\S]*?const sameProduct = reviewProductRouteIsSame\(previousRoute, route\);\s*if \(!sameProduct\) \{\s*closeProductReview\(\);/,
+    "an accepted product switch invalidates the prior draft before awaiting new data",
+  );
+  assert.match(
+    reviewJs,
     /if \(state\.selectedProduct\?\.id === route\.productId\) \{\s*return \{ status: "loaded" \};/,
     "a same-product activation must not reload and discard its drafts",
   );

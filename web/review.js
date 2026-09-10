@@ -211,6 +211,7 @@ export function initializeReviewWorkspace(shared) {
 }
 
 function activateReviewRoute(route, { source } = {}) {
+  const previousRoute = state.route;
   state.routeGeneration += 1;
   state.route = route;
   if (route.view !== "products") {
@@ -234,6 +235,10 @@ function activateReviewRoute(route, { source } = {}) {
 
   showQueue({ discardDraft: true, load: false });
   if (route.view === "products") {
+    const sameProduct = reviewProductRouteIsSame(previousRoute, route);
+    if (!sameProduct) {
+      closeProductReview();
+    }
     setQueueMode("product", { load: false });
     const queueLoad = reviewProductQueueNeedsLoad(
       route,
@@ -251,7 +256,6 @@ function activateReviewRoute(route, { source } = {}) {
         if (state.selectedProduct?.id === route.productId) {
           return { status: "loaded" };
         }
-        closeProductReview();
         const result = await openProductReview(route.productId);
         await replaceAbsentProductRoute(result, route);
         return result;
