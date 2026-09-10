@@ -50,10 +50,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Verify schema test tools
+      - name: Install schema test tools
         run: |
-          command -v rg
-          command -v sqlite3
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep sqlite3
 
       - name: Run SQLite schema contracts
         run: bash tests/schema/run.sh sqlite
@@ -85,11 +85,10 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify database test tools
+      - name: Install database test tools
         run: |
-          command -v rg
-          command -v sqlite3
-          command -v psql
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client ripgrep sqlite3
 
       - name: Verify ignored Rust test inventory
         run: |
