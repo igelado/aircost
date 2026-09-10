@@ -15,8 +15,11 @@ Before implementation starts:
 2. Start feature work only from a clean `main` containing that merge.
 3. Do not reuse the stale, prunable `/tmp/aircost-*` worktree registrations.
    Inspect them before pruning; do not delete branches as part of cleanup.
-4. Give every active agent a separate worktree under
-   `/home/igelado/personal/aircost-work/.worktrees/`.
+4. Give every active agent an isolated checkout. A configured `coder` follows
+   its private-clone workflow. A runtime that shares one clone instead uses a
+   separate worktree under a writable, configurable root outside the repository
+   (for example `../aircost-worktrees/`). Never hard-code a contributor's home
+   directory.
 5. Create a dependent branch only after all prerequisites have merged. Do not
    stack sibling branches on other unmerged branches.
 
@@ -30,8 +33,9 @@ It does not implement a feature while acting as integrator.
 - Large register entries are split below because their acceptance criteria are
   not safe as one review or one deployment. A child branch may not include work
   from another parent ID.
-- Branches use `<agent>/<id>-<outcome>` and are cut from the latest merged
-  `origin/main`.
+- Writable implementation uses the repository-configured `coder` or
+  `architect` agents. Branches use `codex/<id>-<outcome>`, as required by the
+  configured writer workflow, and are cut from the latest merged `origin/main`.
 - Agents do not edit `docs/maintainability.md`. Completion evidence is kept in
   the PR while work is parallel; the integrator updates the register in one
   serialized administrative change after each merge wave.
@@ -85,17 +89,25 @@ these implementation dependencies instead:
 
 ## Agent ownership
 
-| Agent | Primary lane | Exclusive responsibility while active |
-|---|---|---|
-| Lovelace (`explorer_backend`) | database, API contracts, listing/capture architecture | database executor, listing writes/contracts/extractions, capture lifecycle, verification run state |
-| Leibniz (`explorer_avionics`) | avionics/review integrity | shared vocabularies, review aspects, verification plans, catalog authorization/retirement, checkpoints |
-| Rawls (`explorer_performance`) | performance and valuation | atomic valuation, bounded reads/bulk work, sparse fitting, cold storage |
-| Parfit (`explorer_tests`) | CI, tooling, compatibility, integration-quality work | test discovery, migrations, fixtures/toolchains, CLI/docs, compatibility lifecycle, UI test harness |
-| Boole (`explorer_web_ux`) | frontend and extension interaction | routing, controller lifecycle, task flows, capture popup behavior |
-| Gauss (`explorer_visual`) | responsive/visual/accessibility/content layer | mobile navigation, responsive primitives/audit, visual system, accessibility, language |
+The named explorers are session planning/review specialists and are not
+writable repository agents. Each implementation unit is written by a fresh
+instance of the repository-configured `coder` agent after its specification is
+settled. For a multi-module unit whose design still needs decomposition, the
+configured `architect` agent first refines the specification and delegates the
+same single-ID implementation to `coder`. The root agent remains integrator.
 
-Agents review across lanes, but only the assigned owner writes an active
-branch. Ownership moves only by an explicit plan amendment.
+| Review specialist | Primary lane | Exclusive responsibility while active |
+|---|---|---|
+| Lovelace (`explorer_backend`) | database, API contracts, listing/capture architecture | review database executor, listing writes/contracts/extractions, capture lifecycle, verification run state |
+| Leibniz (`explorer_avionics`) | avionics/review integrity | review shared vocabularies, review aspects, verification plans, catalog authorization/retirement, checkpoints |
+| Rawls (`explorer_performance`) | performance and valuation | review atomic valuation, bounded reads/bulk work, sparse fitting, cold storage |
+| Parfit (`explorer_tests`) | CI, tooling, compatibility, integration-quality work | review test discovery, migrations, fixtures/toolchains, CLI/docs, compatibility lifecycle, UI test harness |
+| Boole (`explorer_web_ux`) | frontend and extension interaction | review routing, controller lifecycle, task flows, capture popup behavior |
+| Gauss (`explorer_visual`) | responsive/visual/accessibility/content layer | review mobile navigation, responsive primitives/audit, visual system, accessibility, language |
+
+Review specialists may review across lanes, but only the assigned writable
+`coder`/`architect` agent changes an active branch. Ownership moves only by an
+explicit plan amendment.
 
 ## Implementation units
 
@@ -103,19 +115,19 @@ branch. Ownership moves only by an explicit plan amendment.
 
 | Unit | Owner / branch | Must be merged first | File fence / integration note |
 |---|---|---|---|
-| MNT-005 | Parfit — `parfit/mnt-005-ci-test-inventory` | register branch | `.github/workflows/test.yml`, schema-test runner/registry, PG/DNN test selection; no migration redesign |
-| MNT-003 | Parfit — `parfit/mnt-003-versioned-migrations` | MNT-005 | `src/db.rs`, DB portions of `src/admin.rs`, `schema/**`, `migrations/**`, DB contract tests, `docs/database.md` |
-| MNT-018A | Parfit — `parfit/mnt-018a-pin-toolchains` | MNT-005 | CI toolchain/runner pins, `rust-toolchain.toml`, one Node version file, verification docs |
-| MNT-007A | Lovelace — `lovelace/mnt-007a-db-executor-core` | MNT-003 | `src/db.rs`, new `src/db/**`; freeze the executor/transaction API after merge |
-| MNT-007B | Lovelace — `lovelace/mnt-007b-db-executor-adoption` | MNT-007A | ordinary CRUD dispatch call sites and deletion of local macros; backend-specific SQL remains explicit |
-| MNT-018B | Parfit — `parfit/mnt-018b-amortize-db-fixtures` | MNT-003, MNT-007B, MNT-018A | test support/templates and DB contract tests; both backends remain covered |
-| MNT-018C | Lovelace — `lovelace/mnt-018c-core-warning-budget` | MNT-018B | `src/db/**`, `src/listing/**`, `src/listings.rs`, `src/models.rs`, `src/server.rs`, core module wiring |
-| MNT-018D | Leibniz — `leibniz/mnt-018d-catalog-warning-budget` | MNT-018B | `src/aircraft/**`, `src/avionics/**`, `src/plugin.rs`, `src/html/**` |
-| MNT-018E | Rawls — `rawls/mnt-018e-modeling-warning-budget` | MNT-018B | `src/valuation/**`, `src/gemini/**`, `src/admin.rs`, binaries; no shared Cargo policy |
-| MNT-018F | Parfit — `parfit/mnt-018f-enforce-quality-gate` | MNT-018C, MNT-018D, MNT-018E | CI/lint policy and canonical `-D warnings` command only |
-| MNT-017 | Parfit — `parfit/mnt-017-cli-doc-registry` | MNT-003, MNT-018F | `src/admin.rs`, command docs, proposal lifecycle headers; add a CLI dependency only for measured net simplification |
-| MNT-020A | Parfit — `parfit/mnt-020a-compatibility-inventory` | MNT-017 | inventory, consumers, warnings, telemetry/deployment evidence, removal gates; no premature removal |
-| MNT-020B | Parfit — `parfit/mnt-020b-remove-expired-compatibility` | MNT-020A, MNT-002, MNT-015B | remove only paths whose consumer/removal evidence is satisfied, including tests/docs/adapters |
+| MNT-005 | `coder` (Parfit review) — `codex/mnt-005-ci-test-inventory` | register branch | `.github/workflows/test.yml`, schema-test runner/registry, PG/DNN test selection; no migration redesign |
+| MNT-003 | `architect` -> `coder` (Parfit review) — `codex/mnt-003-versioned-migrations` | MNT-005 | `src/db.rs`, DB portions of `src/admin.rs`, `schema/**`, `migrations/**`, DB contract tests, `docs/database.md` |
+| MNT-018A | `coder` (Parfit review) — `codex/mnt-018a-pin-toolchains` | MNT-005 | CI toolchain/runner pins, `rust-toolchain.toml`, one Node version file, verification docs |
+| MNT-007A | `architect` -> `coder` (Lovelace review) — `codex/mnt-007a-db-executor-core` | MNT-003 | `src/db.rs`, new `src/db/**`; freeze the executor/transaction API after merge |
+| MNT-007B | `coder` (Lovelace review) — `codex/mnt-007b-db-executor-adoption` | MNT-007A | ordinary CRUD dispatch call sites and deletion of local macros; backend-specific SQL remains explicit |
+| MNT-018B | `coder` (Parfit review) — `codex/mnt-018b-amortize-db-fixtures` | MNT-003, MNT-007B, MNT-018A | test support/templates and DB contract tests; both backends remain covered |
+| MNT-018C | `coder` (Lovelace review) — `codex/mnt-018c-core-warning-budget` | MNT-018B | `src/db/**`, `src/listing/**`, `src/listings.rs`, `src/models.rs`, `src/server.rs`, core module wiring |
+| MNT-018D | `coder` (Leibniz review) — `codex/mnt-018d-catalog-warning-budget` | MNT-018B | `src/aircraft/**`, `src/avionics/**`, `src/plugin.rs`, `src/html/**` |
+| MNT-018E | `coder` (Rawls review) — `codex/mnt-018e-modeling-warning-budget` | MNT-018B | `src/valuation/**`, `src/gemini/**`, `src/admin.rs`, binaries; no shared Cargo policy |
+| MNT-018F | `coder` (Parfit review) — `codex/mnt-018f-enforce-quality-gate` | MNT-018C, MNT-018D, MNT-018E | CI/lint policy and canonical `-D warnings` command only |
+| MNT-017 | `architect` -> `coder` (Parfit review) — `codex/mnt-017-cli-doc-registry` | MNT-003, MNT-018F | `src/admin.rs`, command docs, proposal lifecycle headers; add a CLI dependency only for measured net simplification |
+| MNT-020A | `coder` (Parfit review) — `codex/mnt-020a-compatibility-inventory` | MNT-017 | inventory, consumers, warnings, telemetry/deployment evidence, removal gates; no premature removal |
+| MNT-020B | `coder` (Parfit review) — `codex/mnt-020b-remove-expired-compatibility` | MNT-020A, MNT-002, MNT-015B | remove only paths whose consumer/removal evidence is satisfied, including tests/docs/adapters |
 
 `MNT-018C`, `MNT-018D`, and `MNT-018E` are the only intentionally parallel
 Rust-wide cleanup branches. Their file fences are disjoint. Merge them one at a
@@ -125,29 +137,29 @@ time with a rebase between merges, then enable the gate in `MNT-018F`.
 
 | Unit | Owner / branch | Must be merged first | File fence / integration note |
 |---|---|---|---|
-| MNT-009A | Lovelace — `lovelace/mnt-009a-typed-listing-commands` | MNT-007B, MNT-018F | listing transport commands, structured field errors, `src/models.rs`, listing parser removal, thin server wiring |
-| MNT-009B | Lovelace — `lovelace/mnt-009b-structured-review-contracts` | MNT-009A | tagged review decision endpoint/result/error protocol; client compatibility only, no review persistence redesign |
-| MNT-001A | Rawls — `rawls/mnt-001a-atomic-valuation-writes` | MNT-007B, MNT-018F | `src/valuation/{dataset,store}.rs` and failure injection; no aircraft identity cutover |
-| MNT-001B | Lovelace — `lovelace/mnt-001b-atomic-listing-writes` | MNT-007B, MNT-009A, MNT-018F | listing mutation/fact/finalization unit of work and failure injection; no module extraction |
-| MNT-004 | Rawls — `rawls/mnt-004-bounded-list-reads` | MNT-001A, MNT-001B, MNT-009B | listing/catalog page queries, `src/cleanup.rs`, page DTO/handler wiring, query-count tests |
-| MNT-010 | Leibniz — `leibniz/mnt-010-shared-domain-vocabularies` | MNT-003, MNT-009B | one versioned vocabulary source, generators/artifacts, parity fixtures; generated files cease manual ownership |
-| MNT-006A | Lovelace — `lovelace/mnt-006a-canonical-identity-dual-read` | MNT-001A, MNT-001B, MNT-003, MNT-004 | canonical direct writes/reads, paired migration, mismatch instrumentation, documented rollback/export |
-| MNT-006B | Lovelace — `lovelace/mnt-006b-remove-legacy-identity` | MNT-006A plus recorded zero-mismatch observation on SQLite and PostgreSQL | destructive cutover migration and deletion of projections/placeholders/triggers/legacy columns; never start on synthetic evidence alone |
-| MNT-022 | Leibniz — `leibniz/mnt-022-catalog-mutation-authorizations` | MNT-003, MNT-006B, MNT-007B, MNT-010 | consolidation/authorization tables, guards, claims, triggers, paired migrations and parity projection |
-| MNT-002 | Leibniz — `leibniz/mnt-002-review-aspect-source-of-truth` | MNT-001B, MNT-006B; branch after MNT-022 to serialize schema | review persistence/transition engine, pending-review schema/migration, compatibility projection; queue GETs stay read-only |
-| MNT-011 | Leibniz — `leibniz/mnt-011-revision-bound-verification-plans` | MNT-002, MNT-004, MNT-007B, MNT-010 | listing/avionics/aircraft verification plans and scoped catalog reads; consume review API without reopening persistence |
-| MNT-024 | Parfit — `parfit/mnt-024-curation-prepared-outcomes` | MNT-009B, MNT-011 | aircraft curation workflow/application/report separation; keep schema-free if possible |
-| MNT-014 | Rawls — `rawls/mnt-014-bounded-bulk-workflows` | MNT-004, MNT-011 | FAA/backfill set operations and bounded citation/image workers; preserve security and deterministic ordering |
-| MNT-013 | Rawls — `rawls/mnt-013-set-based-sparse-valuation` | MNT-001A, MNT-004, MNT-011, MNT-014 | `src/valuation/**`, benchmarks, optional sparse dependency; final measurements on rebased main |
-| MNT-021 | Leibniz — `leibniz/mnt-021-avionics-product-retirement` | MNT-002, MNT-022 | retirement lifecycle and projections; remove online physical-delete repair/locks without rewriting history |
-| MNT-025 | Lovelace — `lovelace/mnt-025-derived-verification-run-state` | MNT-009B, MNT-010, MNT-011 | listing verification item/result projection and browser protocol fixtures; no replay-run edits |
-| MNT-012 | Lovelace — `lovelace/mnt-012-capture-lifecycle-engine` | MNT-001B, MNT-009B, MNT-011, MNT-021 | `src/plugin.rs`, listing creation/reuse, replay admission/run lifecycle; exclusive listing/capture ownership |
-| MNT-023 | Leibniz — `leibniz/mnt-023-typed-capture-checkpoints` | MNT-009B, MNT-010, MNT-012 | checkpoint type/version/hash and compact capture identity across plugin/listing/replay boundaries |
-| MNT-008A | Lovelace — `lovelace/mnt-008a-listing-model-commands` | MNT-001B, MNT-002, MNT-007B, MNT-009B, MNT-012, MNT-023 | extract model/command behavior from `src/listings.rs`; delete moved code |
-| MNT-008B | Lovelace — `lovelace/mnt-008b-listing-query-repository` | MNT-008A | extract queries/repository; no forwarding implementation remains |
-| MNT-008C | Lovelace — `lovelace/mnt-008c-listing-finalization` | MNT-008B | extract finalization into the settled transaction unit of work |
-| MNT-008D | Lovelace — `lovelace/mnt-008d-remove-listings-module` | MNT-008C | delete `src/listings.rs`, plural module/imports, and temporary migration seams |
-| MNT-019 | Rawls — `rawls/mnt-019-cold-capture-storage` | MNT-003, MNT-004, MNT-008D, MNT-022, MNT-023 | paired migrations, cold content loader, replay/export adapters, measured indexes/retention/backup semantics |
+| MNT-009A | `architect` -> `coder` (Lovelace review) — `codex/mnt-009a-typed-listing-commands` | MNT-007B, MNT-018F | listing transport commands, structured field errors, `src/models.rs`, listing parser removal, thin server wiring |
+| MNT-009B | `coder` (Lovelace review) — `codex/mnt-009b-structured-review-contracts` | MNT-009A | tagged review decision endpoint/result/error protocol; client compatibility only, no review persistence redesign |
+| MNT-001A | `architect` -> `coder` (Rawls review) — `codex/mnt-001a-atomic-valuation-writes` | MNT-007B, MNT-018F | `src/valuation/{dataset,store}.rs` and failure injection; no aircraft identity cutover |
+| MNT-001B | `architect` -> `coder` (Lovelace review) — `codex/mnt-001b-atomic-listing-writes` | MNT-007B, MNT-009A, MNT-018F | listing mutation/fact/finalization unit of work and failure injection; no module extraction |
+| MNT-004 | `architect` -> `coder` (Rawls review) — `codex/mnt-004-bounded-list-reads` | MNT-001A, MNT-001B, MNT-009B | listing/catalog page queries, `src/cleanup.rs`, page DTO/handler wiring, query-count tests |
+| MNT-010 | `coder` (Leibniz review) — `codex/mnt-010-shared-domain-vocabularies` | MNT-003, MNT-009B | one versioned vocabulary source, generators/artifacts, parity fixtures; generated files cease manual ownership |
+| MNT-006A | `architect` -> `coder` (Lovelace review) — `codex/mnt-006a-canonical-identity-dual-read` | MNT-001A, MNT-001B, MNT-003, MNT-004 | canonical direct writes/reads, paired migration, mismatch instrumentation, documented rollback/export |
+| MNT-006B | `architect` -> `coder` (Lovelace review) — `codex/mnt-006b-remove-legacy-identity` | MNT-006A plus recorded zero-mismatch observation on SQLite and PostgreSQL | destructive cutover migration and deletion of projections/placeholders/triggers/legacy columns; never start on synthetic evidence alone |
+| MNT-022 | `architect` -> `coder` (Leibniz review) — `codex/mnt-022-catalog-mutation-authorizations` | MNT-003, MNT-006B, MNT-007B, MNT-010 | consolidation/authorization tables, guards, claims, triggers, paired migrations and parity projection |
+| MNT-002 | `architect` -> `coder` (Leibniz review) — `codex/mnt-002-review-aspect-source-of-truth` | MNT-001B, MNT-006B; branch after MNT-022 to serialize schema | review persistence/transition engine, pending-review schema/migration, compatibility projection; queue GETs stay read-only |
+| MNT-011 | `architect` -> `coder` (Leibniz review) — `codex/mnt-011-revision-bound-verification-plans` | MNT-002, MNT-004, MNT-007B, MNT-010 | listing/avionics/aircraft verification plans and scoped catalog reads; consume review API without reopening persistence |
+| MNT-024 | `coder` (Parfit review) — `codex/mnt-024-curation-prepared-outcomes` | MNT-009B, MNT-011 | aircraft curation workflow/application/report separation; keep schema-free if possible |
+| MNT-014 | `coder` (Rawls review) — `codex/mnt-014-bounded-bulk-workflows` | MNT-004, MNT-011 | FAA/backfill set operations and bounded citation/image workers; preserve security and deterministic ordering |
+| MNT-013 | `architect` -> `coder` (Rawls review) — `codex/mnt-013-set-based-sparse-valuation` | MNT-001A, MNT-004, MNT-011, MNT-014 | `src/valuation/**`, benchmarks, optional sparse dependency; final measurements on rebased main |
+| MNT-021 | `architect` -> `coder` (Leibniz review) — `codex/mnt-021-avionics-product-retirement` | MNT-002, MNT-022 | retirement lifecycle and projections; remove online physical-delete repair/locks without rewriting history |
+| MNT-025 | `coder` (Lovelace review) — `codex/mnt-025-derived-verification-run-state` | MNT-009B, MNT-010, MNT-011 | listing verification item/result projection and browser protocol fixtures; no replay-run edits |
+| MNT-012 | `architect` -> `coder` (Lovelace review) — `codex/mnt-012-capture-lifecycle-engine` | MNT-001B, MNT-009B, MNT-011, MNT-021 | `src/plugin.rs`, listing creation/reuse, replay admission/run lifecycle; exclusive listing/capture ownership |
+| MNT-023 | `architect` -> `coder` (Leibniz review) — `codex/mnt-023-typed-capture-checkpoints` | MNT-009B, MNT-010, MNT-012 | checkpoint type/version/hash and compact capture identity across plugin/listing/replay boundaries |
+| MNT-008A | `coder` (Lovelace review) — `codex/mnt-008a-listing-model-commands` | MNT-001B, MNT-002, MNT-007B, MNT-009B, MNT-012, MNT-023 | extract model/command behavior from `src/listings.rs`; delete moved code |
+| MNT-008B | `coder` (Lovelace review) — `codex/mnt-008b-listing-query-repository` | MNT-008A | extract queries/repository; no forwarding implementation remains |
+| MNT-008C | `coder` (Lovelace review) — `codex/mnt-008c-listing-finalization` | MNT-008B | extract finalization into the settled transaction unit of work |
+| MNT-008D | `coder` (Lovelace review) — `codex/mnt-008d-remove-listings-module` | MNT-008C | delete `src/listings.rs`, plural module/imports, and temporary migration seams |
+| MNT-019 | `architect` -> `coder` (Rawls review) — `codex/mnt-019-cold-capture-storage` | MNT-003, MNT-004, MNT-008D, MNT-022, MNT-023 | paired migrations, cold content loader, replay/export adapters, measured indexes/retention/backup semantics |
 
 `MNT-006B` is an operational gate, not a long-lived branch. Other independent
 work continues during the observation period. The branch is created only when
@@ -163,25 +175,25 @@ behavior; `WEB-009` owns responsive projection; `WEB-010` owns appearance;
 
 | Unit | Owner / branch | Must be merged first | File fence / integration note |
 |---|---|---|---|
-| WEB-002 | Boole — `boole/web-002-task-routing` | register branch | navigation shell, URL state, Back/Forward, titles, placeholder removal; freeze route/panel IDs |
-| WEB-001 | Gauss — `gauss/web-001-mobile-navigation` | WEB-002 | compact navigation layout/behavior, Escape/outside click/focus return; no page redesign |
-| MNT-015A | Boole — `boole/mnt-015a-controller-lifecycle-core` | MNT-004, MNT-009B, WEB-002 | lazy activation, owned abort/resource state, controller/module boundaries; no visible redesign |
-| WEB-008 | Boole — `boole/web-008-resource-feedback-states` | MNT-009B, MNT-015A | idle/loading/data/empty/stale/error presentation, retry/last-updated, race-proof message ownership |
-| MNT-015B | Boole — `boole/mnt-015b-incremental-controllers` | MNT-004, MNT-009B, MNT-015A, WEB-008 | first-page rendering, retained pagination, delta polling, result patching, bounded retries, final workflow split |
-| WEB-009A | Gauss — `gauss/web-009a-responsive-view-primitives` | WEB-001, MNT-015B | reusable priority/card/table primitives only; no feature content decisions |
-| WEB-003 | Boole — `boole/web-003-progressive-listings` | MNT-004, MNT-015B, WEB-008, WEB-009A | listing browse controller/view and page block; no editor or shell changes |
-| WEB-005 | Boole — `boole/web-005-guided-listing-editor` | MNT-009B, MNT-010, MNT-015A | listing editor/dialog only, structured inline errors, dirty protection/focus; no listing browse redesign |
-| WEB-007 | Boole — `boole/web-007-clear-catalog` | MNT-004, MNT-015B, WEB-008, WEB-009A | catalog controller/view, server-backed scope/filter/page, detail and danger-zone separation |
-| MNT-016A | Boole — `boole/mnt-016a-background-capture` | MNT-009B, MNT-010 | extension background job ownership/protocol, strict terminal parsing, coalesced persistence; minimal popup shim |
-| WEB-004 | Boole — `boole/web-004-prioritized-review-queue` | MNT-002, MNT-011, MNT-015B, MNT-020B, WEB-008 | review modules/page only: task buckets, evidence/decision hierarchy, reconnecting progress |
-| WEB-009B | Gauss — `gauss/web-009b-responsive-priority-views` | WEB-001, WEB-003, WEB-004, WEB-007, WEB-009A | migrate/audit page priority views and contained overflow; no fetching, wording, or desktop workflow changes |
-| WEB-010 | Gauss — `gauss/web-010-visual-system` | WEB-002, WEB-003, WEB-004, WEB-009B | tokens, type/spacing/density/status appearance and extension styling; no semantics or workflow changes |
-| WEB-011 | Gauss — `gauss/web-011-accessibility-completion` | WEB-001, WEB-005, WEB-008, WEB-009B, WEB-010 | keyboard/focus/form/status/table semantics, reduced motion/forced colors, behavioral accessibility tests |
-| WEB-006 | Boole — `boole/web-006-explainable-values` | MNT-013, MNT-015B, WEB-008, WEB-011 | aircraft/value controller/view, outcome summary and responsive explainable chart |
-| WEB-013 | Boole — `boole/web-013-capture-first-extension` | MNT-016A, WEB-005, WEB-008, WEB-010, WEB-011 | popup HTML/CSS/JS only; consume frozen background protocol and deep-link to canonical editor |
-| MNT-016B | Boole — `boole/mnt-016b-remove-popup-editor` | MNT-016A, WEB-013 | delete duplicate editor/schema/legacy messages; separate connection reset from history removal |
-| WEB-012 | Gauss — `gauss/web-012-plain-language` | MNT-009B, MNT-016B, WEB-004, WEB-006, WEB-008, WEB-011, WEB-013 | strings and matching accessible names only; update the language guide/contracts |
-| WEB-014 | Parfit — `parfit/web-014-behavioral-ui-tests` | MNT-015B, MNT-016B, WEB-001, WEB-008, WEB-011, WEB-012 | final critical-flow behavioral coverage for web and extension; no source-regex assertions |
+| WEB-002 | `coder` (Boole review) — `codex/web-002-task-routing` | register branch | navigation shell, URL state, Back/Forward, titles, placeholder removal; freeze route/panel IDs |
+| WEB-001 | `coder` (Gauss review) — `codex/web-001-mobile-navigation` | WEB-002 | compact navigation layout/behavior, Escape/outside click/focus return; no page redesign |
+| MNT-015A | `architect` -> `coder` (Boole review) — `codex/mnt-015a-controller-lifecycle-core` | MNT-004, MNT-009B, WEB-002 | lazy activation, owned abort/resource state, controller/module boundaries; no visible redesign |
+| WEB-008 | `coder` (Boole review) — `codex/web-008-resource-feedback-states` | MNT-009B, MNT-015A | idle/loading/data/empty/stale/error presentation, retry/last-updated, race-proof message ownership |
+| MNT-015B | `architect` -> `coder` (Boole review) — `codex/mnt-015b-incremental-controllers` | MNT-004, MNT-009B, MNT-015A, WEB-008 | first-page rendering, retained pagination, delta polling, result patching, bounded retries, final workflow split |
+| WEB-009A | `coder` (Gauss review) — `codex/web-009a-responsive-view-primitives` | WEB-001, MNT-015B | reusable priority/card/table primitives only; no feature content decisions |
+| WEB-003 | `coder` (Boole review) — `codex/web-003-progressive-listings` | MNT-004, MNT-015B, WEB-008, WEB-009A | listing browse controller/view and page block; no editor or shell changes |
+| WEB-005 | `coder` (Boole review) — `codex/web-005-guided-listing-editor` | MNT-009B, MNT-010, MNT-015A | listing editor/dialog only, structured inline errors, dirty protection/focus; no listing browse redesign |
+| WEB-007 | `coder` (Boole review) — `codex/web-007-clear-catalog` | MNT-004, MNT-015B, WEB-008, WEB-009A | catalog controller/view, server-backed scope/filter/page, detail and danger-zone separation |
+| MNT-016A | `architect` -> `coder` (Boole review) — `codex/mnt-016a-background-capture` | MNT-009B, MNT-010 | extension background job ownership/protocol, strict terminal parsing, coalesced persistence; minimal popup shim |
+| WEB-004 | `coder` (Boole review) — `codex/web-004-prioritized-review-queue` | MNT-002, MNT-011, MNT-015B, MNT-020B, WEB-008 | review modules/page only: task buckets, evidence/decision hierarchy, reconnecting progress |
+| WEB-009B | `coder` (Gauss review) — `codex/web-009b-responsive-priority-views` | WEB-001, WEB-003, WEB-004, WEB-007, WEB-009A | migrate/audit page priority views and contained overflow; no fetching, wording, or desktop workflow changes |
+| WEB-010 | `coder` (Gauss review) — `codex/web-010-visual-system` | WEB-002, WEB-003, WEB-004, WEB-009B | tokens, type/spacing/density/status appearance and extension styling; no semantics or workflow changes |
+| WEB-011 | `coder` (Gauss review) — `codex/web-011-accessibility-completion` | WEB-001, WEB-005, WEB-008, WEB-009B, WEB-010 | keyboard/focus/form/status/table semantics, reduced motion/forced colors, behavioral accessibility tests |
+| WEB-006 | `coder` (Boole review) — `codex/web-006-explainable-values` | MNT-013, MNT-015B, WEB-008, WEB-011 | aircraft/value controller/view, outcome summary and responsive explainable chart |
+| WEB-013 | `coder` (Boole review) — `codex/web-013-capture-first-extension` | MNT-016A, WEB-005, WEB-008, WEB-010, WEB-011 | popup HTML/CSS/JS only; consume frozen background protocol and deep-link to canonical editor |
+| MNT-016B | `coder` (Boole review) — `codex/mnt-016b-remove-popup-editor` | MNT-016A, WEB-013 | delete duplicate editor/schema/legacy messages; separate connection reset from history removal |
+| WEB-012 | `coder` (Gauss review) — `codex/web-012-plain-language` | MNT-009B, MNT-016B, WEB-004, WEB-006, WEB-008, WEB-011, WEB-013 | strings and matching accessible names only; update the language guide/contracts |
+| WEB-014 | `coder` (Parfit review) — `codex/web-014-behavioral-ui-tests` | MNT-015B, MNT-016B, WEB-001, WEB-008, WEB-011, WEB-012 | final critical-flow behavioral coverage for web and extension; no source-regex assertions |
 
 ## Conflict barriers
 
@@ -224,7 +236,7 @@ Use dependency readiness rather than keeping speculative branches open. The
 initial and major gates are:
 
 1. **Register:** merge `codex/improvement-register-and-plan`.
-2. **First launch:** run MNT-005 and WEB-002 in separate worktrees.
+2. **First launch:** run MNT-005 and WEB-002 in separate isolated checkouts.
 3. **Early parallel work:** after MNT-005, run MNT-003; after WEB-002, run
    WEB-001. Then land MNT-018A and MNT-007A/B without overlapping their shared
    CI/database files.
@@ -246,10 +258,11 @@ initial and major gates are:
 10. **Web finish:** serialize remaining task flows, WEB-009B, WEB-010,
     WEB-011, WEB-006, WEB-013, MNT-016B, and WEB-012. Land WEB-014 last.
 
-Six agents are the capacity ceiling, not a utilization target. A slot stays
-idle when filling it would create an unmergeable branch or violate a hotspot
-barrier. As soon as an eligible branch merges, the same agent's worktree is
-recreated from current `main` for the next ready unit.
+Six implementation agents are the capacity ceiling, not a utilization target.
+A slot stays idle when filling it would create an unmergeable branch or violate
+a hotspot barrier. As soon as an eligible branch merges, the next writable
+agent creates a fresh private clone or worktree from current `main` for the next
+ready unit.
 
 ## Completion accounting
 
