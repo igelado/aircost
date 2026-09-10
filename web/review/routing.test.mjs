@@ -15,6 +15,7 @@ import {
   reviewListingRouteOwner,
   reviewListingRouteOwnerIsCurrent,
   reviewMutationInProgress,
+  reviewPipelineRouteIsSame,
   reviewProductFallbackForResult,
   reviewProductQueueNeedsLoad,
   reviewProductRouteIsSame,
@@ -267,6 +268,20 @@ test("recognizes only the same listing or product editor route", () => {
     reviewProductRouteIsSame(
       parseRoute("/#/review/products/28"),
       parseRoute("/#/review/products"),
+    ),
+    false,
+  );
+  assert.equal(
+    reviewPipelineRouteIsSame(
+      parseRoute("/#/review?search=GNS"),
+      parseRoute("/#/review?search=GNS+430&filter=automatic"),
+    ),
+    true,
+  );
+  assert.equal(
+    reviewPipelineRouteIsSame(
+      parseRoute("/#/review?search=GNS"),
+      parseRoute("/#/review/manual"),
     ),
     false,
   );

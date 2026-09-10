@@ -247,6 +247,15 @@ export function reviewProductRouteIsSame(current, next) {
     && candidate.productId === owner.productId;
 }
 
+export function reviewPipelineRouteIsSame(current, next) {
+  const owner = normalizeRoute(current);
+  const candidate = normalizeRoute(next);
+  return owner.name === "review"
+    && owner.view === "pipeline"
+    && candidate.name === "review"
+    && candidate.view === "pipeline";
+}
+
 export function confirmDirtyRouteChange(dirty, sameOwner, confirmDiscard) {
   return !dirty || sameOwner || confirmDiscard();
 }

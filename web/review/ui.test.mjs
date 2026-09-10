@@ -8,10 +8,10 @@ const appJs = readFileSync(new URL("../app.js", import.meta.url), "utf8");
 const avionicsJs = readFileSync(new URL("../avionics.js", import.meta.url), "utf8");
 const reviewJs = readFileSync(new URL("../review.js", import.meta.url), "utf8");
 
-test("keeps listing form reset local instead of creating a duplicate route entry", () => {
+test("keeps listing form reset explicit without creating a duplicate route entry", () => {
   assert.match(
     appJs,
-    /elements\.resetForm\.addEventListener\("click", resetListingForm\)/,
+    /elements\.resetForm\.addEventListener\("click", \(\) => resetListingForm\(\)\)/,
   );
   const guardStart = appJs.indexOf("function confirmListingRouteChange");
   const guardEnd = appJs.indexOf("\nfunction markListingDraftDirty", guardStart);
@@ -20,6 +20,56 @@ test("keeps listing form reset local instead of creating a duplicate route entry
     /listingDraftDirty = false/,
     "checking one guard must not consume state before later guards accept",
   );
+});
+
+test("resetting an edited listing replaces its route with creation", () => {
+  const start = appJs.indexOf("function resetListingForm");
+  const end = appJs.indexOf("\nfunction openListingDialog", start);
+  assert.ok(start >= 0 && end > start);
+
+  const state = { editingListingId: 41, listingDraftDirty: true };
+  const navigations = [];
+  const elements = {
+    listingForm: { reset() {} },
+    listingFormTitle: {},
+    formModeStatus: {},
+    deleteListing: { classList: { add() {} } },
+    saveListing: {},
+    avionicsList: { replaceChildren() {} },
+  };
+  const reset = Function(
+    "state",
+    "elements",
+    "setField",
+    "addAvionicsRow",
+    "setFormMessage",
+    "navigateRoute",
+    "listingFiltersFromControls",
+    `${appJs.slice(start, end)}\nreturn resetListingForm;`,
+  )(
+    state,
+    elements,
+    () => {},
+    () => {},
+    () => {},
+    (route, options) => navigations.push({ route, options }),
+    () => ({ search: "Cessna" }),
+  );
+
+  reset();
+  assert.equal(state.editingListingId, null);
+  assert.equal(state.listingDraftDirty, false);
+  assert.deepEqual(navigations, [{
+    route: {
+      name: "listings",
+      selected: "new",
+      filters: { search: "Cessna" },
+    },
+    options: { replace: true },
+  }]);
+
+  reset();
+  assert.equal(navigations.length, 1, "resetting creation mode must not write history again");
 });
 
 test("organizes four addressable task links without unfinished destinations", () => {
@@ -193,6 +243,133 @@ test("preserves stale listing drafts across review area routes", async () => {
   assert.equal(state.drafts.size, 0);
 });
 
+test("reloads pipeline only on startup and true collection re-entry", async () => {
+  const start = reviewJs.indexOf("function activateReviewRoute");
+  const end = reviewJs.indexOf("\nfunction activeReviewMutation", start);
+  assert.ok(start >= 0 && end > start);
+
+  const state = {
+    route: { name: "review", view: "manual" },
+    routeGeneration: 0,
+    pipelineSearch: "",
+    pipelineFilter: "all",
+    pipelineLoaded: true,
+    activeVerificationRunId: 7,
+  };
+  const elements = {
+    reviewPipelineSearch: { value: "" },
+    reviewPipelineFilter: { value: "all" },
+  };
+  const requests = [];
+  const resumedRuns = [];
+  const loadPipelineQueue = (options) => {
+    requests.push(options);
+    return Promise.resolve(true);
+  };
+  const samePipeline = (left, right) => left?.name === "review"
+    && left.view === "pipeline"
+    && right?.name === "review"
+    && right.view === "pipeline";
+  const activate = Function(
+    "state",
+    "elements",
+    "document",
+    "closeProductReview",
+    "showQueue",
+    "setQueueMode",
+    "loadQueue",
+    "loadPipelineQueue",
+    "renderPipelineTable",
+    "preserveLiveRouteInput",
+    "reviewPipelineRouteIsSame",
+    "resumeVerificationRun",
+    `${reviewJs.slice(start, end)}\nreturn activateReviewRoute;`,
+  )(
+    state,
+    elements,
+    { activeElement: null },
+    () => {},
+    () => {},
+    () => {},
+    () => Promise.resolve(true),
+    loadPipelineQueue,
+    () => {},
+    () => false,
+    samePipeline,
+    (runId) => {
+      resumedRuns.push(runId);
+      return Promise.resolve();
+    },
+  );
+
+  const pipeline = { name: "review", view: "pipeline", search: "", filter: "all" };
+  await activate(pipeline, { source: "push" });
+  assert.equal(requests.length, 1, "entering Pipeline refreshes stale cached rows");
+  assert.deepEqual(resumedRuns, [7]);
+
+  const searched = { ...pipeline, search: "GNS" };
+  await activate(searched, { source: "replace" });
+  await activate({ ...searched, filter: "manual" }, { source: "replace" });
+  assert.equal(requests.length, 1, "local controls reuse the active collection");
+  assert.deepEqual(resumedRuns, [7], "local controls issue no run-status request");
+  assert.equal(requests[0].commitGuard(), true, "local controls retain request ownership");
+
+  await activate({ name: "review", view: "manual" }, { source: "push" });
+  assert.equal(requests[0].commitGuard(), false, "leaving Pipeline invalidates its response");
+  await activate(pipeline, { source: "popstate" });
+  assert.equal(requests.length, 2, "returning to Pipeline refreshes again");
+  assert.deepEqual(resumedRuns, [7, 7]);
+});
+
+test("review tab selection changes only after accepted navigation", () => {
+  const start = reviewJs.indexOf("function navigateReviewArea");
+  const end = reviewJs.indexOf("\nfunction handleReviewTabKeydown", start);
+  assert.ok(start >= 0 && end > start);
+
+  let accepted = false;
+  let visibleArea = "aircraft";
+  let focused = 0;
+  const navigations = [];
+  const navigateArea = Function(
+    "REVIEW_AREAS",
+    "currentListingId",
+    "navigate",
+    "reviewListingRoute",
+    "reviewAreaElements",
+    `${reviewJs.slice(start, end)}\nreturn navigateReviewArea;`,
+  )(
+    ["aircraft", "avionics"],
+    () => 41,
+    (route, options) => {
+      navigations.push({ route, options });
+      if (!accepted) {
+        return false;
+      }
+      visibleArea = route.area;
+      return true;
+    },
+    (listingId, area) => ({ name: "review", view: "listing", listingId, area }),
+    () => ({ tab: { focus: () => { focused += 1; } } }),
+  );
+
+  assert.equal(navigateArea("avionics", { focus: true }), false);
+  assert.equal(visibleArea, "aircraft");
+  assert.equal(focused, 0);
+
+  accepted = true;
+  assert.equal(navigateArea("avionics", { focus: true }), true);
+  assert.equal(visibleArea, "avionics");
+  assert.equal(focused, 1);
+  assert.deepEqual(navigations.at(-1), {
+    route: { name: "review", view: "listing", listingId: 41, area: "avionics" },
+    options: { replace: true },
+  });
+  assert.match(
+    reviewJs,
+    /tab\.addEventListener\("click", \(\) => \{\s*navigateReviewArea\(area\);/,
+  );
+});
+
 test("falls back from absent product detail only through its route owner", () => {
   assert.match(
     reviewJs,
@@ -259,10 +436,10 @@ test("reloads the manual review collection on every route re-entry", () => {
   );
 });
 
-test("reloads the pipeline collection under exact route ownership", () => {
+test("reloads the pipeline collection under destination ownership", () => {
   assert.match(
     reviewJs,
-    /const pipelineLoad = loadPipelineQueue\(\{\s*commitGuard: \(\) => routeActivationIsCurrent\(route, state\.route\),/,
+    /const samePipelineActivation = source !== "startup"\s*&& reviewPipelineRouteIsSame\(previousRoute, route\);\s*const pipelineLoad = samePipelineActivation[\s\S]*?commitGuard: \(\) => reviewPipelineRouteIsSame\(route, state\.route\),/,
   );
   assert.match(
     reviewJs,

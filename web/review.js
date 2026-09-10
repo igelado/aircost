@@ -61,6 +61,7 @@ import {
   reviewListingRouteOwner,
   reviewListingRouteOwnerIsCurrent,
   reviewMutationInProgress,
+  reviewPipelineRouteIsSame,
   reviewProductFallbackForResult,
   reviewProductQueueNeedsLoad,
   reviewProductRouteIsSame,
@@ -285,10 +286,14 @@ function activateReviewRoute(route, { source } = {}) {
   if (state.pipelineLoaded) {
     renderPipelineTable();
   }
-  const pipelineLoad = loadPipelineQueue({
-    commitGuard: () => routeActivationIsCurrent(route, state.route),
-  });
-  const runLoad = state.activeVerificationRunId === null
+  const samePipelineActivation = source !== "startup"
+    && reviewPipelineRouteIsSame(previousRoute, route);
+  const pipelineLoad = samePipelineActivation
+    ? Promise.resolve()
+    : loadPipelineQueue({
+      commitGuard: () => reviewPipelineRouteIsSame(route, state.route),
+    });
+  const runLoad = samePipelineActivation || state.activeVerificationRunId === null
     ? Promise.resolve()
     : resumeVerificationRun(state.activeVerificationRunId);
   return Promise.allSettled([pipelineLoad, runLoad]);
@@ -441,7 +446,7 @@ function bindEvents() {
   elements.reviewPipelineFilter.addEventListener("change", () => {
     state.pipelineFilter = elements.reviewPipelineFilter.value;
     renderPipelineTable();
-    navigate(reviewQueueRoute("pipeline"));
+    navigate(reviewQueueRoute("pipeline"), { replace: true });
   });
   elements.reviewPipelineSelectAll.addEventListener("click", selectAllActionablePipelineRows);
   elements.reviewPipelineVerify.addEventListener("click", () => {
@@ -541,7 +546,7 @@ function bindEvents() {
   for (const area of REVIEW_AREAS) {
     const tab = reviewAreaElements(area).tab;
     tab.addEventListener("click", () => {
-      setActiveReviewArea(area, { updateLocation: true });
+      navigateReviewArea(area);
     });
     tab.addEventListener("keydown", (event) => handleReviewTabKeydown(event, area));
   }
@@ -2906,10 +2911,11 @@ function renderReview() {
   elements.reviewAircraftTabCount.textContent = String(aircraftBlockerCount);
   elements.reviewAvionicsTabCount.textContent = String(avionicsAspects.length);
   const requestedArea = reviewAreaForRoute(state.route);
-  setActiveReviewArea(
-    requestedArea ?? presentation.defaultArea,
-    { updateLocation: requestedArea === null },
-  );
+  if (requestedArea === null) {
+    navigateReviewArea(presentation.defaultArea);
+  } else {
+    setActiveReviewArea(requestedArea);
+  }
   elements.reviewStale.classList.add("is-hidden");
   setWorkspaceMessage("");
   updateProgress();
@@ -2944,7 +2950,7 @@ function reviewAreaElements(area) {
   };
 }
 
-function setActiveReviewArea(area, { focus = false, updateLocation = false } = {}) {
+function setActiveReviewArea(area) {
   const selectedArea = REVIEW_AREAS.includes(area) ? area : "avionics";
   state.activeArea = selectedArea;
   for (const candidate of REVIEW_AREAS) {
@@ -2954,12 +2960,19 @@ function setActiveReviewArea(area, { focus = false, updateLocation = false } = {
     tab.tabIndex = selected ? 0 : -1;
     panel.hidden = !selected;
   }
-  if (focus) {
+}
+
+function navigateReviewArea(area, { focus = false } = {}) {
+  const listingId = currentListingId();
+  if (listingId === null) {
+    return false;
+  }
+  const selectedArea = REVIEW_AREAS.includes(area) ? area : "avionics";
+  const result = navigate(reviewListingRoute(listingId, selectedArea), { replace: true });
+  if (result !== false && focus) {
     reviewAreaElements(selectedArea).tab.focus();
   }
-  if (updateLocation && currentListingId() !== null) {
-    navigate(reviewListingRoute(currentListingId(), state.activeArea), { replace: true });
-  }
+  return result;
 }
 
 function handleReviewTabKeydown(event, area) {
@@ -2978,9 +2991,8 @@ function handleReviewTabKeydown(event, area) {
     return;
   }
   event.preventDefault();
-  setActiveReviewArea(REVIEW_AREAS[nextIndex], {
+  navigateReviewArea(REVIEW_AREAS[nextIndex], {
     focus: true,
-    updateLocation: true,
   });
 }
 
@@ -4597,7 +4609,7 @@ async function resolveReview() {
       "Aircraft catalog curation and FAA verification must be completed before this listing can be verified.",
       true,
     );
-    setActiveReviewArea("aircraft", { updateLocation: true });
+    navigateReviewArea("aircraft");
     updateProgress();
     return;
   }
@@ -4609,7 +4621,7 @@ async function resolveReview() {
       "Two retained occurrences select the same canonical avionics product. Keep one occurrence with the exact source-supported quantity, discard a duplicate observation, or select the genuinely different product variant.",
       true,
     );
-    setActiveReviewArea("avionics", { updateLocation: true });
+    navigateReviewArea("avionics");
     state.aspectViews.get(firstConflictKey)?.article.scrollIntoView({
       behavior: "smooth",
       block: "start",
@@ -4620,7 +4632,7 @@ async function resolveReview() {
   }
   if (drafts.some((draft) => !validateDraft(draft).valid)) {
     setWorkspaceMessage("Resolve every residual avionics occurrence before completing the manual review.", true);
-    setActiveReviewArea("avionics", { updateLocation: true });
+    navigateReviewArea("avionics");
     const firstInvalid = drafts.find((draft) => !validateDraft(draft).valid);
     state.aspectViews.get(aspectKey(firstInvalid?.aspect?.id))?.article.scrollIntoView({
       behavior: "smooth",

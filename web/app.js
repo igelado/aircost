@@ -228,7 +228,7 @@ function bindEvents() {
       filters: listingFiltersFromControls(),
     });
   });
-  elements.resetForm.addEventListener("click", resetListingForm);
+  elements.resetForm.addEventListener("click", () => resetListingForm());
   elements.closeListingDialog.addEventListener("click", closeListingDialog);
   elements.listingForm.addEventListener("input", markListingDraftDirty);
   elements.listingForm.addEventListener("change", markListingDraftDirty);
@@ -359,7 +359,7 @@ function applyListingsRoute(route, context = {}) {
   renderListings();
   if (route.selected === "new") {
     if (state.editingListingId !== null || !elements.listingDialog.open) {
-      resetListingForm();
+      resetListingForm({ updateRoute: false });
     }
     openListingDialog();
     return;
@@ -1268,7 +1268,8 @@ function editListing(listing) {
   openListingDialog();
 }
 
-function resetListingForm() {
+function resetListingForm({ updateRoute = true } = {}) {
+  const wasEditing = state.editingListingId !== null;
   state.editingListingId = null;
   elements.listingForm.reset();
   elements.listingFormTitle.textContent = "New aircraft";
@@ -1282,6 +1283,13 @@ function resetListingForm() {
   addAvionicsRow();
   setFormMessage("");
   state.listingDraftDirty = false;
+  if (updateRoute && wasEditing) {
+    return navigateRoute({
+      name: "listings",
+      selected: "new",
+      filters: listingFiltersFromControls(),
+    }, { replace: true });
+  }
 }
 
 function openListingDialog() {
