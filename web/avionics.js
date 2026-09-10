@@ -148,7 +148,13 @@ async function applyCatalogRoute(route, { source } = {}) {
     )
     : null;
   if (pageFallback !== null) {
-    const navigated = await navigate(pageFallback, { replace: true });
+    const fallbackRoute = state.avionicsSearchTimer === null
+      ? pageFallback
+      : catalogRouteFromControls({
+        page: pageFallback.filters?.page || 1,
+        productId: pageFallback.productId || null,
+      });
+    const navigated = await navigate(fallbackRoute, { replace: true });
     if (navigated !== false) {
       return;
     }

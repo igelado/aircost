@@ -1077,11 +1077,132 @@ test("reloads product collections but reuses detail caches under route ownership
   );
 });
 
-test("canonicalizes catalog result pages before continuing detail activation", () => {
-  assert.match(
-    avionicsJs,
-    /const pageFallback = state\.avionicsLoaded[\s\S]*?catalogPageFallbackForResult\(\s*route,\s*state\.route,\s*state\.avionicsTotal,\s*state\.avionicsLimit,[\s\S]*?const navigated = await navigate\(pageFallback, \{ replace: true \}\);\s*if \(navigated !== false\) \{\s*return;/,
-  );
+test("canonicalizes catalog pages without dropping a pending live search", async () => {
+  const applyStart = avionicsJs.indexOf("async function applyCatalogRoute");
+  const applyEnd = avionicsJs.indexOf("\nfunction setCatalogSelectValue", applyStart);
+  assert.ok(applyStart >= 0 && applyEnd > applyStart);
+
+  const compile = ({ pendingSearch }) => {
+    const route = {
+      name: "catalog",
+      productId: 7,
+      filters: {
+        search: "GNS",
+        status: "approved",
+        capability: "gps",
+        completeness: "complete",
+        page: 99,
+      },
+    };
+    const state = {
+      route,
+      avionicsDetail: null,
+      avionicsDetailRequestSequence: 0,
+      avionicsDetailTrigger: null,
+      avionicsDeleting: false,
+      avionicsOptionsLoaded: true,
+      avionicsLoaded: false,
+      avionicsSearchTimer: null,
+      catalogRouteKey: null,
+      avionicsTotal: 25,
+      avionicsLimit: 20,
+      avionicsOffset: 0,
+    };
+    const search = { value: "" };
+    const elements = {
+      avionicsDetailDialog: { open: false },
+      deleteAvionicsProduct: { disabled: true },
+      avionicsSearch: search,
+      avionicsCompletenessFilter: { value: "" },
+      avionicsStatusFilter: { value: "" },
+      avionicsCapabilityFilter: { value: "" },
+    };
+    const navigations = [];
+    const detailOpens = [];
+    const apply = Function(
+      "state",
+      "elements",
+      "positiveInteger",
+      "closeAvionicsDetail",
+      "cancelAvionicsSearch",
+      "preserveLiveRouteInput",
+      "document",
+      "loadAvionicsOptions",
+      "routeActivationIsCurrent",
+      "setCatalogSelectValue",
+      "loadAvionics",
+      "catalogPageFallbackForResult",
+      "catalogRouteFromControls",
+      "navigate",
+      "openAvionicsDetail",
+      `${avionicsJs.slice(applyStart, applyEnd)}\nreturn applyCatalogRoute;`,
+    )(
+      state,
+      elements,
+      (value, fallback) => {
+        const numeric = Number.parseInt(value, 10);
+        return Number.isInteger(numeric) && numeric > 0 ? numeric : fallback;
+      },
+      () => {},
+      () => { state.avionicsSearchTimer = null; },
+      () => false,
+      { activeElement: search },
+      () => Promise.resolve(),
+      (owner, current) => owner === current,
+      (control, value) => { control.value = value || ""; },
+      () => {
+        state.avionicsLoaded = true;
+        if (pendingSearch) {
+          search.value = "GNS 430";
+          state.avionicsSearchTimer = 41;
+        }
+      },
+      () => ({
+        ...route,
+        filters: { ...route.filters, page: 2 },
+      }),
+      ({ page, productId }) => ({
+        name: "catalog",
+        productId,
+        filters: {
+          search: search.value,
+          status: elements.avionicsStatusFilter.value,
+          capability: elements.avionicsCapabilityFilter.value,
+          completeness: elements.avionicsCompletenessFilter.value,
+          page,
+        },
+      }),
+      (nextRoute, options) => {
+        navigations.push({ route: nextRoute, options });
+        return Promise.resolve(true);
+      },
+      (productId) => detailOpens.push(productId),
+    );
+    return { apply: () => apply(route), detailOpens, navigations };
+  };
+
+  const pending = compile({ pendingSearch: true });
+  await pending.apply();
+  assert.deepEqual(pending.navigations, [{
+    route: {
+      name: "catalog",
+      productId: 7,
+      filters: {
+        search: "GNS 430",
+        status: "approved",
+        capability: "gps",
+        completeness: "complete",
+        page: 2,
+      },
+    },
+    options: { replace: true },
+  }]);
+  assert.deepEqual(pending.detailOpens, [], "the replacement activation owns detail loading");
+
+  const unchanged = compile({ pendingSearch: false });
+  await unchanged.apply();
+  assert.equal(unchanged.navigations[0].route.filters.search, "GNS");
+  assert.equal(unchanged.navigations[0].route.filters.page, 2);
 });
 
 test("closes a mismatched catalog detail before route loading but retains the same product", async () => {
