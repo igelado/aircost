@@ -392,8 +392,16 @@ function applyListingsRoute(route, context = {}) {
       }, { replace: true });
       return;
     }
-    if (state.editingListingId !== route.listingId || !elements.listingDialog.open) {
-      editListing(listing);
+    const rebindCleanEditor = context.source === "refresh"
+      && state.editingListingId === route.listingId
+      && elements.listingDialog.open
+      && !state.listingDraftDirty;
+    if (
+      state.editingListingId !== route.listingId
+      || !elements.listingDialog.open
+      || rebindCleanEditor
+    ) {
+      editListing(listing, { focus: !rebindCleanEditor });
     }
     return;
   }
@@ -460,6 +468,8 @@ function updateListingsRoute(replace) {
 
 async function applyValuesRoute(route) {
   if (!state.aircraftOptions.length) {
+    state.aircraftDetail = null;
+    clearAircraftDetail();
     return;
   }
   if (!route.variantId) {
@@ -468,7 +478,13 @@ async function applyValuesRoute(route) {
     elements.aircraftModel.selectedIndex = 0;
     populateAircraftVariantSelect();
     elements.aircraftVariant.selectedIndex = 0;
-    return loadSelectedAircraftDetail();
+    const variantId = selectedInteger(elements.aircraftVariant);
+    if (variantId === null) {
+      state.aircraftDetail = null;
+      clearAircraftDetail();
+      return;
+    }
+    return navigateRoute({ name: "values", variantId }, { replace: true });
   }
   const option = state.aircraftOptions.find(
     (candidate) => Number(candidate.variant_id) === route.variantId,
@@ -1261,7 +1277,7 @@ function synchronizeListingSaveDisabled() {
     || state.listingSaveOwner !== null;
 }
 
-function editListing(listing) {
+function editListing(listing, { focus = true } = {}) {
   state.editingListingId = listing.id;
   state.listingEditorVerified = listing.is_verified === true;
   elements.listingFormTitle.textContent = `Edit listing ${listing.id}`;
@@ -1292,7 +1308,7 @@ function editListing(listing) {
   }
   setFormMessage("");
   state.listingDraftDirty = false;
-  openListingDialog();
+  openListingDialog({ focus });
 }
 
 function resetListingForm({ updateRoute = true } = {}) {
@@ -1320,12 +1336,14 @@ function resetListingForm({ updateRoute = true } = {}) {
   }
 }
 
-function openListingDialog() {
+function openListingDialog({ focus = true } = {}) {
   if (!elements.listingDialog.open) {
     elements.listingDialog.showModal();
   }
-  const firstInput = elements.listingForm.querySelector("input, select, textarea, button");
-  firstInput?.focus();
+  if (focus) {
+    const firstInput = elements.listingForm.querySelector("input, select, textarea, button");
+    firstInput?.focus();
+  }
 }
 
 function closeListingDialog({ navigate = true } = {}) {

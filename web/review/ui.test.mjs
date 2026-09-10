@@ -244,6 +244,109 @@ test("preserves an open dirty editor when its refreshed listing disappears", () 
   assert.deepEqual(superseded.navigations, []);
 });
 
+test("rebinds a clean re-entered listing after deferred save reconciliation", async () => {
+  const start = appJs.indexOf("function applyListingsRoute");
+  const end = appJs.indexOf("\nfunction applyListingFilterControls", start);
+  assert.ok(start >= 0 && end > start);
+
+  const run = async ({ dirtyAfterReentry }) => {
+    const saveOwner = {};
+    const state = {
+      listingDraftDirty: true,
+      editingListingId: 7,
+      listingSaveOwner: saveOwner,
+      listingsLoaded: true,
+      listings: [{ id: 7, label: "old" }],
+      formValue: "initial pending draft",
+      saveDisabled: true,
+    };
+    const elements = { listingDialog: { open: true } };
+    let currentRoute = { name: "listings", listingId: 7, filters: { search: "old" } };
+    let releaseSave;
+    const edits = [];
+    const apply = Function(
+      "state",
+      "elements",
+      "appRouter",
+      "routeActivationIsCurrent",
+      "applyListingFilterControls",
+      "renderListings",
+      "resetListingForm",
+      "openListingDialog",
+      "setFormMessage",
+      "setListMessage",
+      "closeListingDialog",
+      "editListing",
+      "navigateRoute",
+      `${appJs.slice(start, end)}\nreturn applyListingsRoute;`,
+    )(
+      state,
+      elements,
+      { current: () => currentRoute },
+      (owner, current) => owner === current,
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      (listing, options) => {
+        edits.push({ listing, options });
+        state.editingListingId = listing.id;
+        state.listingDraftDirty = false;
+        state.formValue = listing.label;
+        state.saveDisabled = state.listingSaveOwner !== null;
+        elements.listingDialog.open = true;
+      },
+      () => {},
+    );
+    const saveResponse = new Promise((resolve) => { releaseSave = resolve; });
+    const pendingSave = (async () => {
+      const listing = await saveResponse;
+      state.listings = [listing];
+      apply(currentRoute, { source: "refresh" });
+    })();
+
+    currentRoute = { name: "values" };
+    elements.listingDialog.open = false;
+    state.listingDraftDirty = false;
+    const reentryRoute = { name: "listings", listingId: 7, filters: { search: "new" } };
+    currentRoute = reentryRoute;
+    apply(reentryRoute);
+    assert.equal(state.formValue, "old");
+    assert.equal(state.saveDisabled, true);
+    assert.deepEqual(edits[0].options, { focus: true });
+
+    if (dirtyAfterReentry) {
+      state.listingDraftDirty = true;
+      state.formValue = "newer re-entry draft";
+    }
+    releaseSave({ id: 7, label: "committed" });
+    await pendingSave;
+    return { edits, reentryRoute, saveOwner, state };
+  };
+
+  const clean = await run({ dirtyAfterReentry: false });
+  assert.equal(clean.state.listings[0].label, "committed");
+  assert.equal(clean.state.formValue, "committed");
+  assert.equal(clean.state.listingDraftDirty, false);
+  assert.equal(clean.state.listingSaveOwner, clean.saveOwner);
+  assert.equal(clean.state.saveDisabled, true);
+  assert.deepEqual(clean.edits[1], {
+    listing: { id: 7, label: "committed" },
+    options: { focus: false },
+  });
+
+  const dirty = await run({ dirtyAfterReentry: true });
+  assert.equal(dirty.state.listings[0].label, "committed", "the cache still reconciles");
+  assert.equal(dirty.state.formValue, "newer re-entry draft");
+  assert.equal(dirty.state.listingDraftDirty, true);
+  assert.equal(dirty.state.listingSaveOwner, dirty.saveOwner);
+  assert.equal(dirty.state.saveDisabled, true);
+  assert.equal(dirty.edits.length, 1, "a newer dirty draft is not rebound");
+});
+
 test("all listing editors retain the global in-flight Save lock", () => {
   const start = appJs.indexOf("function synchronizeListingSaveDisabled");
   const end = appJs.indexOf("\nfunction openListingDialog", start);
@@ -1147,6 +1250,87 @@ test("keeps usable listing cache state across a failed refresh", () => {
   const loader = appJs.slice(start, end);
   assert.match(loader, /state\.listingsLoaded = true;/);
   assert.doesNotMatch(loader, /catch \(error\) \{\s*state\.listingsLoaded = false;/);
+});
+
+test("canonicalizes the default aircraft selection before its single detail load", async () => {
+  const start = appJs.indexOf("async function applyValuesRoute");
+  const end = appJs.indexOf("\nfunction updateValuesRoute", start);
+  assert.ok(start >= 0 && end > start);
+
+  const compile = (options) => {
+    const state = { aircraftOptions: options, aircraftDetail: { stale: true } };
+    const select = (firstValue) => {
+      const control = { value: "" };
+      Object.defineProperty(control, "selectedIndex", {
+        set() { control.value = String(firstValue); },
+      });
+      return control;
+    };
+    const elements = {
+      aircraftManufacturer: select(options[0]?.manufacturer_id ?? ""),
+      aircraftModel: select(options[0]?.model_id ?? ""),
+      aircraftVariant: select(options[0]?.variant_id ?? ""),
+    };
+    const navigations = [];
+    const detailLoads = [];
+    let clears = 0;
+    let apply;
+    apply = Function(
+      "state",
+      "elements",
+      "populateAircraftModelSelect",
+      "populateAircraftVariantSelect",
+      "selectedInteger",
+      "clearAircraftDetail",
+      "navigateRoute",
+      "setAircraftMessage",
+      "loadSelectedAircraftDetail",
+      `${appJs.slice(start, end)}\nreturn applyValuesRoute;`,
+    )(
+      state,
+      elements,
+      () => { elements.aircraftModel.value = String(options[0]?.model_id ?? ""); },
+      () => { elements.aircraftVariant.value = String(options[0]?.variant_id ?? ""); },
+      (control) => {
+        const value = Number.parseInt(control.value, 10);
+        return Number.isInteger(value) && value > 0 ? value : null;
+      },
+      () => { clears += 1; },
+      (route, navigationOptions) => {
+        navigations.push({ route, options: navigationOptions });
+        return apply(route);
+      },
+      () => {},
+      () => { detailLoads.push(elements.aircraftVariant.value); },
+    );
+    return {
+      apply,
+      detailLoads,
+      navigations,
+      state,
+      clearCount: () => clears,
+    };
+  };
+
+  const startup = compile([{ manufacturer_id: 1, model_id: 2, variant_id: 42 }]);
+  await startup.apply({ name: "values" });
+  assert.deepEqual(startup.navigations, [{
+    route: { name: "values", variantId: 42 },
+    options: { replace: true },
+  }]);
+  assert.deepEqual(startup.detailLoads, ["42"], "the routed activation owns one detail load");
+
+  const reload = compile([{ manufacturer_id: 1, model_id: 2, variant_id: 42 }]);
+  await reload.apply({ name: "values", variantId: 42 });
+  assert.deepEqual(reload.navigations, [], "a selected-ID reload is already canonical");
+  assert.deepEqual(reload.detailLoads, ["42"]);
+
+  const empty = compile([]);
+  await empty.apply({ name: "values" });
+  assert.deepEqual(empty.navigations, []);
+  assert.deepEqual(empty.detailLoads, []);
+  assert.equal(empty.state.aircraftDetail, null);
+  assert.equal(empty.clearCount(), 1);
 });
 
 test("reloads the manual review collection on every route re-entry", () => {
