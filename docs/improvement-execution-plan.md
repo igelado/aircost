@@ -121,8 +121,8 @@ explicit plan amendment.
 | MNT-007A | `architect` -> `coder` (Lovelace review) — `codex/mnt-007a-db-executor-core` | MNT-003 | `src/db.rs`, new `src/db/**`; freeze the executor/transaction API after merge |
 | MNT-007B | `coder` (Lovelace review) — `codex/mnt-007b-db-executor-adoption` | MNT-007A | ordinary CRUD dispatch call sites and deletion of local macros; backend-specific SQL remains explicit |
 | MNT-018B | `coder` (Parfit review) — `codex/mnt-018b-amortize-db-fixtures` | MNT-003, MNT-007B, MNT-018A | test support/templates and DB contract tests; both backends remain covered |
-| MNT-018C | `coder` (Lovelace review) — `codex/mnt-018c-core-warning-budget` | MNT-018B | `src/db/**`, `src/listing/**`, `src/listings.rs`, `src/models.rs`, `src/server.rs`, core module wiring |
-| MNT-018D | `coder` (Leibniz review) — `codex/mnt-018d-catalog-warning-budget` | MNT-018B | `src/aircraft/**`, `src/avionics/**`, `src/plugin.rs`, `src/html/**` |
+| MNT-018C | `coder` (Lovelace review) — `codex/mnt-018c-core-warning-budget` | MNT-018B | `src/db/**`, `src/listing/**`, `src/listings.rs`, `src/models.rs`, `src/server.rs`, `src/lib.rs`, `src/aircraft.rs`, `src/catalog/**`, `src/cleanup.rs`, `src/extract.rs`, `src/avionics/{catalog,verification}.rs`, and `src/plugin.rs`; this fence owns cross-domain enum definitions and consumers |
+| MNT-018D | `coder` (Leibniz review) — `codex/mnt-018d-catalog-warning-budget` | MNT-018B | `src/aircraft/**`, remaining `src/avionics/**`, and `src/html/**`; explicitly excludes `src/avionics/{catalog,verification}.rs` and `src/plugin.rs` reserved for MNT-018C |
 | MNT-018E | `coder` (Rawls review) — `codex/mnt-018e-modeling-warning-budget` | MNT-018B | `src/valuation/**`, `src/gemini/**`, `src/admin.rs`, binaries; no shared Cargo policy |
 | MNT-018F | `coder` (Parfit review) — `codex/mnt-018f-enforce-quality-gate` | MNT-018C, MNT-018D, MNT-018E | CI/lint policy and canonical `-D warnings` command only |
 | MNT-017 | `architect` -> `coder` (Parfit review) — `codex/mnt-017-cli-doc-registry` | MNT-003, MNT-018F | `src/admin.rs`, command docs, proposal lifecycle headers; add a CLI dependency only for measured net simplification |
@@ -130,8 +130,10 @@ explicit plan amendment.
 | MNT-020B | `coder` (Parfit review) — `codex/mnt-020b-remove-expired-compatibility` | MNT-020A, MNT-002, MNT-015B | remove only paths whose consumer/removal evidence is satisfied, including tests/docs/adapters |
 
 `MNT-018C`, `MNT-018D`, and `MNT-018E` are the only intentionally parallel
-Rust-wide cleanup branches. Their file fences are disjoint. Merge them one at a
-time with a rebase between merges, then enable the gate in `MNT-018F`.
+Rust-wide cleanup branches. Their file fences are disjoint: MNT-018C owns all
+large-enum definitions whose constructors/consumers cross domain boundaries,
+while MNT-018D excludes those files. Merge the branches one at a time with a
+rebase between merges, then enable the gate in `MNT-018F`.
 
 ### Persistence, listing, review, avionics, and valuation
 
