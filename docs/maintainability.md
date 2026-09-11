@@ -352,6 +352,10 @@ Completion evidence:
 - CI evidence: all four jobs, including locked Rust checks, existing web and
   extension tests, DNN compile/tests, and both database suites, passed in
   Actions run 34513031946.
+- Required-check evidence: the active default-branch repository ruleset for
+  `refs/heads/main` requires the exact `fast`, `sqlite-contracts`,
+  `postgres-contracts`, and `dnn` contexts with strict status checks. Both the
+  SQLite and PostgreSQL database jobs are therefore required checks.
 
 ### MNT-006 — Complete the canonical aircraft identity cutover
 
