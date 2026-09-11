@@ -1,4 +1,5 @@
 import { initializeAvionicsInspector } from "/avionics.js";
+import { createTaskNavigation } from "/navigation.mjs";
 import { initializeReviewWorkspace } from "/review.js";
 import {
   catalogPageFallbackForResult,
@@ -63,6 +64,7 @@ const elements = {};
 let avionicsInspector;
 let reviewWorkspace;
 let appRouter;
+let taskNavigation;
 
 document.addEventListener("DOMContentLoaded", () => {
   collectElements();
@@ -104,6 +106,15 @@ document.addEventListener("DOMContentLoaded", () => {
       && avionicsInspector.confirmRouteChange(next)
     ),
   });
+  taskNavigation = createTaskNavigation({
+    root: elements.taskNavigationRoot,
+    toggle: elements.mobileNavToggle,
+    menu: elements.taskNavigationMenu,
+    links: elements.navTabs,
+    document,
+    matchMedia: window.matchMedia.bind(window),
+    navigate: (link) => navigateRoute(parseRoute(link.href)),
+  });
   appRouter.start();
   loadValuationStatus();
   loadCurrentUser();
@@ -114,6 +125,9 @@ document.addEventListener("DOMContentLoaded", () => {
 function collectElements() {
   for (const [key, selector] of Object.entries({
     navTabs: ".nav-tab",
+    taskNavigationRoot: "[data-task-navigation]",
+    mobileNavToggle: "#mobile-nav-toggle",
+    taskNavigationMenu: "#task-navigation",
     viewPanels: ".view-panel",
     viewTitle: "#view-title",
     viewSubtitle: "#view-subtitle",
@@ -207,22 +221,6 @@ function renderValuationStatus() {
 }
 
 function bindEvents() {
-  for (const tab of elements.navTabs) {
-    tab.addEventListener("click", (event) => {
-      if (
-        event.defaultPrevented
-        || event.button !== 0
-        || event.metaKey
-        || event.ctrlKey
-        || event.shiftKey
-        || event.altKey
-      ) {
-        return;
-      }
-      event.preventDefault();
-      navigateRoute(parseRoute(tab.href));
-    });
-  }
   elements.refreshListings.addEventListener("click", loadListings);
   elements.newListing.addEventListener("click", () => {
     navigateRoute({
@@ -302,6 +300,7 @@ function bindEvents() {
 
 function applyAppRoute(route, context = {}) {
   const destination = destinationForRoute(route);
+  taskNavigation.closeForRouteActivation();
   if (route.name !== "listings") {
     closeListingDialog({ navigate: false });
   }
