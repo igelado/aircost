@@ -187,6 +187,14 @@ test("closes with Escape and outside click without stealing outside focus", () =
   assert.equal(activated.controller.isOpen(), false);
   assert.equal(activated.document.activeElement, activated.toggle);
 
+  const nonFocusableOutside = navigationHarness();
+  const outsideSurface = new FakeTarget("outside-surface", nonFocusableOutside.document);
+  nonFocusableOutside.toggle.dispatch("click");
+  nonFocusableOutside.links[0].focus();
+  nonFocusableOutside.document.dispatch("click", { target: outsideSurface });
+  assert.equal(nonFocusableOutside.controller.isOpen(), false);
+  assert.equal(nonFocusableOutside.document.activeElement, nonFocusableOutside.toggle);
+
   const outside = navigationHarness();
   const outsideControl = new FakeTarget("outside", outside.document);
   outside.toggle.dispatch("click");

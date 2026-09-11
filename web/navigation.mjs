@@ -58,7 +58,7 @@ export function createTaskNavigation({
 
   function handleDocumentClick(event) {
     if (open && !root.contains(event.target)) {
-      close();
+      close({ returnFocus: menu.contains(document.activeElement) });
     }
   }
 
