@@ -93,7 +93,7 @@ function fakeMedia(width) {
   };
 }
 
-function navigationHarness({ width = 760, navigate = () => true } = {}) {
+function navigationHarness({ width = 760, navigate = () => true, initialFocus = null } = {}) {
   const document = new FakeTarget("document");
   document.activeElement = null;
   const root = new FakeTarget("root", document);
@@ -107,6 +107,12 @@ function navigationHarness({ width = 760, navigate = () => true } = {}) {
   const descendants = new Set([root, toggle, menu, ...links]);
   root.contains = (target) => descendants.has(target);
   menu.contains = (target) => target === menu || links.includes(target);
+  const outside = new FakeTarget("outside", document);
+  if (initialFocus === "menu") {
+    links[1].focus();
+  } else if (initialFocus === "outside") {
+    outside.focus();
+  }
   const media = fakeMedia(width);
   let requestedQuery = null;
   const controller = createTaskNavigation({
@@ -126,6 +132,7 @@ function navigationHarness({ width = 760, navigate = () => true } = {}) {
     document,
     links,
     media,
+    outside,
     requestedQuery: () => requestedQuery,
     root,
     toggle,
@@ -168,6 +175,18 @@ test("switches at 760px and initializes progressive enhancement", () => {
   twoHundredPercent.toggle.dispatch("click");
   assert.equal(twoHundredPercent.controller.isOpen(), true);
   assert.equal(twoHundredPercent.links.length, 4);
+
+  const focusedMobile = navigationHarness({ width: 760, initialFocus: "menu" });
+  assert.equal(focusedMobile.document.activeElement, focusedMobile.toggle);
+
+  const focusedDesktop = navigationHarness({ width: 761, initialFocus: "menu" });
+  assert.equal(focusedDesktop.document.activeElement, focusedDesktop.links[1]);
+  focusedDesktop.document.activeElement = null;
+  focusedDesktop.media.setWidth(760);
+  assert.equal(focusedDesktop.document.activeElement, focusedDesktop.toggle);
+
+  const focusedOutside = navigationHarness({ width: 760, initialFocus: "outside" });
+  assert.equal(focusedOutside.document.activeElement, focusedOutside.outside);
 });
 
 test("closes with Escape and outside click without stealing outside focus", () => {

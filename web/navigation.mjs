@@ -31,7 +31,13 @@ export function createTaskNavigation({
   }
 
   const mobile = matchMedia(MOBILE_NAVIGATION_QUERY);
-  let navigationFocusOwner = "outside";
+  let navigationFocusOwner = document.activeElement === toggle
+    ? "toggle"
+    : menu.contains(document.activeElement)
+      ? "menu"
+      : "outside";
+  const menuOwnedFocusAtInitialization = mobile.matches
+    && navigationFocusOwner === "menu";
   let open = false;
 
   function setOpen(next) {
@@ -121,6 +127,9 @@ export function createTaskNavigation({
   }
   root.classList.toggle("is-menu-ready", true);
   setOpen(false);
+  if (menuOwnedFocusAtInitialization) {
+    toggle.focus();
+  }
 
   return Object.freeze({
     close,
