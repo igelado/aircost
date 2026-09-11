@@ -50,6 +50,7 @@ const state = {
   listings: [],
   listingsLoaded: false,
   aircraftOptions: [],
+  aircraftOptionsLoaded: false,
   aircraftDetail: null,
   editingListingId: null,
   listingEditorVerified: false,
@@ -471,6 +472,9 @@ function updateListingsRoute(replace) {
 }
 
 async function applyValuesRoute(route) {
+  if (!state.aircraftOptionsLoaded) {
+    return;
+  }
   if (!state.aircraftOptions.length) {
     state.aircraftDetail = null;
     clearAircraftDetail();
@@ -556,6 +560,7 @@ async function loadAircraftOptions() {
   try {
     const payload = await api("/api/aircraft/options");
     state.aircraftOptions = payload.options || [];
+    state.aircraftOptionsLoaded = true;
     populateAircraftManufacturerSelect();
     populateAircraftModelSelect();
     populateAircraftVariantSelect();
@@ -567,6 +572,7 @@ async function loadAircraftOptions() {
     }
   } catch (error) {
     state.aircraftOptions = [];
+    state.aircraftOptionsLoaded = false;
     state.aircraftDetail = null;
     clearAircraftDetail();
     setAircraftMessage(error.message, true);

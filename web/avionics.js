@@ -151,7 +151,7 @@ async function applyCatalogRoute(route, { source } = {}) {
     const fallbackRoute = state.avionicsSearchTimer === null
       ? pageFallback
       : catalogRouteFromControls({
-        page: pageFallback.filters?.page || 1,
+        page: 1,
         productId: pageFallback.productId || null,
       });
     const navigated = await navigate(fallbackRoute, { replace: true });

@@ -1159,7 +1159,7 @@ test("canonicalizes catalog pages without dropping a pending live search", async
       },
       () => ({
         ...route,
-        filters: { ...route.filters, page: 2 },
+        filters: { ...route.filters, page: 4 },
       }),
       ({ page, productId }) => ({
         name: "catalog",
@@ -1192,7 +1192,7 @@ test("canonicalizes catalog pages without dropping a pending live search", async
         status: "approved",
         capability: "gps",
         completeness: "complete",
-        page: 2,
+        page: 1,
       },
     },
     options: { replace: true },
@@ -1202,7 +1202,7 @@ test("canonicalizes catalog pages without dropping a pending live search", async
   const unchanged = compile({ pendingSearch: false });
   await unchanged.apply();
   assert.equal(unchanged.navigations[0].route.filters.search, "GNS");
-  assert.equal(unchanged.navigations[0].route.filters.page, 2);
+  assert.equal(unchanged.navigations[0].route.filters.page, 4);
 });
 
 test("closes a mismatched catalog detail before route loading but retains the same product", async () => {
@@ -1706,13 +1706,18 @@ test("keeps usable listing cache state across a failed refresh", () => {
   assert.doesNotMatch(loader, /catch \(error\) \{\s*state\.listingsLoaded = false;/);
 });
 
-test("canonicalizes the default aircraft selection before its single detail load", async () => {
+test("waits for authoritative aircraft options before canonicalizing a value route", async () => {
   const start = appJs.indexOf("async function applyValuesRoute");
   const end = appJs.indexOf("\nfunction updateValuesRoute", start);
   assert.ok(start >= 0 && end > start);
 
-  const compile = (options) => {
-    const state = { aircraftOptions: options, aircraftDetail: { stale: true } };
+  const compile = (initialOptions, { loaded = true } = {}) => {
+    const options = [...initialOptions];
+    const state = {
+      aircraftOptions: options,
+      aircraftOptionsLoaded: loaded,
+      aircraftDetail: { stale: true },
+    };
     const select = (firstValue) => {
       const control = { value: "" };
       Object.defineProperty(control, "selectedIndex", {
@@ -1762,9 +1767,25 @@ test("canonicalizes the default aircraft selection before its single detail load
       detailLoads,
       navigations,
       state,
+      setOptions(nextOptions) {
+        options.splice(0, options.length, ...nextOptions);
+        state.aircraftOptions = options;
+        state.aircraftOptionsLoaded = true;
+      },
       clearCount: () => clears,
     };
   };
+
+  const cold = compile([], { loaded: false });
+  const deepLink = { name: "values", variantId: 42 };
+  await cold.apply(deepLink);
+  assert.deepEqual(cold.navigations, [], "cold options do not erase the selected URL");
+  assert.deepEqual(cold.detailLoads, []);
+  assert.equal(cold.clearCount(), 0);
+  cold.setOptions([{ manufacturer_id: 1, model_id: 2, variant_id: 42 }]);
+  await cold.apply(deepLink);
+  assert.deepEqual(cold.navigations, [], "the loaded valid deep link stays canonical");
+  assert.deepEqual(cold.detailLoads, ["42"]);
 
   const startup = compile([{ manufacturer_id: 1, model_id: 2, variant_id: 42 }]);
   await startup.apply({ name: "values" });
@@ -1802,6 +1823,11 @@ test("canonicalizes the default aircraft selection before its single detail load
   }]);
   assert.deepEqual(emptyMissing.detailLoads, []);
   assert.equal(emptyMissing.clearCount(), 2, "the collection activation remains unselected");
+  assert.match(
+    appJs,
+    /state\.aircraftOptions = payload\.options \|\| \[\];\s*state\.aircraftOptionsLoaded = true;/,
+    "only a successful options response makes absence authoritative",
+  );
 });
 
 test("reloads the manual review collection on every route re-entry", () => {
