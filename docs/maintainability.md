@@ -1,6 +1,6 @@
 # Maintainability and Web UX Improvement Register
 
-Last audited: 2026-09-09
+Last audited: 2026-09-11
 
 This is the living register for simplifying AirCost and improving its web and
 extension interfaces. It records outcomes rather than scattered source-code
@@ -24,6 +24,11 @@ invariants, and an objective definition of done.
   bounds.
 
 ## Audit baseline
+
+The measurements below are the frozen pre-improvement baseline recorded before
+the completed work and merges listed later in this register. They remain
+unchanged for comparison; completion evidence under each item records the
+current post-merge state.
 
 - About 252,000 lines of Rust, with several production files between 10,000 and
   21,000 lines.
@@ -71,9 +76,9 @@ measurements when an item is completed.
 | --- | --- | --- | --- | --- | --- | --- |
 | MNT-001 | P0 | open | unassigned | persistence | both | Atomic application transactions |
 | MNT-002 | P0 | open | unassigned | review | both | One authoritative review-aspect model |
-| MNT-003 | P0 | open | unassigned | database | both | Versioned, repairable startup and migrations |
+| MNT-003 | P0 | in_progress | coder | database | both | Versioned, repairable startup and migrations |
 | MNT-004 | P0 | open | unassigned | listings | both | Bounded list reads and targeted cleanup |
-| MNT-005 | P0 | open | unassigned | tests/CI | both | CI executes the supported test inventory |
+| MNT-005 | P0 | done | coder | tests/CI | both | CI executes the supported test inventory |
 | MNT-006 | P1 | open | unassigned | aircraft | both | One canonical aircraft identity write model |
 | MNT-007 | P1 | open | unassigned | database | both | Shared dual-backend execution boundary |
 | MNT-008 | P1 | open | unassigned | listing | both | Finish the legacy listing-module migration |
@@ -86,7 +91,7 @@ measurements when an item is completed.
 | MNT-015 | P1 | open | unassigned | frontend | none | Incremental controller and mutation architecture |
 | MNT-016 | P1 | open | unassigned | extension | none | Background-owned capture and one canonical editor |
 | MNT-017 | P1 | open | unassigned | tooling/docs | both | Declarative CLI and accurate documentation |
-| MNT-018 | P1 | open | unassigned | quality | both | Fast fixtures, lint policy, and pinned toolchains |
+| MNT-018 | P1 | in_progress | coder | quality | both | Fast fixtures, lint policy, and pinned toolchains |
 | MNT-019 | P2 | open | unassigned | storage | both | Cold capture content and query-aligned indexes |
 | MNT-020 | P2 | open | unassigned | compatibility | none | Time-bounded compatibility policy |
 | MNT-021 | P1 | open | unassigned | avionics catalog | both | Retire products without rewriting history |
@@ -94,8 +99,8 @@ measurements when an item is completed.
 | MNT-023 | P1 | open | unassigned | capture contracts | both | One typed checkpoint and capture identity |
 | MNT-024 | P2 | open | unassigned | aircraft curation | both | Separate diagnostics from executable commands |
 | MNT-025 | P2 | open | unassigned | verification runs | both | Derive run summaries from one terminal result |
-| WEB-001 | P0 | open | unassigned | responsive UI | none | Navigation works at every supported width |
-| WEB-002 | P1 | open | unassigned | information architecture | none | Task-oriented navigation and deep links |
+| WEB-001 | P0 | done | coder | responsive UI | none | Navigation works at every supported width |
+| WEB-002 | P1 | done | coder | information architecture | none | Task-oriented navigation and deep links |
 | WEB-003 | P1 | open | unassigned | listings UX | none | Progressive listing discovery and useful zero state |
 | WEB-004 | P1 | open | unassigned | review UX | none | A comprehensible review work queue |
 | WEB-005 | P1 | open | unassigned | forms | none | Guided, accessible listing editing |
@@ -207,8 +212,9 @@ Acceptance criteria:
 ### MNT-003 — Replace schema replay with a versioned, repairable migration path
 
 - Priority: P0
-- Status: open
-- Owner: unassigned
+- Status: in_progress
+- Owner: coder
+- Active branch: `codex/mnt-003-versioned-migrations`
 - Area: database/startup
 - Backend scope: both
 - Depends on: MNT-005
@@ -294,8 +300,8 @@ Acceptance criteria:
 ### MNT-005 — Make CI execute the supported test inventory
 
 - Priority: P0
-- Status: open
-- Owner: unassigned
+- Status: done
+- Owner: coder
 - Area: tests/CI
 - Backend scope: both
 - Depends on: none
@@ -317,14 +323,44 @@ individual tests/scripts in workflow YAML.
 
 Acceptance criteria:
 
-- [ ] One schema runner discovers or registers every schema test and fails when
+- [x] One schema runner discovers or registers every schema test and fails when
       a new script is omitted.
-- [ ] All environment-backed PostgreSQL tests run through one serial category;
+- [x] All environment-backed PostgreSQL tests run through one serial category;
       only manual external-fixture tests remain ignored.
-- [ ] CI compiles and tests the DNN feature.
-- [ ] Fast pure/unit feedback and slower database-contract suites are separate
+- [x] CI compiles and tests the DNN feature.
+- [x] Fast pure/unit feedback and slower database-contract suites are separate
       jobs with shared reporting.
-- [ ] Both database jobs are required checks.
+- [x] Both database jobs are required checks.
+
+Completion evidence:
+
+- Owner: coder
+- PR/commit: [PR #158](https://github.com/igelado/aircost/pull/158) /
+  `c05c61944736f7bc3d66de070950870c47a9475f`
+- Completed: 2026-09-10
+- Before: the workflow invoked 6 of 17 schema scripts, roughly 18 supported
+  PostgreSQL integration tests were not selected, and the optional DNN feature
+  was neither compiled nor tested.
+- After: `tests/schema/run.sh` registers and discovers all 17 schema contracts
+  (14 SQLite/text and 3 PostgreSQL), failing on missing, duplicate, or
+  unregistered scripts. `tests/schema/rust_test_inventory.sh` registers all 32
+  ignored PostgreSQL contracts and the four intentionally manual external
+  fixtures, verifies target ownership, and runs the supported PostgreSQL set
+  serially. CI is separated into `fast`, `sqlite-contracts`,
+  `postgres-contracts`, and `dnn` jobs.
+- SQLite verification: all 14 registered SQLite/text contracts passed locally;
+  the `sqlite-contracts` job passed in Actions run
+  [34513031946](https://github.com/igelado/aircost/actions/runs/34513031946).
+- PostgreSQL verification: the 32-test inventory and exact serial selectors
+  were verified; the service-backed `postgres-contracts` job passed in the same
+  Actions run. Only the four registered external-fixture tests remain manual.
+- CI evidence: all four jobs, including locked Rust checks, existing web and
+  extension tests, DNN compile/tests, and both database suites, passed in
+  Actions run 34513031946.
+- Required-check evidence: the active default-branch repository ruleset for
+  `refs/heads/main` requires the exact `fast`, `sqlite-contracts`,
+  `postgres-contracts`, and `dnn` contexts with strict status checks. Both the
+  SQLite and PostgreSQL database jobs are therefore required checks.
 
 ### MNT-006 — Complete the canonical aircraft identity cutover
 
@@ -751,8 +787,8 @@ Acceptance criteria:
 ### MNT-018 — Restore fast feedback and establish a warning budget
 
 - Priority: P1
-- Status: open
-- Owner: unassigned
+- Status: in_progress
+- Owner: coder
 - Area: tests/build quality
 - Backend scope: both
 - Depends on: MNT-005, MNT-007
@@ -784,8 +820,32 @@ Acceptance criteria:
       parallel as required checks.
 - [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings` passes;
       justified exceptions use narrowly documented expectations.
-- [ ] Rust, Node, and CI runner versions plus one canonical verification command
+- [x] Rust, Node, and CI runner versions plus one canonical verification command
       are documented.
+
+#### MNT-018A — Pin reproducible CI toolchains (done)
+
+Completion evidence:
+
+- Owner: coder
+- PR/commit: [PR #160](https://github.com/igelado/aircost/pull/160) /
+  `d2b80cb28bbee048be1698965a29d69e476e92c1`
+- Completed: 2026-09-10
+- Before: CI used mutable action tags, the ambient Node installation, Rust
+  `stable`, `ubuntu-latest`, and the floating `postgres:17` service image.
+- After: Rust 1.98.1 and Node.js 24.21.0 LTS are checked in; checkout,
+  setup-node, and Rust setup actions are pinned to verified commit SHAs; the
+  runner family is `ubuntu-24.04`; and PostgreSQL is pinned to the 17.11
+  Trixie image digest. Runtime assertions verify the Rust and Node versions and
+  PostgreSQL `server_version_num` 170011, while CI logs the concrete rolling
+  runner image build. `README.md` contains the single canonical verification
+  command and synchronized update/rollback guidance.
+- Test evidence: exact Node 24.21.0 checks passed 5 extension and 82 web tests;
+  locked formatting, Rust test/check, all 14 SQLite/text contracts, all 32
+  registered PostgreSQL contracts, all 3 PostgreSQL schema contracts, and DNN
+  compile/tests passed. The `fast`, `sqlite-contracts`, `postgres-contracts`,
+  and `dnn` jobs all passed in Actions run
+  [34519997747](https://github.com/igelado/aircost/actions/runs/34519997747).
 
 ### MNT-019 — Move cold capture bodies off hot relational rows and add workload indexes
 
@@ -1029,8 +1089,8 @@ Acceptance criteria:
 ### WEB-001 — Replace the broken mobile navigation
 
 - Priority: P0
-- Status: open
-- Owner: unassigned
+- Status: done
+- Owner: coder
 - Area: responsive navigation
 - Backend scope: none
 - Depends on: WEB-002
@@ -1053,18 +1113,53 @@ full text labels until they collide.
 
 Acceptance criteria:
 
-- [ ] No label overlap or document-level horizontal scroll at 320, 390, 760,
+- [x] No label overlap or document-level horizontal scroll at 320, 390, 760,
       1024, and 1440 px.
-- [ ] The active destination is announced with `aria-current="page"`.
-- [ ] Menu open/close, focus return, Escape, and outside-click behavior work by
+- [x] The active destination is announced with `aria-current="page"`.
+- [x] Menu open/close, focus return, Escape, and outside-click behavior work by
       keyboard and pointer.
-- [ ] A user can reach every available page at 200% zoom.
+- [x] A user can reach every available page at 200% zoom.
+
+Completion evidence:
+
+- Owner: coder
+- PR/commit: [PR #162](https://github.com/igelado/aircost/pull/162) / merge
+  `8eb33ccbebb32eacc733227dba45308193fb3273`; exact implementation head
+  `1e08b802c3b32c1d7a2b22c07299f51f4b2d3ff2`
+- Completed: 2026-09-11
+- Before: six full navigation labels collided at mobile widths, the sticky
+  brand/navigation block consumed excessive space, and wide review content
+  could expand a 390 px viewport to about 1,347 px.
+- After: a progressively enhanced compact task menu appears at 760 CSS pixels
+  and below while preserving WEB-002 routes and central navigation guards.
+  Responsive containment prevents document-level overflow; visible 44 px
+  targets, `aria-current`, Escape, outside-click close, and focus transfer and
+  return cover keyboard, pointer, initialization, history, and breakpoint
+  transitions.
+- CI evidence: `fast`, `sqlite-contracts`, `postgres-contracts`, and `dnn` all
+  passed in Actions run
+  [34653061221](https://github.com/igelado/aircost/actions/runs/34653061221).
+  The change added no database schema or API contract; both database suites
+  passed unchanged.
+- Local/frontend evidence: the exact frontend command reported 150 outcomes
+  (149 passed and one explicit optional-Chromium test skipped); every web
+  JavaScript module passed `node --check`; `cargo check --locked`, the focused
+  mobile-navigation asset test, formatting, and diff checks passed. The final
+  exact-head native Chromium matrix passed 1/1 in 11.12 seconds using disposable
+  SQLite and browser-profile state. It covered 320, 390, 760, 1024, and 1440 px,
+  the 1120/1121 px edge, Listings, Values, Review, Manual, Products, and Catalog
+  route/detail states, Back/Forward, no-JavaScript behavior, 200% zoom,
+  containment, 44 px targets, Escape, outside click, guarded accept/reject
+  navigation, and focus return.
+- Hosted review evidence: exact-head code and security reviews completed clean,
+  and all six review threads were resolved after verified focus-preservation
+  fixes. WEB-014 retains ownership of a shared enforced browser harness.
 
 ### WEB-002 — Organize navigation around user tasks and make it addressable
 
 - Priority: P1
-- Status: open
-- Owner: unassigned
+- Status: done
+- Owner: coder
 - Area: information architecture/navigation
 - Backend scope: none
 - Depends on: none
@@ -1089,13 +1184,46 @@ or label them honestly as unavailable rather than presenting dead navigation.
 
 Acceptance criteria:
 
-- [ ] Each functional destination and selected record has a reload-safe URL.
-- [ ] Browser Back/Forward restores panel, filters, page, and selected detail.
-- [ ] Primary versus operator navigation is clear without relying on color.
-- [ ] Placeholder pages are removed from primary navigation until they offer a
+- [x] Each functional destination and selected record has a reload-safe URL.
+- [x] Browser Back/Forward restores panel, filters, page, and selected detail.
+- [x] Primary versus operator navigation is clear without relying on color.
+- [x] Placeholder pages are removed from primary navigation until they offer a
       useful task or explicit roadmap action.
-- [ ] Page titles and headings match the task, including a clearer name for the
+- [x] Page titles and headings match the task, including a clearer name for the
       aircraft valuation view.
+
+Completion evidence:
+
+- Owner: coder
+- PR/commit: [PR #159](https://github.com/igelado/aircost/pull/159) / merge
+  `3942ae8ff0c02c97942ca72793dcefe35a9c63a9`
+- Completed: 2026-09-11
+- Before: six button-only destinations mixed market and operator tasks,
+  `Comparisons` and `Rentals` were placeholders, panel activation had no
+  bookmarkable history contract, and the valuation destination was labeled
+  `Aircraft`.
+- After: grouped task links expose canonical hash routes for Listings, Aircraft
+  values, Review queue, and Avionics catalog. Listing, value-variant, review,
+  review-area, product, and catalog-detail selections are reload-safe; filters
+  and pagination remain route-scoped; and Back/Forward restores route state.
+  Active links use `aria-current="page"`, route activation updates the document
+  title and task heading, and placeholder destinations are absent from primary
+  navigation.
+- CI evidence: `fast`, `sqlite-contracts`, `postgres-contracts`, and `dnn` all
+  passed in Actions run
+  [34628321801](https://github.com/igelado/aircost/actions/runs/34628321801).
+  The change added no database schema or API contract; both database suites
+  passed unchanged.
+- Local UI evidence: the exact web suite reported 144 outcomes (143 passed and
+  one explicit native-Chromium opt-in skipped); the native Chromium run passed
+  all 144. The combined extension and web command reported 149 outcomes (148
+  passed and the same opt-in skipped). Headless Chromium smoke covered direct
+  deep-link reload, active title/panel/`aria-current`, listing filter state,
+  Back/Forward restoration, invalid-ID canonicalization, review-area
+  restoration, and reset without a history write. The live server served both
+  `/` and `/routing.mjs` with the expected body and JavaScript MIME type.
+- Follow-up items: MNT-015A owns controller/resource lifecycles; WEB-001 owns
+  the compact responsive navigation, menu keyboard behavior, and focus return.
 
 ### WEB-003 — Turn Listings into progressive discovery, not a filter wall
 
