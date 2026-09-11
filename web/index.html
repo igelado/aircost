@@ -123,7 +123,7 @@
           </div>
           <div class="list-message" id="list-message" role="status"></div>
 
-          <div class="table-shell">
+          <div class="table-shell" role="region" aria-label="Listings table" tabindex="0">
             <table>
               <colgroup>
                 <col class="col-aircraft">
@@ -224,7 +224,7 @@
                 <span id="review-run-current"></span>
               </div>
               <div class="review-run-counts" id="review-run-counts"></div>
-              <div class="table-shell review-run-items-shell">
+              <div class="table-shell review-run-items-shell" role="region" aria-label="Automatic acceptance run results" tabindex="0">
                 <table class="review-run-items-table">
                   <caption class="sr-only">Results for the current automatic acceptance run</caption>
                   <thead>
@@ -262,7 +262,7 @@
               </label>
               <span id="review-pipeline-visible-count" role="status" aria-live="polite">0 listings</span>
             </div>
-            <div class="table-shell review-table-shell">
+            <div class="table-shell review-table-shell review-pipeline-table-shell" role="region" aria-label="Automatic acceptance status" tabindex="0">
               <table class="review-pipeline-table">
                 <caption class="sr-only">Automatic acceptance status for every non-ready listing</caption>
                 <thead>
@@ -283,7 +283,7 @@
               <div class="empty-state is-hidden" id="empty-review-pipeline">No non-ready listings match this filter.</div>
             </div>
           </div>
-          <div class="table-shell review-table-shell is-hidden" id="review-results" aria-busy="false">
+          <div class="table-shell review-table-shell is-hidden" id="review-results" aria-busy="false" role="region" aria-label="Manual review listings" tabindex="0">
             <table class="review-table">
               <caption class="sr-only">Listings waiting for manual review</caption>
               <thead>
@@ -302,7 +302,7 @@
             <div class="empty-state is-hidden" id="empty-reviews">No listings need manual review.</div>
           </div>
           <div id="review-product-results" aria-busy="false">
-            <div class="table-shell review-table-shell">
+            <div class="table-shell review-table-shell" role="region" aria-label="Product association review queue" tabindex="0">
               <table class="review-product-table">
                 <caption class="sr-only">Products with pending listing associations</caption>
                 <thead>
@@ -362,7 +362,7 @@
                 <button class="button primary" id="review-product-validate" type="button">Automatically apply to eligible unique occurrences</button>
                 <span id="review-product-action-message" role="status" aria-live="polite"></span>
               </div>
-              <div class="table-shell">
+              <div class="table-shell" role="region" aria-label="Product listing associations" tabindex="0">
                 <table class="review-product-association-table">
                   <thead>
                     <tr>
@@ -529,7 +529,7 @@
               </div>
             </section>
           </div>
-          <div class="table-shell aircraft-values-shell">
+          <div class="table-shell aircraft-values-shell" role="region" aria-label="Aircraft value comparisons" tabindex="0">
             <table class="aircraft-values-table">
               <colgroup>
                 <col class="col-tail">
@@ -597,7 +597,7 @@
             </button>
           </div>
           <div class="avionics-message" id="avionics-message" role="status" aria-live="polite"></div>
-          <div class="table-shell avionics-table-shell" id="avionics-results" aria-busy="false">
+          <div class="table-shell avionics-table-shell" id="avionics-results" aria-busy="false" role="region" aria-label="Avionics catalog results" tabindex="0">
             <table class="avionics-table">
               <caption class="sr-only">Avionics catalog search results</caption>
               <thead>

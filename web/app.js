@@ -68,15 +68,6 @@ let taskNavigation;
 
 document.addEventListener("DOMContentLoaded", () => {
   collectElements();
-  taskNavigation = createTaskNavigation({
-    root: elements.taskNavigationRoot,
-    toggle: elements.mobileNavToggle,
-    menu: elements.taskNavigationMenu,
-    links: elements.navTabs,
-    document,
-    matchMedia: window.matchMedia.bind(window),
-    navigate: (link) => navigateRoute(parseRoute(link.href)),
-  });
   avionicsInspector = initializeAvionicsInspector({
     api,
     catalogPageFallbackForResult,
@@ -114,6 +105,15 @@ document.addEventListener("DOMContentLoaded", () => {
       && reviewWorkspace.confirmRouteChange(next)
       && avionicsInspector.confirmRouteChange(next)
     ),
+  });
+  taskNavigation = createTaskNavigation({
+    root: elements.taskNavigationRoot,
+    toggle: elements.mobileNavToggle,
+    menu: elements.taskNavigationMenu,
+    links: elements.navTabs,
+    document,
+    matchMedia: window.matchMedia.bind(window),
+    navigate: (link) => navigateRoute(parseRoute(link.href)),
   });
   appRouter.start();
   loadValuationStatus();
@@ -300,7 +300,7 @@ function bindEvents() {
 
 function applyAppRoute(route, context = {}) {
   const destination = destinationForRoute(route);
-  taskNavigation.close();
+  taskNavigation.closeForRouteActivation();
   if (route.name !== "listings") {
     closeListingDialog({ navigate: false });
   }

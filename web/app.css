@@ -43,6 +43,9 @@ button {
 .app-shell {
   display: grid;
   grid-template-columns: 228px minmax(0, 1fr);
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   min-height: 100vh;
 }
 
@@ -171,7 +174,9 @@ button {
 }
 
 .workspace {
+  width: 100%;
   min-width: 0;
+  max-width: 100%;
   padding: 22px;
 }
 
@@ -246,6 +251,14 @@ button {
   color: var(--muted);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.view-panel,
+.data-panel,
+#review-pipeline-results,
+#review-product-results {
+  min-width: 0;
+  max-width: 100%;
 }
 
 .view-panel {
@@ -469,8 +482,16 @@ textarea:focus {
 }
 
 .table-shell {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   min-height: 420px;
   overflow-x: auto;
+}
+
+.table-shell:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
 }
 
 table {
@@ -1480,7 +1501,7 @@ label span,
 
 .review-pipeline-overview {
   display: grid;
-  grid-template-columns: minmax(520px, 1.1fr) minmax(360px, 0.9fr);
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
   gap: 12px;
   margin: 12px;
 }
@@ -1980,6 +2001,8 @@ label span,
 }
 
 .review-workspace {
+  min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -2938,11 +2961,25 @@ label span,
 
 .sr-only {
   position: absolute;
+  top: 0;
+  left: 0;
   width: 1px;
   height: 1px;
+  margin: -1px;
+  padding: 0;
   overflow: hidden;
+  border: 0;
   clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
   white-space: nowrap;
+}
+
+@media (max-width: 1400px) {
+  .table-toolbar,
+  .aircraft-toolbar,
+  .avionics-toolbar {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 1120px) {
@@ -2950,13 +2987,11 @@ label span,
     grid-template-columns: 190px minmax(0, 1fr);
   }
 
-  .table-toolbar,
-  .aircraft-toolbar,
-  .avionics-toolbar {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+  .aircraft-content {
+    grid-template-columns: 1fr;
   }
 
-  .aircraft-content {
+  .review-pipeline-overview {
     grid-template-columns: 1fr;
   }
 }
@@ -2994,18 +3029,21 @@ label span,
     min-width: 0;
   }
 
-  .mobile-nav-toggle {
+  .sidebar.is-menu-ready .mobile-nav-toggle {
     display: inline-flex;
     flex: 0 0 auto;
   }
 
   .nav-groups {
-    display: none;
     grid-template-columns: 1fr;
     gap: 12px;
     width: 100%;
     min-width: 0;
     max-width: 100%;
+  }
+
+  .sidebar.is-menu-ready .nav-groups {
+    display: none;
   }
 
   .sidebar.is-menu-open .nav-groups {
@@ -3282,9 +3320,14 @@ label span,
     width: 100%;
   }
 
-  .review-table-shell {
+  #review-results.review-table-shell {
     overflow: visible;
     padding: 10px;
+  }
+
+  .review-pipeline-table-shell {
+    min-height: 0;
+    overflow-x: auto;
   }
 
   .review-table,

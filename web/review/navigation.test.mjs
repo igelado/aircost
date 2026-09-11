@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import {
   isPlainPrimaryClick,
   MOBILE_NAVIGATION_QUERY,
 } from "../navigation.mjs";
+import { createHistoryRouter, parseRoute } from "../routing.mjs";
 
 const indexHtml = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 const appCss = readFileSync(new URL("../app.css", import.meta.url), "utf8");
@@ -114,6 +115,7 @@ function navigationHarness({ width = 760, navigate = () => true } = {}) {
   });
   const descendants = new Set([root, toggle, menu, ...links]);
   root.contains = (target) => descendants.has(target);
+  menu.contains = (target) => target === menu || links.includes(target);
   const media = fakeMedia(width);
   let requestedQuery = null;
   const controller = createTaskNavigation({
@@ -137,6 +139,50 @@ function navigationHarness({ width = 760, navigate = () => true } = {}) {
     requestedQuery: () => requestedQuery,
     root,
     toggle,
+  };
+}
+
+function fakeLocation(initialUrl = "/#/listings") {
+  const location = { href: "", pathname: "/", search: "", hash: "" };
+  setLocation(location, initialUrl);
+  return location;
+}
+
+function setLocation(location, value) {
+  const url = new URL(value, "http://localhost:8001");
+  location.href = url.href;
+  location.pathname = url.pathname;
+  location.search = url.search;
+  location.hash = url.hash;
+}
+
+function trackedHistory(location, listeners) {
+  const entries = [{ state: null, url: `${location.pathname}${location.search}${location.hash}` }];
+  let index = 0;
+  return {
+    pushState(state, _title, url) {
+      entries.splice(index + 1, entries.length, { state, url });
+      index += 1;
+      setLocation(location, url);
+    },
+    replaceState(state, _title, url) {
+      entries[index] = { state, url };
+      setLocation(location, url);
+    },
+    go(delta) {
+      index += delta;
+      const entry = entries[index];
+      setLocation(location, entry.url);
+      for (const listener of listeners.get("popstate") || []) {
+        listener({ state: entry.state });
+      }
+    },
+    back() {
+      this.go(-1);
+    },
+    forward() {
+      this.go(1);
+    },
   };
 }
 
@@ -244,6 +290,10 @@ async function stopChild(child) {
   ]);
   if (child.exitCode === null) {
     child.kill("SIGKILL");
+    await Promise.race([
+      new Promise((resolve) => child.once("exit", resolve)),
+      delay(2_000),
+    ]);
   }
 }
 
@@ -266,7 +316,11 @@ test("keeps WEB-002 task routes and IDs behind one labelled mobile menu", () => 
     );
   }
   assert.match(appJs, /createTaskNavigation\(\{[\s\S]*?navigate: \(link\) => navigateRoute\(parseRoute\(link\.href\)\),/);
-  assert.match(appJs, /function applyAppRoute\(route, context = \{\}\) \{\s*const destination = destinationForRoute\(route\);\s*taskNavigation\.close\(\);/);
+  assert.match(
+    appJs,
+    /appRouter = createHistoryRouter\([\s\S]*?taskNavigation = createTaskNavigation\([\s\S]*?appRouter\.start\(\);/,
+  );
+  assert.match(appJs, /function applyAppRoute\(route, context = \{\}\) \{\s*const destination = destinationForRoute\(route\);\s*taskNavigation\.closeForRouteActivation\(\);/);
 });
 
 test("switches only at 760px and contains the menu at 200 percent zoom", () => {
@@ -274,15 +328,21 @@ test("switches only at 760px and contains the menu at 200 percent zoom", () => {
   assert.ok(mobileStart >= 0);
   const mobileCss = appCss.slice(mobileStart);
   assert.match(appCss, /\.mobile-nav-toggle \{[\s\S]*?display: none;/);
-  assert.match(mobileCss, /\.mobile-nav-toggle \{[\s\S]*?display: inline-flex;/);
-  assert.match(mobileCss, /\.nav-groups \{[\s\S]*?display: none;[\s\S]*?max-width: 100%;/);
+  assert.match(mobileCss, /\.sidebar\.is-menu-ready \.mobile-nav-toggle \{[\s\S]*?display: inline-flex;/);
+  assert.match(mobileCss, /\.nav-groups \{[\s\S]*?max-width: 100%;/);
+  assert.match(mobileCss, /\.sidebar\.is-menu-ready \.nav-groups \{\s*display: none;/);
   assert.match(mobileCss, /\.sidebar\.is-menu-open \.nav-groups \{\s*display: grid;/);
+  assert.match(appCss, /\.view-panel,[\s\S]*?#review-product-results \{[\s\S]*?min-width: 0;[\s\S]*?max-width: 100%;/);
+  assert.match(appCss, /\.table-shell \{[\s\S]*?width: 100%;[\s\S]*?overflow-x: auto;/);
+  assert.match(appCss, /@media \(max-width: 1120px\) \{[\s\S]*?\.review-pipeline-overview \{\s*grid-template-columns: 1fr;/);
+  assert.match(indexHtml, /class="table-shell review-table-shell review-pipeline-table-shell"[^>]*role="region"[^>]*tabindex="0"/);
   assert.match(mobileCss, /\.nav-tab \{[\s\S]*?min-height: 44px;[\s\S]*?overflow-wrap: anywhere;/);
   assert.match(appCss, /\.mobile-nav-toggle \{[\s\S]*?min-height: 44px;/);
   assert.match(appCss, /\.mobile-nav-toggle:focus-visible,[\s\S]*?outline: 3px solid var\(--accent\);/);
 
   const at760 = navigationHarness({ width: 760 });
   assert.equal(at760.requestedQuery(), MOBILE_NAVIGATION_QUERY);
+  assert.equal(at760.root.classList.contains("is-menu-ready"), true);
   at760.toggle.dispatch("click");
   assert.equal(at760.controller.isOpen(), true);
 
@@ -296,6 +356,56 @@ test("switches only at 760px and contains the menu at 200 percent zoom", () => {
   assert.equal(atTwoHundredPercent.links.length, 4, "every destination remains reachable");
   assert.match(mobileCss, /\.sidebar \{[\s\S]*?width: 100%;[\s\S]*?min-width: 0;[\s\S]*?max-width: 100%;/);
   assert.match(appCss, /\.table-shell \{[\s\S]*?overflow-x: auto;/);
+});
+
+test("route activation closes and returns focus only after guarded history accepts", () => {
+  const listeners = new Map();
+  const location = fakeLocation();
+  let allowNavigation = true;
+  let router;
+  const harness = navigationHarness({
+    navigate(link) {
+      return router.navigate(parseRoute(link.href));
+    },
+  });
+  const history = trackedHistory(location, listeners);
+  const listen = (name, listener) => {
+    const registered = listeners.get(name) || [];
+    registered.push(listener);
+    listeners.set(name, registered);
+  };
+  router = createHistoryRouter({
+    location,
+    history,
+    listen,
+    mayNavigate: () => allowNavigation,
+    apply: () => harness.controller.closeForRouteActivation(),
+  });
+  router.start();
+
+  harness.toggle.dispatch("click");
+  harness.links[1].focus();
+  harness.links[1].dispatch("click");
+  assert.equal(location.hash, "#/values");
+  assert.equal(harness.controller.isOpen(), false);
+  assert.equal(harness.document.activeElement, harness.toggle);
+
+  harness.toggle.dispatch("click");
+  harness.links[0].focus();
+  history.back();
+  assert.equal(location.hash, "#/listings");
+  assert.equal(harness.controller.isOpen(), false, "accepted Back activates the route");
+  assert.equal(harness.document.activeElement, harness.toggle);
+
+  history.forward();
+  assert.equal(location.hash, "#/values");
+  harness.toggle.dispatch("click");
+  harness.links[0].focus();
+  allowNavigation = false;
+  history.back();
+  assert.equal(location.hash, "#/values", "the router repairs the rejected Back traversal");
+  assert.equal(harness.controller.isOpen(), true);
+  assert.equal(harness.document.activeElement, harness.links[0]);
 });
 
 test("closes with Escape or outside click and returns focus only when appropriate", () => {
@@ -321,6 +431,18 @@ test("closes with Escape or outside click and returns focus only when appropriat
   resized.media.setWidth(761);
   assert.equal(resized.controller.isOpen(), false);
   assert.equal(resized.toggle.getAttribute("aria-expanded"), "false");
+
+  const programmatic = navigationHarness();
+  const workspaceControl = new FakeTarget("workspace", programmatic.document);
+  programmatic.toggle.dispatch("click");
+  workspaceControl.focus();
+  programmatic.controller.closeForRouteActivation();
+  assert.equal(programmatic.controller.isOpen(), false);
+  assert.equal(
+    programmatic.document.activeElement,
+    workspaceControl,
+    "route activation does not steal focus from outside the menu",
+  );
 });
 
 test("closes only after the central router accepts navigation", () => {
@@ -376,7 +498,11 @@ test("native Chromium keeps every task reachable without viewport overflow", {
 }, async () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), "aircost-navigation-smoke-"));
   const profileDirectory = join(temporaryRoot, "chromium-profile");
+  const crashDirectory = join(temporaryRoot, "crash-dumps");
+  const chromiumTemporaryDirectory = join(temporaryRoot, "tmp");
   const databasePath = join(temporaryRoot, "aircost.sqlite3");
+  mkdirSync(crashDirectory);
+  mkdirSync(chromiumTemporaryDirectory);
   const port = await availablePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   let server;
@@ -397,6 +523,7 @@ test("native Chromium keeps every task reachable without viewport overflow", {
     browser = spawn(chromiumPath, [
       "--headless=new",
       `--user-data-dir=${profileDirectory}`,
+      `--crash-dumps-dir=${crashDirectory}`,
       "--disable-background-networking",
       "--disable-breakpad",
       "--disable-component-update",
@@ -411,7 +538,17 @@ test("native Chromium keeps every task reachable without viewport overflow", {
       "--remote-debugging-port=0",
       "--remote-allow-origins=*",
       baseUrl,
-    ], { stdio: ["ignore", "ignore", "pipe"] });
+    ], {
+      env: {
+        ...process.env,
+        TMPDIR: chromiumTemporaryDirectory,
+        XDG_CACHE_HOME: join(temporaryRoot, "xdg-cache"),
+        XDG_CONFIG_HOME: join(temporaryRoot, "xdg-config"),
+        XDG_DATA_HOME: join(temporaryRoot, "xdg-data"),
+        XDG_STATE_HOME: join(temporaryRoot, "xdg-state"),
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
     browser.stderr.setEncoding("utf8");
     browser.stderr.on("data", (chunk) => { browserError += chunk; });
     const debuggingPort = await waitForDevtools(
@@ -437,6 +574,29 @@ test("native Chromium keeps every task reachable without viewport overflow", {
       assert.equal(result.exceptionDetails, undefined, JSON.stringify(result.exceptionDetails));
       return result.result.value;
     };
+    const waitForPage = async (cssWidth, route = "listings") => {
+      const expectedHash = JSON.stringify(`#/${route}`);
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const ready = await evaluate(
+          `document.readyState === 'complete'
+            && location.hash === ${expectedHash}
+            && Boolean(document.querySelector('#mobile-nav-toggle'))`,
+        );
+        if (ready) {
+          return;
+        }
+        await delay(50);
+      }
+      throw new Error(`Timed out loading navigation at ${cssWidth}px`);
+    };
+    let pageNavigationSequence = 0;
+    const navigatePage = async (route, cssWidth) => {
+      pageNavigationSequence += 1;
+      await devtools.send("Page.navigate", {
+        url: `${baseUrl}/?smoke=${pageNavigationSequence}#/${route}`,
+      });
+      await waitForPage(cssWidth, route);
+    };
     const setViewport = async ({ cssWidth, deviceScaleFactor = 1, screenWidth = cssWidth }) => {
       await devtools.send("Emulation.setDeviceMetricsOverride", {
         width: cssWidth,
@@ -446,17 +606,7 @@ test("native Chromium keeps every task reachable without viewport overflow", {
         deviceScaleFactor,
         mobile: false,
       });
-      await devtools.send("Page.navigate", { url: `${baseUrl}/#/listings` });
-      for (let attempt = 0; attempt < 200; attempt += 1) {
-        const ready = await evaluate(
-          "document.readyState === 'complete' && Boolean(document.querySelector('#mobile-nav-toggle'))",
-        );
-        if (ready) {
-          return;
-        }
-        await delay(50);
-      }
-      throw new Error(`Timed out loading navigation at ${cssWidth}px`);
+      await navigatePage("listings", cssWidth);
     };
     const layout = () => evaluate(`(() => {
       const toggle = document.querySelector("#mobile-nav-toggle");
@@ -465,6 +615,8 @@ test("native Chromium keeps every task reachable without viewport overflow", {
       return {
         devicePixelRatio,
         innerWidth,
+        clientWidth: document.documentElement.clientWidth,
+        scrollWidth: document.documentElement.scrollWidth,
         menuDisplay: getComputedStyle(menu).display,
         overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
         toggleDisplay: getComputedStyle(toggle).display,
@@ -584,6 +736,113 @@ test("native Chromium keeps every task reachable without viewport overflow", {
       focused: "fixture-toggle",
     });
 
+    await setViewport({ cssWidth: 760 });
+    const historyInteractions = await evaluate(`(async () => {
+      const pause = (milliseconds = 0) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+      const root = document.querySelector("[data-task-navigation]");
+      const toggle = document.querySelector("#mobile-nav-toggle");
+      const menu = document.querySelector("#task-navigation");
+      const link = (destination) => menu.querySelector(
+        '[data-destination="' + destination + '"]',
+      );
+      const traverse = (method) => new Promise((resolve) => {
+        addEventListener("popstate", () => setTimeout(resolve), { once: true });
+        history[method]();
+      });
+
+      toggle.click();
+      link("values").click();
+      await pause();
+      toggle.click();
+      link("catalog").focus();
+      await traverse("back");
+      const acceptedBack = {
+        closed: !root.classList.contains("is-menu-open"),
+        focused: document.activeElement.id,
+        hash: location.hash,
+      };
+      toggle.click();
+      link("catalog").focus();
+      await traverse("forward");
+      const acceptedForward = {
+        closed: !root.classList.contains("is-menu-open"),
+        focused: document.activeElement.id,
+        hash: location.hash,
+      };
+
+      toggle.click();
+      link("listings").click();
+      await pause();
+      document.querySelector("#new-listing").click();
+      await pause();
+      const listingInput = document.querySelector("#listing-form input");
+      listingInput.value = "unsaved";
+      listingInput.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("#listing-dialog").close();
+      let confirmations = 0;
+      window.confirm = () => {
+        confirmations += 1;
+        return false;
+      };
+      toggle.click();
+      link("values").focus();
+      history.back();
+      await pause(250);
+      const rejectedBack = {
+        confirmations,
+        focused: document.activeElement.textContent.trim(),
+        hash: location.hash,
+        open: root.classList.contains("is-menu-open"),
+      };
+
+      window.confirm = () => true;
+      link("values").click();
+      await pause();
+      await traverse("back");
+      const forwardListingInput = document.querySelector("#listing-form input");
+      forwardListingInput.value = "another unsaved change";
+      forwardListingInput.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("#listing-dialog").close();
+      confirmations = 0;
+      window.confirm = () => {
+        confirmations += 1;
+        return false;
+      };
+      toggle.click();
+      link("catalog").focus();
+      history.forward();
+      await pause(250);
+      const rejectedForward = {
+        confirmations,
+        focused: document.activeElement.textContent.trim(),
+        hash: location.hash,
+        open: root.classList.contains("is-menu-open"),
+      };
+      return { acceptedBack, acceptedForward, rejectedBack, rejectedForward };
+    })()`);
+    assert.deepEqual(historyInteractions.acceptedBack, {
+      closed: true,
+      focused: "mobile-nav-toggle",
+      hash: "#/listings",
+    });
+    assert.deepEqual(historyInteractions.acceptedForward, {
+      closed: true,
+      focused: "mobile-nav-toggle",
+      hash: "#/values",
+    });
+    assert.deepEqual(historyInteractions.rejectedBack, {
+      confirmations: 1,
+      focused: "Aircraft values",
+      hash: "#/listings/new",
+      open: true,
+    });
+    assert.deepEqual(historyInteractions.rejectedForward, {
+      confirmations: 1,
+      focused: "Avionics catalog",
+      hash: "#/listings/new",
+      open: true,
+    });
+
     await setViewport({ cssWidth: 761 });
     result = await layout();
     assert.equal(result.innerWidth, 761);
@@ -601,10 +860,65 @@ test("native Chromium keeps every task reachable without viewport overflow", {
     assert.equal(result.menuDisplay, "grid");
     assert.equal(result.overflow, false);
     assert.equal(result.links.every(({ height, visible }) => visible && height >= 44), true);
+
+    const routes = [
+      "listings",
+      "values",
+      "review",
+      "review/manual",
+      "review/products",
+      "catalog",
+    ];
+    for (const cssWidth of [320, 390, 760, 1024, 1120, 1121, 1440]) {
+      await setViewport({ cssWidth });
+      for (const route of routes) {
+        await navigatePage(route, cssWidth);
+        if (cssWidth <= 760) {
+          await evaluate("document.querySelector('#mobile-nav-toggle').click()");
+        }
+        const routeLayout = await layout();
+        assert.ok(
+          routeLayout.scrollWidth <= routeLayout.clientWidth,
+          `${route} at ${cssWidth}px overflowed ${routeLayout.scrollWidth}/${routeLayout.clientWidth}`,
+        );
+        assert.equal(
+          routeLayout.links.every(({ height, visible }) => (
+            visible && (cssWidth > 760 || height >= 44)
+          )),
+          true,
+          `${route} at ${cssWidth}px keeps every task reachable`,
+        );
+      }
+    }
+
+    await devtools.send("Emulation.setScriptExecutionDisabled", { value: true });
+    await devtools.send("Emulation.setDeviceMetricsOverride", {
+      width: 760,
+      height: 900,
+      screenWidth: 760,
+      screenHeight: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await devtools.send("Page.navigate", {
+      url: `${baseUrl}/?javascript=disabled#/listings`,
+    });
+    await waitForPage(760);
+    result = await layout();
+    assert.equal(result.toggleDisplay, "none", "the no-JS menu does not expose an inert toggle");
+    assert.equal(result.menuDisplay, "grid", "the no-JS menu keeps all task links visible");
+    assert.equal(result.links.every(({ height, visible }) => visible && height >= 44), true);
+    assert.equal(result.overflow, false);
+    await devtools.send("Emulation.setScriptExecutionDisabled", { value: false });
   } finally {
     devtools?.close();
     await stopChild(browser);
     await stopChild(server);
-    rmSync(temporaryRoot, { recursive: true, force: true });
+    rmSync(temporaryRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    });
   }
 });

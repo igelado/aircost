@@ -46,6 +46,11 @@ export function createTaskNavigation({
     }
   }
 
+  function closeForRouteActivation() {
+    const returnFocus = open && menu.contains(document.activeElement);
+    close({ returnFocus });
+  }
+
   function handleToggle() {
     setOpen(!open);
   }
@@ -89,10 +94,12 @@ export function createTaskNavigation({
   } else {
     mobile.addListener?.(handleViewportChange);
   }
+  root.classList.toggle("is-menu-ready", true);
   setOpen(false);
 
   return Object.freeze({
     close,
+    closeForRouteActivation,
     isOpen: () => open,
   });
 }
