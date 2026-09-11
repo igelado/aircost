@@ -1,4 +1,5 @@
 let api;
+let catalogPageFallbackForResult;
 let finiteNumber;
 let formatCurrency;
 let formatDate;
@@ -8,6 +9,9 @@ let selectOption;
 let setButtonBusy;
 let refreshListings;
 let refreshReview;
+let navigate;
+let preserveLiveRouteInput;
+let routeActivationIsCurrent;
 
 const state = {
   avionicsItems: [],
@@ -22,6 +26,9 @@ const state = {
   avionicsDetailTrigger: null,
   avionicsDetail: null,
   avionicsDeleting: false,
+  avionicsDeletionOwner: null,
+  catalogRouteKey: null,
+  route: { name: "catalog", filters: { page: 1 } },
 };
 
 const elements = {};
@@ -33,6 +40,7 @@ export function initializeAvionicsInspector(shared) {
   }
   ({
     api,
+    catalogPageFallbackForResult,
     finiteNumber,
     formatCurrency,
     formatDate,
@@ -42,24 +50,148 @@ export function initializeAvionicsInspector(shared) {
     setButtonBusy,
     refreshListings,
     refreshReview,
+    navigate,
+    preserveLiveRouteInput,
+    routeActivationIsCurrent,
   } = shared);
   collectElements();
   bindEvents();
   initialized = true;
 
   return Object.freeze({
-    activate() {
-      if (!state.avionicsLoaded) {
-        return loadAvionicsWorkspace();
-      }
-      return Promise.resolve();
+    activate(route, context) {
+      return applyCatalogRoute(route, context);
+    },
+    deactivate() {
+      deactivateAvionicsInspector();
+    },
+    confirmRouteChange(next) {
+      return !state.avionicsDeleting
+        || next?.name === "catalog" && next.productId === state.route.productId;
     },
     refresh() {
       cancelAvionicsSearch();
-      state.avionicsOffset = 0;
       return loadAvionicsWorkspace(true);
     },
   });
+}
+
+function deactivateAvionicsInspector() {
+  cancelAvionicsSearch();
+  state.avionicsDetailTrigger = null;
+  state.route = { ...state.route };
+  closeAvionicsDetail(false, { updateRoute: false });
+}
+
+function finishAvionicsDetailClose() {
+  if (elements.avionicsDetailDialog.open) {
+    return;
+  }
+  state.avionicsDetailRequestSequence += 1;
+  state.avionicsDetail = null;
+  state.avionicsDeleting = false;
+  elements.deleteAvionicsProduct.disabled = true;
+  state.avionicsDetailTrigger?.focus();
+  state.avionicsDetailTrigger = null;
+}
+
+async function applyCatalogRoute(route, { source } = {}) {
+  const targetProductId = positiveInteger(route.productId, null);
+  const displayedProductId = positiveInteger(
+    state.avionicsDetail?.summary?.id,
+    positiveInteger(state.route?.productId, null),
+  );
+  if (
+    elements.avionicsDetailDialog.open
+    && (targetProductId === null || displayedProductId !== targetProductId)
+  ) {
+    state.avionicsDetailRequestSequence += 1;
+    state.avionicsDetailTrigger = null;
+    state.avionicsDetail = null;
+    state.avionicsDeleting = false;
+    elements.deleteAvionicsProduct.disabled = true;
+    closeAvionicsDetail(false, { updateRoute: false });
+  }
+  state.route = route;
+  cancelAvionicsSearch();
+  const filters = route.filters || {};
+  if (!preserveLiveRouteInput(
+    source,
+    document.activeElement === elements.avionicsSearch,
+  )) {
+    elements.avionicsSearch.value = filters.search || "";
+  }
+  elements.avionicsCompletenessFilter.value = filters.completeness || "";
+  if (!state.avionicsOptionsLoaded) {
+    await loadAvionicsOptions();
+  }
+  if (!routeActivationIsCurrent(route, state.route)) {
+    return;
+  }
+  setCatalogSelectValue(elements.avionicsStatusFilter, filters.status);
+  setCatalogSelectValue(elements.avionicsCapabilityFilter, filters.capability);
+  const routeKey = JSON.stringify(filters);
+  if (!state.avionicsLoaded || state.catalogRouteKey !== routeKey) {
+    state.avionicsOffset = ((filters.page || 1) - 1) * state.avionicsLimit;
+    state.catalogRouteKey = routeKey;
+    await loadAvionics();
+  }
+  if (!routeActivationIsCurrent(route, state.route)) {
+    return;
+  }
+  const pageFallback = state.avionicsLoaded
+    ? catalogPageFallbackForResult(
+      route,
+      state.route,
+      state.avionicsTotal,
+      state.avionicsLimit,
+    )
+    : null;
+  if (pageFallback !== null) {
+    const fallbackRoute = state.avionicsSearchTimer === null
+      ? pageFallback
+      : catalogRouteFromControls({
+        page: 1,
+        productId: pageFallback.productId || null,
+      });
+    const navigated = await navigate(fallbackRoute, { replace: true });
+    if (navigated !== false) {
+      return;
+    }
+  }
+  if (route.productId) {
+    const openId = positiveInteger(state.avionicsDetail?.summary?.id, null);
+    if (openId !== route.productId || !elements.avionicsDetailDialog.open) {
+      await openAvionicsDetail(route.productId, null);
+    }
+  } else {
+    closeAvionicsDetail(false, { updateRoute: false });
+  }
+}
+
+function setCatalogSelectValue(select, value) {
+  const selected = value || "";
+  if (![...select.options].some((option) => option.value === selected)) {
+    select.append(selectOption(selected, selected));
+  }
+  select.value = selected;
+}
+
+function catalogRouteFromControls({ page = 1, productId = null } = {}) {
+  const route = {
+    name: "catalog",
+    filters: {
+      search: elements.avionicsSearch.value,
+      status: elements.avionicsStatusFilter.value,
+      capability: elements.avionicsCapabilityFilter.value,
+      completeness: elements.avionicsCompletenessFilter.value,
+      page,
+    },
+  };
+  if (productId !== null) {
+    route.productId = productId;
+  }
+  return route;
 }
 
 function collectElements() {
@@ -95,9 +227,7 @@ function collectElements() {
 
 function bindEvents() {
   elements.refreshAvionics.addEventListener("click", () => {
-    cancelAvionicsSearch();
-    state.avionicsOffset = 0;
-    loadAvionicsWorkspace(true);
+    refreshAvionicsFromControls();
   });
   elements.avionicsSearch.addEventListener("input", scheduleAvionicsSearch);
   for (const filter of [
@@ -107,61 +237,77 @@ function bindEvents() {
   ]) {
     filter.addEventListener("change", () => {
       cancelAvionicsSearch();
-      state.avionicsOffset = 0;
-      loadAvionics();
+      navigate(catalogRouteFromControls({ page: 1 }));
     });
   }
   elements.avionicsPreviousPage.addEventListener("click", () => {
     cancelAvionicsSearch();
-    state.avionicsOffset = Math.max(0, state.avionicsOffset - state.avionicsLimit);
-    loadAvionics();
+    const page = Math.max(1, (state.route.filters?.page || 1) - 1);
+    navigate(catalogRouteFromControls({ page }));
   });
   elements.avionicsNextPage.addEventListener("click", () => {
     cancelAvionicsSearch();
     if (state.avionicsOffset + state.avionicsLimit < state.avionicsTotal) {
-      state.avionicsOffset += state.avionicsLimit;
-      loadAvionics();
+      navigate(catalogRouteFromControls({ page: (state.route.filters?.page || 1) + 1 }));
     }
   });
   elements.avionicsTableBody.addEventListener("click", handleAvionicsTableClick);
   elements.deleteAvionicsProduct.addEventListener("click", deleteCurrentAvionicsProduct);
-  elements.closeAvionicsDetail.addEventListener("click", closeAvionicsDetail);
+  elements.closeAvionicsDetail.addEventListener("click", () => closeAvionicsDetail());
   elements.avionicsDetailDialog.addEventListener("click", (event) => {
     if (event.target === elements.avionicsDetailDialog) {
       closeAvionicsDetail();
     }
   });
   elements.avionicsDetailDialog.addEventListener("cancel", (event) => {
-    if (state.avionicsDeleting) {
-      event.preventDefault();
-    }
+    event.preventDefault();
+    closeAvionicsDetail();
   });
-  elements.avionicsDetailDialog.addEventListener("close", () => {
-    state.avionicsDetailRequestSequence += 1;
-    state.avionicsDetail = null;
-    state.avionicsDeleting = false;
-    elements.deleteAvionicsProduct.disabled = true;
-    state.avionicsDetailTrigger?.focus();
-    state.avionicsDetailTrigger = null;
-  });
+  elements.avionicsDetailDialog.addEventListener("close", finishAvionicsDetailClose);
 }
 
-async function loadAvionicsWorkspace(forceOptions = false) {
+async function loadAvionicsWorkspace(
+  forceOptions = false,
+  { source, searchValue } = {},
+) {
   if (forceOptions || !state.avionicsOptionsLoaded) {
     await loadAvionicsOptions();
   }
+  const filters = state.route?.filters || {};
+  if (typeof searchValue === "string") {
+    elements.avionicsSearch.value = searchValue;
+  } else if (!preserveLiveRouteInput(
+    source,
+    document.activeElement === elements.avionicsSearch,
+  )) {
+    elements.avionicsSearch.value = filters.search || "";
+  }
+  elements.avionicsCompletenessFilter.value = filters.completeness || "";
+  setCatalogSelectValue(elements.avionicsStatusFilter, filters.status);
+  setCatalogSelectValue(elements.avionicsCapabilityFilter, filters.capability);
+  state.avionicsOffset = ((filters.page || 1) - 1) * state.avionicsLimit;
   await loadAvionics();
 }
 
-async function loadAvionicsOptions() {
+async function loadAvionicsOptions({ commitGuard = null } = {}) {
+  const mayCommit = () => (
+    typeof commitGuard !== "function" || commitGuard()
+  );
   try {
     const payload = await api("/api/avionics/options");
+    if (!mayCommit()) {
+      return false;
+    }
     updateAvionicsFilterOptions(payload?.options || {});
     state.avionicsOptionsLoaded = true;
   } catch (error) {
+    if (!mayCommit()) {
+      return false;
+    }
     state.avionicsOptionsLoaded = false;
     setAvionicsMessage(`Catalog filters unavailable: ${error.message}`, true);
   }
+  return true;
 }
 
 function updateAvionicsFilterOptions(options) {
@@ -218,9 +364,52 @@ function scheduleAvionicsSearch() {
   cancelAvionicsSearch();
   state.avionicsSearchTimer = window.setTimeout(() => {
     state.avionicsSearchTimer = null;
-    state.avionicsOffset = 0;
-    loadAvionics();
+    navigate(catalogRouteFromControls({ page: 1 }), { replace: true });
   }, 250);
+}
+
+async function refreshAvionicsFromControls() {
+  const hadPendingSearch = state.avionicsSearchTimer !== null;
+  const previousRouteKey = state.catalogRouteKey;
+  const refreshOwner = state.route;
+  const liveSearch = elements.avionicsSearch.value;
+  const route = catalogRouteFromControls({
+    page: hadPendingSearch ? 1 : state.route?.filters?.page || 1,
+    productId: state.route?.productId || null,
+  });
+  cancelAvionicsSearch();
+  const optionsCommitted = await loadAvionicsOptions({
+    commitGuard: () => (
+      routeActivationIsCurrent(refreshOwner, state.route)
+      && elements.avionicsSearch.value === liveSearch
+    ),
+  });
+  if (!optionsCommitted) {
+    return false;
+  }
+  const activation = navigate(route, { replace: true });
+  if (activation === false) {
+    return false;
+  }
+  const routeOwner = state.route;
+  const routedSearch = state.route?.filters?.search || "";
+  if (elements.avionicsSearch.value === routedSearch) {
+    elements.avionicsSearch.value = liveSearch;
+  }
+  await activation;
+  if (!routeActivationIsCurrent(routeOwner, state.route)) {
+    return false;
+  }
+  if (elements.avionicsSearch.value !== liveSearch) {
+    return false;
+  }
+  if (state.catalogRouteKey === previousRouteKey) {
+    await loadAvionicsWorkspace(false, {
+      source: "refresh",
+      searchValue: liveSearch,
+    });
+  }
+  return true;
 }
 
 function cancelAvionicsSearch() {
@@ -498,13 +687,17 @@ function handleAvionicsTableClick(event) {
   }
   const id = Number.parseInt(button.dataset.avionicsId, 10);
   if (Number.isInteger(id)) {
-    openAvionicsDetail(id, button);
+    state.avionicsDetailTrigger = button;
+    navigate(catalogRouteFromControls({
+      page: state.route.filters?.page || 1,
+      productId: id,
+    }));
   }
 }
 
 async function openAvionicsDetail(id, trigger) {
   const requestSequence = ++state.avionicsDetailRequestSequence;
-  state.avionicsDetailTrigger = trigger || document.activeElement;
+  state.avionicsDetailTrigger = trigger || state.avionicsDetailTrigger || document.activeElement;
   state.avionicsDetail = null;
   state.avionicsDeleting = false;
   elements.deleteAvionicsProduct.disabled = true;
@@ -568,6 +761,12 @@ async function deleteCurrentAvionicsProduct() {
     return;
   }
 
+  const deletionOwner = { productId };
+  const ownsDeletion = () => routeActivationIsCurrent(
+    deletionOwner,
+    state.avionicsDeletionOwner,
+  );
+  state.avionicsDeletionOwner = deletionOwner;
   state.avionicsDeleting = true;
   elements.closeAvionicsDetail.disabled = true;
   setButtonBusy(elements.deleteAvionicsProduct, true);
@@ -575,16 +774,37 @@ async function deleteCurrentAvionicsProduct() {
   removeAvionicsDeleteError();
   try {
     const payload = await api(`/api/avionics/${productId}`, { method: "DELETE" });
-    const outcome = avionicsDeletionOutcome(payload, productId);
-    if (state.avionicsItems.length === 1 && state.avionicsOffset > 0) {
-      state.avionicsOffset = Math.max(0, state.avionicsOffset - state.avionicsLimit);
+    if (!ownsDeletion()) {
+      return;
     }
-    closeAvionicsDetail(true);
+    const outcome = avionicsDeletionOutcome(payload, productId);
+    const page = state.avionicsItems.length === 1 && state.avionicsOffset > 0
+      ? Math.max(1, (state.route.filters?.page || 1) - 1)
+      : state.route.filters?.page || 1;
+    closeAvionicsDetail(true, { updateRoute: false });
+    if (!ownsDeletion()) {
+      return;
+    }
+    state.avionicsDeleting = false;
+    const navigation = navigate(catalogRouteFromControls({
+      page,
+    }), { replace: true });
+    if (navigation === false) {
+      return;
+    }
+    const routeOwner = state.route;
+    await navigation;
+    if (!ownsDeletion() || !routeActivationIsCurrent(routeOwner, state.route)) {
+      return;
+    }
     await Promise.allSettled([
       loadAvionicsWorkspace(true),
       Promise.resolve(refreshListings()),
       Promise.resolve(refreshReview()),
     ]);
+    if (!ownsDeletion() || !routeActivationIsCurrent(routeOwner, state.route)) {
+      return;
+    }
     const listingIds = outcome.affectedListingIds.length
       ? ` Listings: ${outcome.affectedListingIds.join(", ")}.`
       : "";
@@ -592,6 +812,9 @@ async function deleteCurrentAvionicsProduct() {
       `${outcome.productName} deleted. Removed associations from ${outcome.affectedListingCount} ${outcome.affectedListingCount === 1 ? "listing" : "listings"}.${listingIds}`,
     );
   } catch (error) {
+    if (!ownsDeletion()) {
+      return;
+    }
     const message = `Could not delete ${productName}: ${error.message}`;
     elements.avionicsDetailSubtitle.textContent = "Product deletion failed";
     const failure = detailState(message, true);
@@ -599,10 +822,13 @@ async function deleteCurrentAvionicsProduct() {
     elements.avionicsDetailBody.prepend(failure);
     setAvionicsMessage(message, true);
   } finally {
-    state.avionicsDeleting = false;
-    elements.closeAvionicsDetail.disabled = false;
-    setButtonBusy(elements.deleteAvionicsProduct, false);
-    elements.deleteAvionicsProduct.disabled = state.avionicsDetail === null;
+    if (ownsDeletion()) {
+      state.avionicsDeletionOwner = null;
+      state.avionicsDeleting = false;
+      elements.closeAvionicsDetail.disabled = false;
+      setButtonBusy(elements.deleteAvionicsProduct, false);
+      elements.deleteAvionicsProduct.disabled = state.avionicsDetail === null;
+    }
   }
 }
 
@@ -641,12 +867,17 @@ export function avionicsDeletionOutcome(payload, expectedProductId) {
   };
 }
 
-function closeAvionicsDetail(force = false) {
+function closeAvionicsDetail(force = false, { updateRoute = true } = {}) {
   if (state.avionicsDeleting && !force) {
     return;
   }
   if (elements.avionicsDetailDialog.open) {
     elements.avionicsDetailDialog.close();
+  }
+  if (updateRoute && state.route.productId) {
+    navigate(catalogRouteFromControls({
+      page: state.route.filters?.page || 1,
+    }));
   }
 }
 

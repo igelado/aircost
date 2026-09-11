@@ -53,9 +53,21 @@ import {
   useExistingProductRequest,
   validateAvionicsObservationCorrection,
 } from "/review/domain.mjs";
+import {
+  confirmDirtyRouteChange,
+  preserveLiveRouteInput,
+  reviewAreaForRoute,
+  reviewListingIdForRoute,
+  reviewListingRouteOwner,
+  reviewListingRouteOwnerIsCurrent,
+  reviewMutationInProgress,
+  reviewPipelineRouteIsSame,
+  reviewProductFallbackForResult,
+  reviewProductQueueNeedsLoad,
+  reviewProductRouteIsSame,
+  routeActivationIsCurrent,
+} from "/routing.mjs";
 
-const REVIEW_LISTING_PARAM = "review_listing";
-const REVIEW_AREA_PARAM = "review_area";
 const QUEUE_LIMIT = 100;
 const CATALOG_RESULT_LIMIT = 8;
 const CATALOG_SEARCH_DELAY_MS = 250;
@@ -67,13 +79,13 @@ const SUPPORTED_ACTIONS = Object.freeze([
   "discard",
 ]);
 
-let activatePanel;
 let api;
 let formatDate;
 let formatNumber;
 let refreshAvionics;
 let refreshListings;
 let setButtonBusy;
+let navigate;
 
 const state = {
   reviews: [],
@@ -100,6 +112,7 @@ const state = {
   verificationRunCreating: false,
   verificationRunCancelling: false,
   productRequestSequence: 0,
+  reviewLoadUiGeneration: 0,
   productDetailRequestSequence: 0,
   productGroups: [],
   selectedProduct: null,
@@ -108,6 +121,9 @@ const state = {
   productBusy: false,
   productBusyProductId: null,
   productActionSequence: 0,
+  productAttestationDirty: false,
+  productStructureDirty: false,
+  settingProductDraft: false,
   productStructureSearchTimer: null,
   productStructureSearchSequence: 0,
   detailRequestSequence: 0,
@@ -121,8 +137,11 @@ const state = {
   stale: false,
   resolving: false,
   savingAspectKey: null,
+  validatingAspectKey: null,
   automating: false,
   automationControlStates: new Map(),
+  routeGeneration: 0,
+  route: { name: "review", view: "pipeline", search: "", filter: "all" },
 };
 
 const elements = {};
@@ -133,13 +152,13 @@ export function initializeReviewWorkspace(shared) {
     throw new Error("The listing review workspace is already initialized.");
   }
   ({
-    activatePanel,
     api,
     formatDate,
     formatNumber,
     refreshAvionics,
     refreshListings,
     setButtonBusy,
+    navigate,
   } = shared);
   collectElements();
   bindEvents();
@@ -148,44 +167,179 @@ export function initializeReviewWorkspace(shared) {
   initialized = true;
 
   return Object.freeze({
-    activate() {
-      const listingId = reviewListingIdFromLocation();
-      if (listingId !== null) {
-        setQueueMode("listing", { load: false });
-        state.activeArea = reviewAreaFromLocation() ?? "avionics";
-        const queueLoad = state.queueLoaded ? Promise.resolve() : loadQueue({ quiet: true });
-        const pipelineLoad = state.pipelineLoaded
-          ? Promise.resolve()
-          : loadPipelineQueue({ quiet: true });
-        const detailLoad = openReview(listingId, { historyMode: "none", discardDraft: true });
-        const runLoad = state.activeVerificationRunId === null
-          ? Promise.resolve()
-          : resumeVerificationRun(state.activeVerificationRunId);
-        return Promise.allSettled([queueLoad, pipelineLoad, detailLoad, runLoad]);
-      }
-      showQueue({ historyMode: "none", discardDraft: true });
-      const pipelineLoad = state.pipelineLoaded
-        ? Promise.resolve()
-        : loadPipelineQueue();
-      const runLoad = state.activeVerificationRunId === null
-        ? Promise.resolve()
-        : resumeVerificationRun(state.activeVerificationRunId);
-      return Promise.allSettled([pipelineLoad, runLoad]);
+    activate(route, context) {
+      return activateReviewRoute(route, context);
+    },
+    deactivate() {
+      deactivateReviewRoute();
     },
     refresh() {
       return refreshActiveQueue();
     },
-    restoreFromLocation() {
-      if (reviewListingIdFromLocation() !== null) {
-        activatePanel("review-panel");
+    confirmRouteChange(next) {
+      if (activeReviewMutation()) {
+        return false;
       }
+      const sameProduct = reviewProductRouteIsSame(state.route, next);
+      if (!confirmDirtyRouteChange(
+        productDraftDirty(),
+        sameProduct,
+        () => window.confirm("Discard the unsaved product review changes?"),
+      )) {
+        return false;
+      }
+      const listingId = currentListingId();
+      if (
+        listingId === null
+        || next?.name === "review"
+          && next.view === "listing"
+          && next.listingId === listingId
+      ) {
+        return true;
+      }
+      return confirmDiscardDraft();
     },
   });
 }
 
+function deactivateReviewRoute() {
+  state.routeGeneration += 1;
+  if (state.route?.view === "listing") {
+    showQueue({ discardDraft: true, load: false });
+  }
+  closeProductReview();
+  state.route = null;
+}
+
+function activateReviewRoute(route, { source } = {}) {
+  const previousRoute = state.route;
+  state.routeGeneration += 1;
+  state.route = route;
+  if (route.view !== "products") {
+    closeProductReview();
+  }
+  if (route.view === "listing") {
+    setQueueMode("listing", { load: false });
+    state.activeArea = route.area ?? "avionics";
+    const detailRouteOwnsActivation = () => routeActivationIsCurrent(route, state.route);
+    const queueLoad = state.queueLoaded
+      ? Promise.resolve()
+      : loadQueue({ quiet: true, commitGuard: detailRouteOwnsActivation });
+    const pipelineLoad = state.pipelineLoaded
+      ? Promise.resolve()
+      : loadPipelineQueue({ quiet: true, commitGuard: detailRouteOwnsActivation });
+    const detailLoad = reuseListingReviewForAreaRoute(previousRoute, route)
+      ? Promise.resolve()
+      : openReview(route.listingId, { discardDraft: true });
+    const runLoad = state.activeVerificationRunId === null
+      ? Promise.resolve()
+      : resumeVerificationRun(state.activeVerificationRunId);
+    return Promise.allSettled([queueLoad, pipelineLoad, detailLoad, runLoad]);
+  }
+
+  showQueue({ discardDraft: true, load: false });
+  if (route.view === "products") {
+    const sameProduct = reviewProductRouteIsSame(previousRoute, route);
+    if (!sameProduct) {
+      closeProductReview();
+    }
+    setQueueMode("product", { load: false });
+    const queueLoad = reviewProductQueueNeedsLoad(
+      route,
+      state.productGroups.length > 0,
+    )
+      ? loadProductQueue({
+        commitGuard: () => routeActivationIsCurrent(route, state.route),
+      })
+      : Promise.resolve(true);
+    const detailLoad = route.productId
+      ? Promise.resolve(queueLoad).then(async (loaded) => {
+        if (!loaded || !routeActivationIsCurrent(route, state.route)) {
+          return { status: "superseded" };
+        }
+        if (state.selectedProduct?.id === route.productId) {
+          return { status: "loaded" };
+        }
+        const result = await openProductReview(route.productId);
+        await replaceAbsentProductRoute(result, route);
+        return result;
+      })
+      : Promise.resolve(closeProductReview());
+    return Promise.allSettled([queueLoad, detailLoad]);
+  }
+  if (route.view === "manual") {
+    setQueueMode("listing", { load: false });
+    const queueLoad = loadQueue({
+      commitGuard: () => routeActivationIsCurrent(route, state.route),
+    });
+    return Promise.allSettled([queueLoad]);
+  }
+
+  state.pipelineSearch = route.search || "";
+  state.pipelineFilter = route.filter || "all";
+  if (!preserveLiveRouteInput(
+    source,
+    document.activeElement === elements.reviewPipelineSearch,
+  )) {
+    elements.reviewPipelineSearch.value = state.pipelineSearch;
+  }
+  elements.reviewPipelineFilter.value = state.pipelineFilter;
+  setQueueMode("pipeline", { load: false });
+  if (state.pipelineLoaded) {
+    renderPipelineTable();
+  }
+  const samePipelineActivation = source !== "startup"
+    && reviewPipelineRouteIsSame(previousRoute, route);
+  const pipelineLoad = samePipelineActivation
+    ? Promise.resolve()
+    : loadPipelineQueue({
+      commitGuard: () => reviewPipelineRouteIsSame(route, state.route),
+    });
+  const runLoad = samePipelineActivation || state.activeVerificationRunId === null
+    ? Promise.resolve()
+    : resumeVerificationRun(state.activeVerificationRunId);
+  return Promise.allSettled([pipelineLoad, runLoad]);
+}
+
+function reuseListingReviewForAreaRoute(previousRoute, route) {
+  if (
+    reviewListingIdForRoute(previousRoute) !== route.listingId
+    || positiveInteger(state.currentReview?.listing_id) !== route.listingId
+  ) {
+    return false;
+  }
+  showWorkspace();
+  setActiveReviewArea(state.activeArea);
+  return true;
+}
+
+function activeReviewMutation() {
+  return reviewMutationInProgress({
+    productBatch: state.productBusy,
+    resolution: state.resolving,
+    aspectSave: state.savingAspectKey !== null,
+    correctionSave: Array.from(state.drafts.values()).some(
+      (draft) => draft.correction?.saving === true,
+    ),
+    automation: state.automating,
+    associationValidation: state.validatingAspectKey !== null,
+  });
+}
+
+function captureListingRouteOwner() {
+  return reviewListingRouteOwner(state.route, state.routeGeneration);
+}
+
+function listingRouteOwnerIsCurrent(owner) {
+  return reviewListingRouteOwnerIsCurrent(
+    owner,
+    state.route,
+    state.routeGeneration,
+  );
+}
+
 function collectElements() {
   for (const [key, selector] of Object.entries({
-    reviewPanel: "#review-panel",
     reviewPendingCount: "#review-pending-count",
     reviewPendingLabel: "#review-pending-label",
     reviewAspectCount: "#review-aspect-count",
@@ -283,16 +437,18 @@ function collectElements() {
 
 function bindEvents() {
   elements.refreshReviews.addEventListener("click", () => refreshActiveQueue());
-  elements.reviewModePipeline.addEventListener("click", () => setQueueMode("pipeline"));
-  elements.reviewModeProduct.addEventListener("click", () => setQueueMode("product"));
-  elements.reviewModeListing.addEventListener("click", () => setQueueMode("listing"));
+  elements.reviewModePipeline.addEventListener("click", () => navigate(reviewQueueRoute("pipeline")));
+  elements.reviewModeProduct.addEventListener("click", () => navigate(reviewQueueRoute("product")));
+  elements.reviewModeListing.addEventListener("click", () => navigate(reviewQueueRoute("listing")));
   elements.reviewPipelineSearch.addEventListener("input", () => {
     state.pipelineSearch = elements.reviewPipelineSearch.value;
     renderPipelineTable();
+    navigate(reviewQueueRoute("pipeline"), { replace: true });
   });
   elements.reviewPipelineFilter.addEventListener("change", () => {
     state.pipelineFilter = elements.reviewPipelineFilter.value;
     renderPipelineTable();
+    navigate(reviewQueueRoute("pipeline"), { replace: true });
   });
   elements.reviewPipelineSelectAll.addEventListener("click", selectAllActionablePipelineRows);
   elements.reviewPipelineVerify.addEventListener("click", () => {
@@ -314,8 +470,7 @@ function bindEvents() {
     const button = event.target.closest("button[data-review-listing-id]");
     const listingId = positiveInteger(button?.dataset.reviewListingId);
     if (listingId !== null) {
-      setQueueMode("listing", { load: false });
-      openReview(listingId, { historyMode: "push" });
+      navigate(reviewListingRoute(listingId));
     }
   });
   elements.reviewRunItemsBody.addEventListener("click", (event) => {
@@ -323,8 +478,7 @@ function bindEvents() {
     const listingId = positiveInteger(button?.dataset.reviewListingId);
     const row = pipelineRowForListing(listingId);
     if (listingId !== null && row?.hasPendingReview) {
-      setQueueMode("listing", { load: false });
-      openReview(listingId, { historyMode: "push", force: true });
+      navigate(reviewListingRoute(listingId));
     }
   });
   elements.reviewProductTableBody.addEventListener("click", (event) => {
@@ -334,12 +488,16 @@ function bindEvents() {
     const button = event.target.closest("button[data-review-product-id]");
     const productId = positiveInteger(button?.dataset.reviewProductId);
     if (productId !== null) {
-      openProductReview(productId);
+      navigate({ name: "review", view: "products", productId });
     }
   });
   elements.reviewProductAttestationForm.addEventListener(
     "submit",
     attestSelectedProduct,
+  );
+  elements.reviewProductAttestationForm.addEventListener(
+    "input",
+    markProductAttestationDirty,
   );
   elements.reviewProductValidate.addEventListener(
     "click",
@@ -369,30 +527,28 @@ function bindEvents() {
     }
     const listingId = positiveInteger(button.dataset.reviewListingId);
     if (listingId !== null) {
-      openReview(listingId, { historyMode: "push" });
+      navigate(reviewListingRoute(listingId));
     }
   });
   elements.reviewBack.addEventListener("click", () => {
-    if (confirmDiscardDraft()) {
-      showQueue({ historyMode: "push", discardDraft: true });
-    }
+    navigate(reviewQueueRoute("listing"));
   });
   elements.reviewNext.addEventListener("click", () => {
     const listingId = nextPendingListingId();
-    if (listingId !== null && confirmDiscardDraft()) {
-      openReview(listingId, { historyMode: "push", discardDraft: true });
+    if (listingId !== null) {
+      navigate(reviewListingRoute(listingId));
     }
   });
   elements.reviewReload.addEventListener("click", () => {
     const listingId = currentListingId();
     if (listingId !== null) {
-      openReview(listingId, { historyMode: "none", discardDraft: true, force: true });
+      openReview(listingId, { discardDraft: true, force: true });
     }
   });
   for (const area of REVIEW_AREAS) {
     const tab = reviewAreaElements(area).tab;
     tab.addEventListener("click", () => {
-      setActiveReviewArea(area, { updateLocation: true });
+      navigateReviewArea(area);
     });
     tab.addEventListener("keydown", (event) => handleReviewTabKeydown(event, area));
   }
@@ -402,23 +558,25 @@ function bindEvents() {
   );
   elements.rebuildAvionicsReview.addEventListener("click", rebuildAvionicsReview);
   elements.verifyListing.addEventListener("click", resolveReview);
-  window.addEventListener("popstate", () => {
-    if (!elements.reviewPanel.classList.contains("is-active")) {
-      return;
-    }
-    const openListingId = positiveInteger(state.currentReview?.listing_id);
-    if (!confirmDiscardDraft()) {
-      updateReviewLocation(openListingId, "push");
-      return;
-    }
-    const listingId = reviewListingIdFromLocation();
-    if (listingId === null) {
-      showQueue({ historyMode: "none", discardDraft: true });
-    } else {
-      state.activeArea = reviewAreaFromLocation() ?? "avionics";
-      openReview(listingId, { historyMode: "none", discardDraft: true, force: true });
-    }
-  });
+}
+
+function reviewQueueRoute(mode = state.queueMode) {
+  if (mode === "product") {
+    return { name: "review", view: "products" };
+  }
+  if (mode === "listing") {
+    return { name: "review", view: "manual" };
+  }
+  return {
+    name: "review",
+    view: "pipeline",
+    search: state.pipelineSearch,
+    filter: state.pipelineFilter,
+  };
+}
+
+function reviewListingRoute(listingId, area = null) {
+  return { name: "review", view: "listing", listingId, area };
 }
 
 function refreshActiveQueue() {
@@ -495,8 +653,13 @@ function setQueueMode(mode, { load = true } = {}) {
   }
 }
 
-async function loadPipelineQueue({ quiet = false } = {}) {
+async function loadPipelineQueue({ quiet = false, commitGuard = null } = {}) {
   const sequence = ++state.pipelineRequestSequence;
+  const uiGeneration = ++state.reviewLoadUiGeneration;
+  const mayCommit = () => (
+    sequence === state.pipelineRequestSequence
+    && (commitGuard === null || commitGuard())
+  );
   if (!quiet) {
     setQueueMessage("Running provider-free verification preflight…");
   }
@@ -514,7 +677,7 @@ async function loadPipelineQueue({ quiet = false } = {}) {
       const payload = await api(
         `/api/review/verification/preflight?${params}`,
       );
-      if (sequence !== state.pipelineRequestSequence) {
+      if (!mayCommit()) {
         return false;
       }
       responses.push(payload);
@@ -534,7 +697,7 @@ async function loadPipelineQueue({ quiet = false } = {}) {
       afterListingId = checkpoint.resumeAfterListingId;
     } while (true);
 
-    if (sequence !== state.pipelineRequestSequence) {
+    if (!mayCommit()) {
       return false;
     }
     state.pipelineResponses = responses;
@@ -563,7 +726,7 @@ async function loadPipelineQueue({ quiet = false } = {}) {
     }
     return true;
   } catch (error) {
-    if (sequence === state.pipelineRequestSequence) {
+    if (mayCommit()) {
       setQueueMessage(
         `Could not load verification pipeline: ${error.message}`,
         true,
@@ -573,6 +736,8 @@ async function loadPipelineQueue({ quiet = false } = {}) {
   } finally {
     if (sequence === state.pipelineRequestSequence) {
       elements.reviewPipelineResults.setAttribute("aria-busy", "false");
+    }
+    if (uiGeneration === state.reviewLoadUiGeneration) {
       setButtonBusy(elements.refreshReviews, false);
     }
   }
@@ -1251,6 +1416,8 @@ function updateOpenedListingRunProgress(run) {
 }
 
 async function reconcileCompletedVerificationRun(run, sequence) {
+  const routeGeneration = state.routeGeneration;
+  const routeOwner = captureListingRouteOwner();
   await Promise.allSettled([
     loadPipelineQueue({ quiet: true }),
     loadQueue({ quiet: true }),
@@ -1268,7 +1435,16 @@ async function reconcileCompletedVerificationRun(run, sequence) {
   renderVerificationRun();
   renderPipelineTable();
   renderPipelineSelection();
-  const listingId = currentListingId();
+  if (state.routeGeneration !== routeGeneration) {
+    return;
+  }
+  if (routeOwner === null) {
+    setQueueMessage(
+      `Automatic acceptance run #${run.id} ${run.status}. Review the terminal results below.`,
+    );
+    return;
+  }
+  const listingId = routeOwner.listingId;
   const item = state.activeVerificationRunItemByListing.get(listingId);
   if (!item) {
     setQueueMessage(
@@ -1278,16 +1454,24 @@ async function reconcileCompletedVerificationRun(run, sequence) {
   }
   const status = verificationRunStatusView(item.status);
   if (item.status === "verified") {
-    await leaveAutomaticallyVerifiedReview(listingId, state.reviews.slice(), status.label);
+    setAutomaticVerificationBusy(false);
+    await leaveAutomaticallyVerifiedReview(
+      listingId,
+      state.reviews.slice(),
+      status.label,
+      routeOwner,
+    );
     return;
   }
   const refreshedRow = pipelineRowForListing(listingId);
   if (refreshedRow?.hasPendingReview) {
     await openReview(listingId, {
-      historyMode: "none",
       discardDraft: true,
       force: true,
     });
+  }
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
   }
   setWorkspaceMessage(
     `${status.label}: ${verificationRunItemDetail(item, status.detail)}`,
@@ -1297,6 +1481,7 @@ async function reconcileCompletedVerificationRun(run, sequence) {
 
 async function loadProductQueue({ quiet = false, commitGuard = null } = {}) {
   const sequence = ++state.productRequestSequence;
+  const uiGeneration = ++state.reviewLoadUiGeneration;
   const mayCommit = () => (
     sequence === state.productRequestSequence
     && (commitGuard === null || commitGuard())
@@ -1368,6 +1553,8 @@ async function loadProductQueue({ quiet = false, commitGuard = null } = {}) {
   } finally {
     if (sequence === state.productRequestSequence) {
       elements.reviewProductResults.setAttribute("aria-busy", "false");
+    }
+    if (uiGeneration === state.reviewLoadUiGeneration) {
       setButtonBusy(elements.refreshReviews, false);
     }
   }
@@ -1526,7 +1713,8 @@ async function openProductReview(productId) {
     };
     elements.reviewProductStructureMessage.textContent = "";
     state.productAssociations = detail.associations;
-    renderSelectedProduct();
+    renderSelectedProduct({ populateAttestation: true });
+    resetProductDraftDirty();
     return { status: "loaded" };
   } catch (error) {
     if (!productDetailRequestMayCommit(productId, sequence, state)) {
@@ -1536,6 +1724,7 @@ async function openProductReview(productId) {
       if (state.selectedProduct?.id === productId) {
         state.selectedProduct = null;
         state.productAssociations = [];
+        resetProductDraftDirty();
       }
       elements.reviewProductWorkspace.classList.add("is-hidden");
       elements.reviewProductActionMessage.textContent = "";
@@ -1547,7 +1736,34 @@ async function openProductReview(productId) {
   }
 }
 
-function renderSelectedProduct() {
+async function replaceAbsentProductRoute(result, routeOwner) {
+  const fallback = reviewProductFallbackForResult(
+    result,
+    routeOwner,
+    state.route,
+  );
+  if (fallback === null) {
+    return false;
+  }
+  await navigate(fallback, { replace: true });
+  return true;
+}
+
+function closeProductReview() {
+  if (state.productStructureSearchTimer !== null) {
+    window.clearTimeout(state.productStructureSearchTimer);
+    state.productStructureSearchTimer = null;
+  }
+  state.productStructureSearchSequence += 1;
+  state.productDetailRequestSequence += 1;
+  state.selectedProduct = null;
+  state.productAssociations = [];
+  resetProductDraftDirty();
+  elements.reviewProductWorkspace.classList.add("is-hidden");
+  elements.reviewProductActionMessage.textContent = "";
+}
+
+function renderSelectedProduct({ populateAttestation = false } = {}) {
   const selected = state.selectedProduct;
   if (!selected) {
     elements.reviewProductWorkspace.classList.add("is-hidden");
@@ -1596,19 +1812,45 @@ function renderSelectedProduct() {
   elements.reviewProductRecover.disabled = !current
     || summary.needsSourceRecovery === 0
     || state.productBusy;
-  if (!current) {
+  if (!current && populateAttestation) {
     const form = elements.reviewProductAttestationForm.elements;
     const draft = productAttestationDraft(product);
-    form.namedItem("identity_source_url").value = draft.sourceUrl;
-    form.namedItem("identity_source_title").value = draft.sourceTitle;
-    form.namedItem("identity_evidence_text").value = draft.evidenceText;
-    form.namedItem("identity_source_title").dispatchEvent(new Event("input"));
-    form.namedItem("identity_evidence_text").dispatchEvent(new Event("input"));
+    state.settingProductDraft = true;
+    try {
+      form.namedItem("identity_source_url").value = draft.sourceUrl;
+      form.namedItem("identity_source_title").value = draft.sourceTitle;
+      form.namedItem("identity_evidence_text").value = draft.evidenceText;
+      form.namedItem("identity_source_title").dispatchEvent(new Event("input"));
+      form.namedItem("identity_evidence_text").dispatchEvent(new Event("input"));
+    } finally {
+      state.settingProductDraft = false;
+    }
   }
   renderProductAssociationRows();
   elements.reviewProductActionMessage.textContent = current
     ? productAssociationActionSummary(summary)
     : "This OEM source is needed only for automated bulk validation. Reviewers can still approve each listing association directly from its avionics card.";
+}
+
+function productDraftDirty() {
+  return state.productAttestationDirty || state.productStructureDirty;
+}
+
+function resetProductDraftDirty() {
+  state.productAttestationDirty = false;
+  state.productStructureDirty = false;
+}
+
+function markProductAttestationDirty() {
+  if (!state.settingProductDraft && state.selectedProduct !== null) {
+    state.productAttestationDirty = true;
+  }
+}
+
+function markProductStructureDirty() {
+  if (state.selectedProduct !== null) {
+    state.productStructureDirty = true;
+  }
 }
 
 function productStructureDraft(product) {
@@ -1686,6 +1928,7 @@ function renderExistingProductStructureEditor() {
   scope.disabled = state.productBusy;
   scope.addEventListener("change", () => {
     draft.valuationScope = scope.value;
+    markProductStructureDirty();
     elements.reviewProductStructureMessage.textContent = "";
     renderExistingProductStructureEditor();
   });
@@ -1762,6 +2005,7 @@ function existingProductStructureComponent(component, selected, draft) {
   quantity.disabled = state.productBusy;
   quantity.addEventListener("input", () => {
     component.quantity = Number.parseInt(quantity.value, 10);
+    markProductStructureDirty();
     const validation = productStructureValidation(selected, draft);
     elements.reviewProductStructureMessage.textContent = validation.message;
   });
@@ -1775,6 +2019,7 @@ function existingProductStructureComponent(component, selected, draft) {
     draft.suiteComponents = draft.suiteComponents.filter(
       (candidate) => candidate.avionicsModelId !== component.avionicsModelId,
     );
+    markProductStructureDirty();
     elements.reviewProductStructureMessage.textContent = `${component.displayName} removed from the draft component set.`;
     renderExistingProductStructureEditor();
   });
@@ -1852,6 +2097,7 @@ async function searchExistingProductStructureComponents(query, sequence, results
         valuationScope: product.valuationScope,
         quantity: 1,
       });
+      markProductStructureDirty();
       elements.reviewProductStructureMessage.textContent = `${product.displayName} added to the draft component set.`;
       renderExistingProductStructureEditor();
     })));
@@ -1915,6 +2161,7 @@ async function saveExistingProductStructure(event) {
     };
     selected.catalogRevision = catalogRevision;
     selected.structureDraft = productStructureDraft(selected.product);
+    state.productStructureDirty = false;
     renderSelectedProduct();
     elements.reviewProductStructureMessage.textContent =
       `Saved ${productKindLabel(normalizedProduct(selected.product))} structure for catalog product ${selected.id}.`;
@@ -2027,6 +2274,7 @@ async function attestSelectedProduct(event) {
     return;
   }
   const action = beginProductAction(selected);
+  let detailResult = null;
   elements.reviewProductActionMessage.textContent =
     "Fetching the OEM source and checking the immutable product identity…";
   try {
@@ -2049,6 +2297,7 @@ async function attestSelectedProduct(event) {
       return;
     }
     state.selectedProduct.attestationStatus = "current";
+    state.productAttestationDirty = false;
     elements.reviewProductActionMessage.textContent = result?.reused
       ? "The reusable product source was already current; no source fetch was needed."
       : "Reusable product source verified from the guarded manufacturer source without Gemini.";
@@ -2059,7 +2308,7 @@ async function attestSelectedProduct(event) {
     if (!productActionContextIsCurrent(action, state)) {
       return;
     }
-    await openProductReview(action.productId);
+    detailResult = await openProductReview(action.productId);
   } catch (error) {
     if (!productActionContextIsCurrent(action, state)) {
       return;
@@ -2068,7 +2317,9 @@ async function attestSelectedProduct(event) {
     elements.reviewProductActionMessage.textContent =
       `${outcome.label}: ${outcome.detail}`;
   } finally {
-    finishProductAction(action);
+    if (finishProductAction(action)) {
+      await replaceAbsentProductRoute(detailResult, action.routeOwner);
+    }
   }
 }
 
@@ -2089,6 +2340,7 @@ async function validateSelectedProductAssociations() {
     return;
   }
   const action = beginProductAction(selected);
+  let detailResult = null;
   elements.reviewProductActionMessage.textContent =
     `Validating ${initialAssociations.length} associations locally…`;
   try {
@@ -2212,9 +2464,11 @@ async function validateSelectedProductAssociations() {
     if (!productActionContextIsCurrent(action, state)) {
       return;
     }
-    await openProductReview(action.productId);
+    detailResult = await openProductReview(action.productId);
   } finally {
-    finishProductAction(action);
+    if (finishProductAction(action)) {
+      await replaceAbsentProductRoute(detailResult, action.routeOwner);
+    }
   }
 }
 
@@ -2238,6 +2492,7 @@ async function recoverSelectedProductEvidence() {
     selected.attestationStatus,
   );
   const action = beginProductAction(selected);
+  let detailResult = null;
   elements.reviewProductActionMessage.textContent =
     `Recovering exact source text from ${listingCount} `
       + `${pluralize(listingCount, "listing")}…`;
@@ -2261,7 +2516,7 @@ async function recoverSelectedProductEvidence() {
     if (!productActionContextIsCurrent(action, state)) {
       return;
     }
-    const detailResult = await openProductReview(action.productId);
+    detailResult = await openProductReview(action.productId);
     if (detailResult.status !== "loaded" || state.selectedProduct?.id !== action.productId) {
       return;
     }
@@ -2278,7 +2533,9 @@ async function recoverSelectedProductEvidence() {
       failed ? `${failed} ${pluralize(failed, "listing")} could not be refreshed` : null,
     ].filter(nonBlank).join(" · ");
   } finally {
-    finishProductAction(action);
+    if (finishProductAction(action)) {
+      await replaceAbsentProductRoute(detailResult, action.routeOwner);
+    }
   }
 }
 
@@ -2287,6 +2544,7 @@ function beginProductAction(selected) {
     productId: selected.id,
     detailSequence: state.productDetailRequestSequence,
     actionSequence: state.productActionSequence + 1,
+    routeOwner: state.route,
   };
   state.productActionSequence = action.actionSequence;
   state.productBusyProductId = action.productId;
@@ -2299,10 +2557,11 @@ function finishProductAction(action) {
     state.productActionSequence !== action.actionSequence
     || state.productBusyProductId !== action.productId
   ) {
-    return;
+    return false;
   }
   state.productBusyProductId = null;
   setProductBusy(false);
+  return true;
 }
 
 function setProductBusy(busy) {
@@ -2329,8 +2588,13 @@ function setProductBusy(busy) {
   renderProductQueue();
 }
 
-async function loadQueue({ quiet = false } = {}) {
+async function loadQueue({ quiet = false, commitGuard = null } = {}) {
   const sequence = ++state.queueRequestSequence;
+  const uiGeneration = ++state.reviewLoadUiGeneration;
+  const mayCommit = () => (
+    sequence === state.queueRequestSequence
+    && (commitGuard === null || commitGuard())
+  );
   if (!quiet) {
     setQueueMessage("Loading review queue…");
   }
@@ -2338,7 +2602,7 @@ async function loadQueue({ quiet = false } = {}) {
   setButtonBusy(elements.refreshReviews, true);
   try {
     const payload = await api(`/api/review/listings?limit=${QUEUE_LIMIT}&offset=0`);
-    if (sequence !== state.queueRequestSequence) {
+    if (!mayCommit()) {
       return false;
     }
     const reviews = Array.isArray(payload?.reviews) ? payload.reviews.slice() : [];
@@ -2347,7 +2611,7 @@ async function loadQueue({ quiet = false } = {}) {
       const page = await api(
         `/api/review/listings?limit=${QUEUE_LIMIT}&offset=${reviews.length}`,
       );
-      if (sequence !== state.queueRequestSequence) {
+      if (!mayCommit()) {
         return false;
       }
       const items = Array.isArray(page?.reviews) ? page.reviews : [];
@@ -2377,13 +2641,15 @@ async function loadQueue({ quiet = false } = {}) {
     }
     return true;
   } catch (error) {
-    if (sequence === state.queueRequestSequence) {
+    if (mayCommit()) {
       setQueueMessage(`Could not load review queue: ${error.message}`, true);
     }
     return false;
   } finally {
     if (sequence === state.queueRequestSequence) {
       elements.reviewResults.setAttribute("aria-busy", "false");
+    }
+    if (uiGeneration === state.reviewLoadUiGeneration) {
       setButtonBusy(elements.refreshReviews, false);
     }
   }
@@ -2489,7 +2755,7 @@ function reviewReasonChips(values) {
 
 async function openReview(
   listingId,
-  { historyMode = "push", discardDraft = false, force = false } = {},
+  { discardDraft = false, force = false } = {},
 ) {
   if (!discardDraft && !confirmDiscardDraft()) {
     return;
@@ -2501,13 +2767,11 @@ async function openReview(
     && !state.stale
   ) {
     showWorkspace();
-    updateReviewLocation(listingId, historyMode);
+    setActiveReviewArea(state.activeArea);
     return;
   }
 
-  state.activeArea = historyMode === "none"
-    ? reviewAreaFromLocation() ?? "avionics"
-    : "avionics";
+  state.activeArea = reviewAreaForRoute(state.route, "avionics");
   cancelCatalogSearches();
   state.currentReview = null;
   state.drafts.clear();
@@ -2517,7 +2781,6 @@ async function openReview(
   state.resolving = false;
   state.savingAspectKey = null;
   showWorkspace();
-  updateReviewLocation(listingId, historyMode);
   setWorkspaceLoading(listingId);
 
   const sequence = ++state.detailRequestSequence;
@@ -2652,11 +2915,12 @@ function renderReview() {
   const aircraftBlockerCount = presentation.aircraft.blocking ? 1 : 0;
   elements.reviewAircraftTabCount.textContent = String(aircraftBlockerCount);
   elements.reviewAvionicsTabCount.textContent = String(avionicsAspects.length);
-  const requestedArea = reviewAreaFromLocation();
-  setActiveReviewArea(
-    requestedArea ?? presentation.defaultArea,
-    { updateLocation: requestedArea === null },
-  );
+  const requestedArea = reviewAreaForRoute(state.route);
+  if (requestedArea === null) {
+    navigateReviewArea(presentation.defaultArea);
+  } else {
+    setActiveReviewArea(requestedArea);
+  }
   elements.reviewStale.classList.add("is-hidden");
   setWorkspaceMessage("");
   updateProgress();
@@ -2691,7 +2955,7 @@ function reviewAreaElements(area) {
   };
 }
 
-function setActiveReviewArea(area, { focus = false, updateLocation = false } = {}) {
+function setActiveReviewArea(area) {
   const selectedArea = REVIEW_AREAS.includes(area) ? area : "avionics";
   state.activeArea = selectedArea;
   for (const candidate of REVIEW_AREAS) {
@@ -2701,12 +2965,37 @@ function setActiveReviewArea(area, { focus = false, updateLocation = false } = {
     tab.tabIndex = selected ? 0 : -1;
     panel.hidden = !selected;
   }
-  if (focus) {
+}
+
+function navigateReviewArea(area, { focus = false } = {}) {
+  const listingId = currentListingId();
+  if (listingId === null) {
+    return false;
+  }
+  const selectedArea = REVIEW_AREAS.includes(area) ? area : "avionics";
+  const result = navigate(reviewListingRoute(listingId, selectedArea), { replace: true });
+  if (result !== false && focus) {
     reviewAreaElements(selectedArea).tab.focus();
   }
-  if (updateLocation && currentListingId() !== null) {
-    updateReviewLocation(currentListingId(), "replace");
+  return result;
+}
+
+async function navigateAndCommitReviewRoute(route, options, commit) {
+  const activation = navigate(route, options);
+  if (activation === false) {
+    return false;
   }
+  const routeOwner = state.route;
+  const routeGeneration = state.routeGeneration;
+  await activation;
+  if (
+    !routeActivationIsCurrent(routeOwner, state.route)
+    || routeGeneration !== state.routeGeneration
+  ) {
+    return false;
+  }
+  commit();
+  return true;
 }
 
 function handleReviewTabKeydown(event, area) {
@@ -2725,9 +3014,8 @@ function handleReviewTabKeydown(event, area) {
     return;
   }
   event.preventDefault();
-  setActiveReviewArea(REVIEW_AREAS[nextIndex], {
+  navigateReviewArea(REVIEW_AREAS[nextIndex], {
     focus: true,
-    updateLocation: true,
   });
 }
 
@@ -2924,7 +3212,6 @@ async function submitAircraftRepair(review, repair, endpoint, body, confirmation
       throw new Error("The server returned an invalid aircraft correction result.");
     }
     await openReview(review.listing_id, {
-      historyMode: "none",
       discardDraft: true,
       force: true,
     });
@@ -4194,6 +4481,7 @@ async function rebuildAvionicsReview() {
   )) {
     return;
   }
+  const routeOwner = captureListingRouteOwner();
   setAutomaticVerificationBusy(true);
   setWorkspaceMessage("Rebuilding avionics cards from the retained extraction…");
   try {
@@ -4206,6 +4494,9 @@ async function rebuildAvionicsReview() {
         }),
       },
     );
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     if (payload?.status === "blocked") {
       setWorkspaceMessage(
         `Cards were not changed. ${avionicsRebuildBlockMessage(payload.reason_code)}`,
@@ -4217,10 +4508,12 @@ async function rebuildAvionicsReview() {
       throw new Error("The server returned an invalid avionics rebuild result.");
     }
     if (payload.review_complete === true) {
+      setAutomaticVerificationBusy(false);
       await leaveAutomaticallyVerifiedReview(
         review.listing_id,
         state.reviews.slice(),
         "The rebuilt avionics review is complete",
+        routeOwner,
       );
       return;
     }
@@ -4235,22 +4528,38 @@ async function rebuildAvionicsReview() {
       "Avionics cards were rebuilt locally from the strict retained extraction.",
     );
   } catch (error) {
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     if (isStaleError(error)) {
       markStale(error.message);
     } else {
       setWorkspaceMessage(`Could not rebuild avionics cards: ${error.message}`, true);
     }
   } finally {
-    setAutomaticVerificationBusy(false);
+    setAutomaticVerificationBusy(false, {
+      updateView: listingRouteOwnerIsCurrent(routeOwner),
+    });
   }
 }
 
-async function leaveAutomaticallyVerifiedReview(listingId, previousQueue, label) {
+async function leaveAutomaticallyVerifiedReview(
+  listingId,
+  previousQueue,
+  label,
+  routeOwner,
+) {
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
   state.correctionViews.clear();
   const queueRefreshed = await loadQueue({ quiet: true });
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   if (!queueRefreshed) {
     state.reviews = previousQueue.filter(
       (item) => positiveInteger(item?.listing_id) !== listingId,
@@ -4262,25 +4571,30 @@ async function leaveAutomaticallyVerifiedReview(listingId, previousQueue, label)
     Promise.resolve(refreshListings?.()),
     Promise.resolve(refreshAvionics?.()),
   ]);
-  const nextId = nextAfterResolved(previousQueue, listingId);
-  if (nextId !== null) {
-    await openReview(nextId, {
-      historyMode: "replace",
-      discardDraft: true,
-      force: true,
-    });
-    setWorkspaceMessage(`${label}. Loaded the next pending review.`);
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
     return;
   }
-  showQueue({ historyMode: "replace", discardDraft: true });
-  setQueueMessage(
-    state.total === 0
-      ? `${label}. The review queue is clear.`
-      : `${label}.`,
+  const nextId = nextAfterResolved(previousQueue, listingId);
+  if (nextId !== null) {
+    await navigateAndCommitReviewRoute(
+      reviewListingRoute(nextId),
+      { replace: true },
+      () => setWorkspaceMessage(`${label}. Loaded the next pending review.`),
+    );
+    return;
+  }
+  await navigateAndCommitReviewRoute(
+    reviewQueueRoute("listing"),
+    { replace: true },
+    () => setQueueMessage(
+      state.total === 0
+        ? `${label}. The review queue is clear.`
+        : `${label}.`,
+    ),
   );
 }
 
-function setAutomaticVerificationBusy(busy) {
+function setAutomaticVerificationBusy(busy, { updateView = true } = {}) {
   if (state.automating === busy) {
     return;
   }
@@ -4302,8 +4616,10 @@ function setAutomaticVerificationBusy(busy) {
     }
   }
   state.automationControlStates.clear();
-  updateProgress();
-  updateNextButton();
+  if (updateView) {
+    updateProgress();
+    updateNextButton();
+  }
 }
 
 async function resolveReview() {
@@ -4322,7 +4638,7 @@ async function resolveReview() {
       "Aircraft catalog curation and FAA verification must be completed before this listing can be verified.",
       true,
     );
-    setActiveReviewArea("aircraft", { updateLocation: true });
+    navigateReviewArea("aircraft");
     updateProgress();
     return;
   }
@@ -4334,7 +4650,7 @@ async function resolveReview() {
       "Two retained occurrences select the same canonical avionics product. Keep one occurrence with the exact source-supported quantity, discard a duplicate observation, or select the genuinely different product variant.",
       true,
     );
-    setActiveReviewArea("avionics", { updateLocation: true });
+    navigateReviewArea("avionics");
     state.aspectViews.get(firstConflictKey)?.article.scrollIntoView({
       behavior: "smooth",
       block: "start",
@@ -4345,7 +4661,7 @@ async function resolveReview() {
   }
   if (drafts.some((draft) => !validateDraft(draft).valid)) {
     setWorkspaceMessage("Resolve every residual avionics occurrence before completing the manual review.", true);
-    setActiveReviewArea("avionics", { updateLocation: true });
+    navigateReviewArea("avionics");
     const firstInvalid = drafts.find((draft) => !validateDraft(draft).valid);
     state.aspectViews.get(aspectKey(firstInvalid?.aspect?.id))?.article.scrollIntoView({
       behavior: "smooth",
@@ -4363,6 +4679,7 @@ async function resolveReview() {
   };
   const previousQueue = state.reviews.slice();
   const resolvedListingId = review.listing_id;
+  const routeOwner = captureListingRouteOwner();
   state.resolving = true;
   updateProgress();
   setWorkspaceMessage("Saving the manual review and completing final enrichment…");
@@ -4372,6 +4689,9 @@ async function resolveReview() {
       method: "POST",
       body: JSON.stringify(request),
     });
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     const outcome = describeResolvedListingOutcome(payload, resolvedListingId);
     if (!outcome.terminal) {
       throw new Error(outcome.detail);
@@ -4381,6 +4701,9 @@ async function resolveReview() {
     state.aspectViews.clear();
     state.correctionViews.clear();
     const queueRefreshed = await loadQueue({ quiet: true });
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     if (!queueRefreshed) {
       state.reviews = previousQueue.filter(
         (item) => positiveInteger(item?.listing_id) !== resolvedListingId,
@@ -4392,31 +4715,42 @@ async function resolveReview() {
       Promise.resolve(refreshListings?.()),
       Promise.resolve(refreshAvionics?.()),
     ]);
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
+    state.resolving = false;
     const nextId = nextAfterResolved(previousQueue, resolvedListingId);
     if (nextId !== null) {
-      await openReview(nextId, {
-        historyMode: "replace",
-        discardDraft: true,
-        force: true,
-      });
-      setWorkspaceMessage(`${outcome.label}. Loaded the next pending review.`);
+      await navigateAndCommitReviewRoute(
+        reviewListingRoute(nextId),
+        { replace: true },
+        () => setWorkspaceMessage(`${outcome.label}. Loaded the next pending review.`),
+      );
     } else {
-      showQueue({ historyMode: "replace", discardDraft: true });
-      setQueueMessage(
-        state.total === 0
-          ? `${outcome.label}. The review queue is clear.`
-          : `${outcome.label}.`,
+      await navigateAndCommitReviewRoute(
+        reviewQueueRoute("listing"),
+        { replace: true },
+        () => setQueueMessage(
+          state.total === 0
+            ? `${outcome.label}. The review queue is clear.`
+            : `${outcome.label}.`,
+        ),
       );
     }
   } catch (error) {
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     if (isAvionicsCatalogConsolidated(error)) {
       state.resolving = false;
       await Promise.allSettled([
         loadQueue({ quiet: true }),
         Promise.resolve(refreshAvionics?.()),
       ]);
+      if (!listingRouteOwnerIsCurrent(routeOwner)) {
+        return;
+      }
       await openReview(resolvedListingId, {
-        historyMode: "none",
         discardDraft: true,
         force: true,
       });
@@ -4431,16 +4765,23 @@ async function resolveReview() {
     } else if (isStaleError(error)) {
       markStale(error.message);
     } else if (isFinalizationError(error)) {
+      state.resolving = false;
       await recoverCommittedResolution(
         resolvedListingId,
         `Review decisions were saved, but listing ${resolvedListingId} was quarantined during final enrichment: ${error.message}`,
+        routeOwner,
       );
     } else if (shouldReconcileResolution(error)) {
       const stillPending = await pendingReviewStatus(resolvedListingId);
+      if (!listingRouteOwnerIsCurrent(routeOwner)) {
+        return;
+      }
       if (stillPending === false) {
+        state.resolving = false;
         await recoverCommittedResolution(
           resolvedListingId,
           `Review decisions were saved, but the response was interrupted. Inspect listing ${resolvedListingId} to confirm its final enrichment state.`,
+          routeOwner,
         );
       } else {
         showAspectResolutionError(error);
@@ -4450,9 +4791,11 @@ async function resolveReview() {
     }
   } finally {
     state.resolving = false;
-    setButtonBusy(elements.verifyListing, false);
-    syncAllAspectViews();
-    updateProgress();
+    if (listingRouteOwnerIsCurrent(routeOwner)) {
+      setButtonBusy(elements.verifyListing, false);
+      syncAllAspectViews();
+      updateProgress();
+    }
   }
 }
 
@@ -4508,6 +4851,7 @@ async function saveIndividualAspectDecision(key) {
     return;
   }
 
+  const routeOwner = captureListingRouteOwner();
   state.savingAspectKey = key;
   draft.savingDecision = true;
   draft.decisionError = "";
@@ -4557,7 +4901,7 @@ async function saveIndividualAspectDecision(key) {
     }
     if (isCompletedReviewMaintenanceResponse(payload)) {
       state.savingAspectKey = null;
-      await leaveCompletedOneByOneReview(review.listing_id, payload);
+      await leaveCompletedOneByOneReview(review.listing_id, payload, routeOwner);
       return;
     }
     const refreshed = payload?.review;
@@ -4608,10 +4952,13 @@ async function validateExistingAssociation(key, button) {
     || !draft
     || targetId === null
     || !listingAssociationCanValidateLocally(draft.aspect)
+    || state.validatingAspectKey !== null
     || state.stale
   ) {
     return;
   }
+  const routeOwner = captureListingRouteOwner();
+  state.validatingAspectKey = key;
   button.disabled = true;
   setWorkspaceMessage(`Validating this listing association against catalog product ${targetId}…`);
   try {
@@ -4626,9 +4973,13 @@ async function validateExistingAssociation(key, button) {
         )),
       },
     );
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     const refreshed = payload?.review;
     if (isCompletedReviewMaintenanceResponse(payload)) {
-      await leaveCompletedOneByOneReview(review.listing_id, payload);
+      state.validatingAspectKey = null;
+      await leaveCompletedOneByOneReview(review.listing_id, payload, routeOwner);
       return;
     }
     if (!isReviewDetail(refreshed, review.listing_id)) {
@@ -4644,6 +4995,9 @@ async function validateExistingAssociation(key, button) {
       `The listing text matched catalog product ${targetId}. Review the remaining aspects.`,
     );
   } catch (error) {
+    if (!listingRouteOwnerIsCurrent(routeOwner)) {
+      return;
+    }
     if (isStaleError(error)) {
       markStale(error.message);
     } else {
@@ -4651,10 +5005,17 @@ async function validateExistingAssociation(key, button) {
       setWorkspaceMessage(`${outcome.label}: ${outcome.detail}`, true);
       button.disabled = false;
     }
+  } finally {
+    if (state.validatingAspectKey === key) {
+      state.validatingAspectKey = null;
+    }
   }
 }
 
-async function leaveCompletedOneByOneReview(listingId, outcome) {
+async function leaveCompletedOneByOneReview(listingId, outcome, routeOwner) {
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
@@ -4665,32 +5026,41 @@ async function leaveCompletedOneByOneReview(listingId, outcome) {
   state.total = Math.max(0, state.total - 1);
   renderQueue();
   await loadQueue({ quiet: true });
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   await Promise.allSettled([
     Promise.resolve(refreshListings?.()),
     Promise.resolve(refreshAvionics?.()),
   ]);
-  showQueue({ historyMode: "replace", discardDraft: true });
-  const listingReady = outcome?.listing_ready === true;
-  const listingVerified = outcome?.listing_verified === true;
-  const finalizationError = optionalText(outcome?.finalization_error);
-  if (listingReady && listingVerified) {
-    setQueueMessage(
-      state.total === 0
-        ? `Listing ${listingId} is verified and ready. The review queue is clear.`
-        : `Listing ${listingId} is verified and ready.`,
-    );
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
     return;
   }
-  if (nonBlank(finalizationError)) {
-    setQueueMessage(
-      `The final avionics decision for listing ${listingId} was saved, but the listing could not be verified: ${finalizationError}`,
-      true,
-    );
-    return;
-  }
-  setQueueMessage(
-    `The review decisions for listing ${listingId} were saved, but the server did not confirm that the listing is verified and ready.`,
-    true,
+  await navigateAndCommitReviewRoute(
+    reviewQueueRoute("listing"),
+    { replace: true },
+    () => {
+      const listingReady = outcome?.listing_ready === true;
+      const listingVerified = outcome?.listing_verified === true;
+      const finalizationError = optionalText(outcome?.finalization_error);
+      if (listingReady && listingVerified) {
+        setQueueMessage(
+          state.total === 0
+            ? `Listing ${listingId} is verified and ready. The review queue is clear.`
+            : `Listing ${listingId} is verified and ready.`,
+        );
+      } else if (nonBlank(finalizationError)) {
+        setQueueMessage(
+          `The final avionics decision for listing ${listingId} was saved, but the listing could not be verified: ${finalizationError}`,
+          true,
+        );
+      } else {
+        setQueueMessage(
+          `The review decisions for listing ${listingId} were saved, but the server did not confirm that the listing is verified and ready.`,
+          true,
+        );
+      }
+    },
   );
 }
 
@@ -4706,7 +5076,10 @@ async function pendingReviewStatus(listingId) {
   }
 }
 
-async function recoverCommittedResolution(listingId, message) {
+async function recoverCommittedResolution(listingId, message, routeOwner) {
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
@@ -4717,12 +5090,21 @@ async function recoverCommittedResolution(listingId, message) {
   state.total = Math.max(0, state.total - 1);
   renderQueue();
   await loadQueue({ quiet: true });
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
   await Promise.allSettled([
     Promise.resolve(refreshListings?.()),
     Promise.resolve(refreshAvionics?.()),
   ]);
-  showQueue({ historyMode: "replace", discardDraft: true });
-  setQueueMessage(message, true);
+  if (!listingRouteOwnerIsCurrent(routeOwner)) {
+    return;
+  }
+  await navigateAndCommitReviewRoute(
+    reviewQueueRoute("listing"),
+    { replace: true },
+    () => setQueueMessage(message, true),
+  );
 }
 
 function decisionFromDraft(draft) {
@@ -5181,13 +5563,13 @@ function renderReviewLoadError(listingId, error) {
   retry.className = "button";
   retry.textContent = "Try again";
   retry.addEventListener("click", () => {
-    openReview(listingId, { historyMode: "none", discardDraft: true, force: true });
+    openReview(listingId, { discardDraft: true, force: true });
   });
   errorState.append(retry);
   elements.reviewAvionicsAspects.replaceChildren(errorState);
   elements.reviewAircraftTabCount.textContent = "0";
   elements.reviewAvionicsTabCount.textContent = "0";
-  setActiveReviewArea("avionics", { updateLocation: true });
+  setActiveReviewArea(reviewAreaForRoute(state.route, "avionics"));
   elements.automaticallyVerifyListing.disabled = true;
   elements.rebuildAvionicsReview.disabled = true;
   elements.verifyListing.disabled = true;
@@ -5240,7 +5622,7 @@ function showWorkspace() {
   elements.reviewWorkspace.classList.remove("is-hidden");
 }
 
-function showQueue({ historyMode = "push", discardDraft = false } = {}) {
+function showQueue({ discardDraft = false, load = true } = {}) {
   if (!discardDraft && !confirmDiscardDraft()) {
     return false;
   }
@@ -5260,7 +5642,9 @@ function showQueue({ historyMode = "push", discardDraft = false } = {}) {
   elements.rebuildAvionicsReview.disabled = true;
   elements.reviewWorkspace.classList.add("is-hidden");
   elements.reviewQueueView.classList.remove("is-hidden");
-  updateReviewLocation(null, historyMode);
+  if (!load) {
+    return true;
+  }
   if (state.queueMode === "pipeline" && !state.pipelineLoaded) {
     loadPipelineQueue();
   } else if (state.queueMode === "product" && !state.productGroups.length) {
@@ -5271,38 +5655,9 @@ function showQueue({ historyMode = "push", discardDraft = false } = {}) {
   return true;
 }
 
-function updateReviewLocation(listingId, mode) {
-  if (mode === "none") {
-    return;
-  }
-  const url = new URL(window.location.href);
-  if (listingId === null) {
-    url.searchParams.delete(REVIEW_LISTING_PARAM);
-    url.searchParams.delete(REVIEW_AREA_PARAM);
-  } else {
-    url.searchParams.set(REVIEW_LISTING_PARAM, String(listingId));
-    url.searchParams.set(REVIEW_AREA_PARAM, state.activeArea);
-  }
-  const method = mode === "replace" ? "replaceState" : "pushState";
-  window.history[method](
-    { reviewListingId: listingId, reviewArea: listingId === null ? null : state.activeArea },
-    "",
-    url,
-  );
-}
-
-function reviewListingIdFromLocation() {
-  const value = new URL(window.location.href).searchParams.get(REVIEW_LISTING_PARAM);
-  return positiveInteger(value);
-}
-
-function reviewAreaFromLocation() {
-  const value = new URL(window.location.href).searchParams.get(REVIEW_AREA_PARAM);
-  return REVIEW_AREAS.includes(value) ? value : null;
-}
-
 function currentListingId() {
-  return positiveInteger(state.currentReview?.listing_id) ?? reviewListingIdFromLocation();
+  return positiveInteger(state.currentReview?.listing_id)
+    ?? reviewListingIdForRoute(state.route);
 }
 
 function updateNextButton(listingId = currentListingId()) {
