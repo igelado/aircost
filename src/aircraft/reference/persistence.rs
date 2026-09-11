@@ -2308,17 +2308,13 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::raw_sql(include_str!("../../../schema/postgres.sql"))
-            .execute(&pool)
-            .await
-            .unwrap();
+        let db = AppDb::connect(&database_url).await.unwrap();
         sqlx::raw_sql(include_str!(
             "../../../tests/schema/aircraft_reference_catalog.postgres.sql"
         ))
         .execute(&pool)
         .await
         .unwrap();
-        let db = AppDb::connect(&database_url).await.unwrap();
 
         let null_configuration_decision: i64 = sqlx::query_scalar(
             r#"

@@ -15,8 +15,8 @@ use sqlx::{Connection, PgConnection, SqliteConnection};
 use super::current::CurrentCatalogProjection;
 use super::{canonical_row, primary_key_predicate, quoted_identifier, ProjectionRow};
 use crate::db::{
-    canonical_startup_migration_contract_receipts, AppDb, DatabaseBackend, DatabaseKind,
-    DEVELOPER_EMAIL,
+    canonical_startup_migration_contract_receipts, current_migration_history_rows_are_exact, AppDb,
+    DatabaseBackend, DatabaseKind, MigrationHistoryRow, DEVELOPER_EMAIL,
 };
 use crate::listing::replay::{authenticate_retained_capture, RetainedCaptureAuthentication};
 
@@ -24,6 +24,7 @@ const POSTGRES_SEED_ADVISORY_LOCK_KEY: i64 = 0x0041_4952_5345_4544;
 
 const CLEAN_TARGET_NONEMPTY_TABLES: &[&str] = &[
     "schema_migration_contracts",
+    "schema_migration_history",
     "users",
     "plugin_installs",
     "plugin_submissions",
@@ -327,6 +328,7 @@ async fn validate_clean_target_with_tables(
 
 async fn validate_schema_bootstrap(target: &mut SeedConnection<'_>) -> Result<()> {
     validate_schema_migration_contracts(target).await?;
+    validate_schema_migration_history(target).await?;
     require_exact_count(
         target,
         "aircraft_markets",
@@ -368,6 +370,56 @@ async fn validate_schema_bootstrap(target: &mut SeedConnection<'_>) -> Result<()
         1,
     )
     .await?;
+    Ok(())
+}
+
+async fn validate_schema_migration_history(target: &mut SeedConnection<'_>) -> Result<()> {
+    let (kind, actual): (DatabaseKind, Vec<MigrationHistoryRow>) = match target {
+        SeedConnection::Sqlite(connection) => (
+            DatabaseKind::Sqlite,
+            sqlx::query_as(
+                "SELECT sequence_number, migration_name, backend_applicability, \
+                        script_sha256, provenance, installed_at \
+                 FROM schema_migration_history ORDER BY sequence_number",
+            )
+            .fetch_all(&mut **connection)
+            .await?,
+        ),
+        SeedConnection::Postgres(connection) => (
+            DatabaseKind::Postgres,
+            sqlx::query_as(
+                "SELECT sequence_number, migration_name, backend_applicability, \
+                        script_sha256, provenance, installed_at::text AS installed_at \
+                 FROM ONLY public.schema_migration_history ORDER BY sequence_number",
+            )
+            .fetch_all(&mut **connection)
+            .await?,
+        ),
+    };
+    if !current_migration_history_rows_are_exact(kind, &actual)? {
+        bail!("clean catalog target has non-canonical ordered migration history");
+    }
+    let invalid_installed_at = match target {
+        SeedConnection::Sqlite(connection) => {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM schema_migration_history \
+                 WHERE julianday(installed_at) IS NULL",
+            )
+            .fetch_one(&mut **connection)
+            .await?
+        }
+        SeedConnection::Postgres(connection) => {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM ONLY public.schema_migration_history \
+                 WHERE installed_at IS NULL",
+            )
+            .fetch_one(&mut **connection)
+            .await?
+        }
+    };
+    if invalid_installed_at != 0 {
+        bail!("clean catalog target has invalid ordered migration timestamps");
+    }
     Ok(())
 }
 
@@ -1201,6 +1253,7 @@ mod tests {
         assert!(allowlist.contains("plugin_submissions"));
         assert!(allowlist.contains("listing_replay_submission_inventory_lock"));
         assert!(allowlist.contains("schema_migration_contracts"));
+        assert!(allowlist.contains("schema_migration_history"));
         assert!(!allowlist.contains("aircraft_sale_listings"));
         assert!(!allowlist.contains("avionics_models"));
         assert!(!allowlist.contains("gemini_api_usage"));
@@ -1677,6 +1730,66 @@ mod tests {
         let DatabaseBackend::Sqlite(pool) = target.backend() else {
             panic!("catalog seed target must be SQLite")
         };
+
+        // An adopted clean target has one coherent lineage: every historical
+        // adopt-only row was shape-attested and the atomic bootstrap applied.
+        pool.execute("DROP TRIGGER schema_migration_history_immutable_update")
+            .await
+            .unwrap();
+        pool.execute(
+            "UPDATE schema_migration_history SET provenance = CASE \
+               WHEN sequence_number < 34 THEN 'shape_attested_legacy_adoption' \
+               ELSE 'applied' END",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TRIGGER schema_migration_history_immutable_update \
+             BEFORE UPDATE ON schema_migration_history BEGIN \
+             SELECT RAISE(ABORT, 'schema migration history is immutable'); END",
+        )
+        .await
+        .unwrap();
+        inspect_clean_target(&target, &projection).await.unwrap();
+
+        pool.execute("DROP TRIGGER schema_migration_history_immutable_update")
+            .await
+            .unwrap();
+        pool.execute(
+            "UPDATE schema_migration_history SET provenance='canonical' \
+             WHERE sequence_number=1",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TRIGGER schema_migration_history_immutable_update \
+             BEFORE UPDATE ON schema_migration_history BEGIN \
+             SELECT RAISE(ABORT, 'schema migration history is immutable'); END",
+        )
+        .await
+        .unwrap();
+        assert!(inspect_clean_target(&target, &projection)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("non-canonical ordered migration history"));
+        pool.execute("DROP TRIGGER schema_migration_history_immutable_update")
+            .await
+            .unwrap();
+        pool.execute(
+            "UPDATE schema_migration_history \
+             SET provenance='shape_attested_legacy_adoption' \
+             WHERE sequence_number=1",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TRIGGER schema_migration_history_immutable_update \
+             BEFORE UPDATE ON schema_migration_history BEGIN \
+             SELECT RAISE(ABORT, 'schema migration history is immutable'); END",
+        )
+        .await
+        .unwrap();
 
         sqlx::query("UPDATE users SET display_name = 'Drifted' WHERE email = ?")
             .bind(DEVELOPER_EMAIL)

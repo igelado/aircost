@@ -271,7 +271,8 @@ expect_guard_failure() {
 mapfile -t receipt_postgres_migrations < <(
   grep -El '^INSERT INTO public[.]schema_migration_contracts' \
     "$repository_root"/migrations/*.postgres.sql |
-    sed -E 's|.*/([^/]+)[.]postgres[.]sql|\1|' | sort
+    sed -E 's|.*/([^/]+)[.]postgres[.]sql|\1|' |
+    grep -v '^20260910_versioned_migration_history$' | sort
 )
 test "${#receipt_postgres_migrations[@]}" = 25
 test "${#all_postgres_migrations[@]}" = 25
