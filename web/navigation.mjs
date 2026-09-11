@@ -31,7 +31,7 @@ export function createTaskNavigation({
   }
 
   const mobile = matchMedia(MOBILE_NAVIGATION_QUERY);
-  let focusWasInMenu = false;
+  let navigationFocusOwner = "outside";
   let open = false;
 
   function setOpen(next) {
@@ -71,7 +71,13 @@ export function createTaskNavigation({
   }
 
   function handleDocumentFocus(event) {
-    focusWasInMenu = menu.contains(event.target);
+    if (event.target === toggle) {
+      navigationFocusOwner = "toggle";
+    } else if (menu.contains(event.target)) {
+      navigationFocusOwner = "menu";
+    } else {
+      navigationFocusOwner = "outside";
+    }
   }
 
   function handleLinkClick(event) {
@@ -85,9 +91,19 @@ export function createTaskNavigation({
   }
 
   function handleViewportChange() {
+    if (
+      !mobile.matches
+      && (document.activeElement === toggle || navigationFocusOwner === "toggle")
+    ) {
+      close();
+      const destination = links.find((link) => link.getAttribute?.("aria-current") === "page")
+        ?? links[0];
+      destination?.focus();
+      return;
+    }
     close({
       returnFocus: mobile.matches
-        && (menu.contains(document.activeElement) || focusWasInMenu),
+        && (menu.contains(document.activeElement) || navigationFocusOwner === "menu"),
     });
   }
 

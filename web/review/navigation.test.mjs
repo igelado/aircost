@@ -443,6 +443,41 @@ test("closes with Escape or outside click and returns focus only when appropriat
     "collapsing desktop navigation returns focus from its newly hidden link",
   );
 
+  const expanded = navigationHarness({ width: 760 });
+  expanded.links[2].setAttribute("aria-current", "page");
+  expanded.toggle.focus();
+  expanded.media.setWidth(761);
+  assert.equal(
+    expanded.document.activeElement,
+    expanded.links[2],
+    "expanding navigation moves focus from the hidden toggle to the current task",
+  );
+
+  const expandedFallback = navigationHarness({ width: 760 });
+  expandedFallback.toggle.focus();
+  expandedFallback.media.setWidth(761);
+  assert.equal(expandedFallback.document.activeElement, expandedFallback.links[0]);
+
+  const visibleLink = navigationHarness({ width: 760 });
+  visibleLink.toggle.dispatch("click");
+  visibleLink.links[1].focus();
+  visibleLink.media.setWidth(761);
+  assert.equal(
+    visibleLink.document.activeElement,
+    visibleLink.links[1],
+    "expanding navigation preserves focus on a link that remains visible",
+  );
+
+  const expandedOutside = navigationHarness({ width: 760 });
+  const expandedOutsideControl = new FakeTarget("workspace", expandedOutside.document);
+  expandedOutsideControl.focus();
+  expandedOutside.media.setWidth(761);
+  assert.equal(
+    expandedOutside.document.activeElement,
+    expandedOutsideControl,
+    "expanding navigation does not steal focus from the workspace",
+  );
+
   const programmatic = navigationHarness();
   const workspaceControl = new FakeTarget("workspace", programmatic.document);
   programmatic.toggle.dispatch("click");
@@ -876,6 +911,20 @@ test("native Chromium keeps every task reachable without viewport overflow", {
       await evaluate("document.activeElement.id"),
       "mobile-nav-toggle",
       "crossing into the mobile breakpoint returns focus from the collapsed menu",
+    );
+    await devtools.send("Emulation.setDeviceMetricsOverride", {
+      width: 761,
+      height: 900,
+      screenWidth: 761,
+      screenHeight: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await delay(50);
+    assert.equal(
+      await evaluate("document.activeElement.dataset.destination"),
+      "listings",
+      "crossing out of the mobile breakpoint focuses the current task link",
     );
 
     await setViewport({ cssWidth: 640, deviceScaleFactor: 2, screenWidth: 1280 });
