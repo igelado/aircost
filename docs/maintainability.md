@@ -99,7 +99,7 @@ measurements when an item is completed.
 | MNT-023 | P1 | open | unassigned | capture contracts | both | One typed checkpoint and capture identity |
 | MNT-024 | P2 | open | unassigned | aircraft curation | both | Separate diagnostics from executable commands |
 | MNT-025 | P2 | open | unassigned | verification runs | both | Derive run summaries from one terminal result |
-| WEB-001 | P0 | open | unassigned | responsive UI | none | Navigation works at every supported width |
+| WEB-001 | P0 | done | coder | responsive UI | none | Navigation works at every supported width |
 | WEB-002 | P1 | done | coder | information architecture | none | Task-oriented navigation and deep links |
 | WEB-003 | P1 | open | unassigned | listings UX | none | Progressive listing discovery and useful zero state |
 | WEB-004 | P1 | open | unassigned | review UX | none | A comprehensible review work queue |
@@ -1089,8 +1089,8 @@ Acceptance criteria:
 ### WEB-001 — Replace the broken mobile navigation
 
 - Priority: P0
-- Status: open
-- Owner: unassigned
+- Status: done
+- Owner: coder
 - Area: responsive navigation
 - Backend scope: none
 - Depends on: WEB-002
@@ -1113,12 +1113,47 @@ full text labels until they collide.
 
 Acceptance criteria:
 
-- [ ] No label overlap or document-level horizontal scroll at 320, 390, 760,
+- [x] No label overlap or document-level horizontal scroll at 320, 390, 760,
       1024, and 1440 px.
-- [ ] The active destination is announced with `aria-current="page"`.
-- [ ] Menu open/close, focus return, Escape, and outside-click behavior work by
+- [x] The active destination is announced with `aria-current="page"`.
+- [x] Menu open/close, focus return, Escape, and outside-click behavior work by
       keyboard and pointer.
-- [ ] A user can reach every available page at 200% zoom.
+- [x] A user can reach every available page at 200% zoom.
+
+Completion evidence:
+
+- Owner: coder
+- PR/commit: [PR #162](https://github.com/igelado/aircost/pull/162) / merge
+  `8eb33ccbebb32eacc733227dba45308193fb3273`; exact implementation head
+  `1e08b802c3b32c1d7a2b22c07299f51f4b2d3ff2`
+- Completed: 2026-09-11
+- Before: six full navigation labels collided at mobile widths, the sticky
+  brand/navigation block consumed excessive space, and wide review content
+  could expand a 390 px viewport to about 1,347 px.
+- After: a progressively enhanced compact task menu appears at 760 CSS pixels
+  and below while preserving WEB-002 routes and central navigation guards.
+  Responsive containment prevents document-level overflow; visible 44 px
+  targets, `aria-current`, Escape, outside-click close, and focus transfer and
+  return cover keyboard, pointer, initialization, history, and breakpoint
+  transitions.
+- CI evidence: `fast`, `sqlite-contracts`, `postgres-contracts`, and `dnn` all
+  passed in Actions run
+  [34653061221](https://github.com/igelado/aircost/actions/runs/34653061221).
+  The change added no database schema or API contract; both database suites
+  passed unchanged.
+- Local/frontend evidence: the exact frontend command reported 150 outcomes
+  (149 passed and one explicit optional-Chromium test skipped); every web
+  JavaScript module passed `node --check`; `cargo check --locked`, the focused
+  mobile-navigation asset test, formatting, and diff checks passed. The final
+  exact-head native Chromium matrix passed 1/1 in 11.12 seconds using disposable
+  SQLite and browser-profile state. It covered 320, 390, 760, 1024, and 1440 px,
+  the 1120/1121 px edge, Listings, Values, Review, Manual, Products, and Catalog
+  route/detail states, Back/Forward, no-JavaScript behavior, 200% zoom,
+  containment, 44 px targets, Escape, outside click, guarded accept/reject
+  navigation, and focus return.
+- Hosted review evidence: exact-head code and security reviews completed clean,
+  and all six review threads were resolved after verified focus-preservation
+  fixes. WEB-014 retains ownership of a shared enforced browser harness.
 
 ### WEB-002 — Organize navigation around user tasks and make it addressable
 
