@@ -59,7 +59,11 @@ export function createTaskNavigation({
   }
 
   function handleToggle() {
-    setOpen(!open);
+    if (open) {
+      close({ returnFocus: menu.contains(document.activeElement) });
+    } else {
+      setOpen(true);
+    }
   }
 
   function handleDocumentClick(event) {
