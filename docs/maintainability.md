@@ -25,6 +25,11 @@ invariants, and an objective definition of done.
 
 ## Audit baseline
 
+The measurements below are the frozen pre-improvement baseline recorded before
+the completed work and merges listed later in this register. They remain
+unchanged for comparison; completion evidence under each item records the
+current post-merge state.
+
 - About 252,000 lines of Rust, with several production files between 10,000 and
   21,000 lines.
 - The current SQLite database has 105 tables, 277 triggers, 17 views, and 66
