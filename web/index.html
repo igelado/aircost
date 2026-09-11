@@ -8,15 +8,27 @@
 </head>
 <body>
   <div class="app-shell">
-    <aside class="sidebar">
-      <div class="brand">
-        <div class="brand-mark">A</div>
-        <div>
-          <strong>AirCost</strong>
-          <span>Aircraft economics</span>
+    <aside class="sidebar" data-task-navigation>
+      <div class="sidebar-header">
+        <div class="brand">
+          <div class="brand-mark">A</div>
+          <div>
+            <strong>AirCost</strong>
+            <span>Aircraft economics</span>
+          </div>
         </div>
+        <button
+          class="mobile-nav-toggle"
+          id="mobile-nav-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="task-navigation"
+        >
+          <span>Tasks</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"></path></svg>
+        </button>
       </div>
-      <div class="nav-groups">
+      <div class="nav-groups" id="task-navigation">
         <section class="nav-group" aria-labelledby="market-navigation-title">
           <h2 id="market-navigation-title">Market analysis</h2>
           <nav class="nav-tabs" aria-label="Market analysis">

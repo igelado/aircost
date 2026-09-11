@@ -55,6 +55,10 @@ button {
   background: var(--panel);
 }
 
+.sidebar-header {
+  min-width: 0;
+}
+
 .brand {
   display: flex;
   align-items: center;
@@ -86,6 +90,34 @@ button {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.4;
+}
+
+.mobile-nav-toggle {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 44px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 700;
+}
+
+.mobile-nav-toggle svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.sidebar.is-menu-open .mobile-nav-toggle svg {
+  transform: rotate(180deg);
 }
 
 .nav-groups {
@@ -124,6 +156,12 @@ button {
 .nav-tab:hover {
   background: var(--panel-soft);
   color: var(--text);
+}
+
+.mobile-nav-toggle:focus-visible,
+.nav-tab:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .nav-tab.is-active {
@@ -2932,22 +2970,57 @@ label span,
     position: sticky;
     top: 0;
     z-index: 10;
+    display: grid;
+    gap: 10px;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
     padding: 12px;
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }
 
-  .nav-groups {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .sidebar-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     gap: 12px;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .brand {
+    min-width: 0;
+  }
+
+  .mobile-nav-toggle {
+    display: inline-flex;
+    flex: 0 0 auto;
+  }
+
+  .nav-groups {
+    display: none;
+    grid-template-columns: 1fr;
+    gap: 12px;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .sidebar.is-menu-open .nav-groups {
+    display: grid;
   }
 
   .nav-tabs {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: 1fr;
   }
 
   .nav-tab {
-    text-align: center;
+    min-height: 44px;
+    overflow-wrap: anywhere;
+    text-align: left;
+    white-space: normal;
   }
 
   .workspace {

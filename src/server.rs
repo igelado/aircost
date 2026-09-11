@@ -288,6 +288,7 @@ fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/app.css", get(stylesheet))
         .route("/app.js", get(javascript))
+        .route("/navigation.mjs", get(navigation_javascript))
         .route("/routing.mjs", get(routing_javascript))
         .route("/avionics.js", get(avionics_javascript))
         .route("/review.js", get(review_javascript))
@@ -455,6 +456,16 @@ async fn routing_javascript() -> impl IntoResponse {
             "application/javascript; charset=utf-8",
         )],
         ROUTING_JS,
+    )
+}
+
+async fn navigation_javascript() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        NAVIGATION_JS,
     )
 }
 
@@ -2448,6 +2459,7 @@ impl From<anyhow::Error> for ApiError {
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
+const NAVIGATION_JS: &str = include_str!("../web/navigation.mjs");
 const ROUTING_JS: &str = include_str!("../web/routing.mjs");
 const AVIONICS_JS: &str = include_str!("../web/avionics.js");
 const REVIEW_JS: &str = include_str!("../web/review.js");
@@ -2477,16 +2489,16 @@ mod tests {
         approve_replacement_products_handler, attest_review_avionics_product_handler,
         avionics_options_handler, cancel_verification_run_handler, create_verification_run_handler,
         get_listing_review, get_verification_run_handler, list_avionics_handler,
-        list_verification_run_items_handler, process_claimed_verification_run_item,
-        proposed_identity_matches_consolidation_members, rebuild_listing_avionics_review_handler,
-        require_current_review_revisions, required_idempotency_key, routing_javascript,
-        start_plugin_submission_job, use_existing_review_avionics_handler,
-        verification_run_api_error, verification_run_failure_reason,
-        verify_existing_review_avionics_handler, AppState, AttestReviewAvionicsProductRequest,
-        CreateVerificationRunHttpRequest, RebuildPendingAvionicsReviewRequest,
-        ReviewerListingPreflightQuery, UseExistingReviewAvionicsRequest,
-        VerificationRunItemsHttpQuery, VerifyExistingReviewAvionicsRequest, REVIEW_AUTOMATION_JS,
-        ROUTING_JS,
+        list_verification_run_items_handler, navigation_javascript,
+        process_claimed_verification_run_item, proposed_identity_matches_consolidation_members,
+        rebuild_listing_avionics_review_handler, require_current_review_revisions,
+        required_idempotency_key, routing_javascript, start_plugin_submission_job,
+        use_existing_review_avionics_handler, verification_run_api_error,
+        verification_run_failure_reason, verify_existing_review_avionics_handler, AppState,
+        AttestReviewAvionicsProductRequest, CreateVerificationRunHttpRequest,
+        RebuildPendingAvionicsReviewRequest, ReviewerListingPreflightQuery,
+        UseExistingReviewAvionicsRequest, VerificationRunItemsHttpQuery,
+        VerifyExistingReviewAvionicsRequest, NAVIGATION_JS, REVIEW_AUTOMATION_JS, ROUTING_JS,
     };
     use crate::aircraft::faa::require_listing_faa_admission;
     use crate::avionics::inspection::AvionicsCatalogQuery;
@@ -2552,6 +2564,20 @@ mod tests {
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), ROUTING_JS.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn serves_the_mobile_navigation_module_as_javascript() {
+        let response = navigation_javascript().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static(
+                "application/javascript; charset=utf-8"
+            ))
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), NAVIGATION_JS.as_bytes());
     }
 
     #[test]
