@@ -31,6 +31,7 @@ export function createTaskNavigation({
   }
 
   const mobile = matchMedia(MOBILE_NAVIGATION_QUERY);
+  let focusWasInMenu = false;
   let open = false;
 
   function setOpen(next) {
@@ -69,6 +70,10 @@ export function createTaskNavigation({
     close({ returnFocus: true });
   }
 
+  function handleDocumentFocus(event) {
+    focusWasInMenu = menu.contains(event.target);
+  }
+
   function handleLinkClick(event) {
     if (!isPlainPrimaryClick(event)) {
       return;
@@ -80,7 +85,10 @@ export function createTaskNavigation({
   }
 
   function handleViewportChange() {
-    close();
+    close({
+      returnFocus: mobile.matches
+        && (menu.contains(document.activeElement) || focusWasInMenu),
+    });
   }
 
   toggle.addEventListener("click", handleToggle);
@@ -88,6 +96,7 @@ export function createTaskNavigation({
     link.addEventListener("click", handleLinkClick);
   }
   document.addEventListener("click", handleDocumentClick);
+  document.addEventListener("focusin", handleDocumentFocus);
   document.addEventListener("keydown", handleDocumentKeydown);
   if (typeof mobile.addEventListener === "function") {
     mobile.addEventListener("change", handleViewportChange);

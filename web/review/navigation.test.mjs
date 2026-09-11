@@ -72,6 +72,7 @@ class FakeTarget {
   focus() {
     if (this.ownerDocument) {
       this.ownerDocument.activeElement = this;
+      this.ownerDocument.dispatch("focusin", { target: this });
     }
   }
 
@@ -431,6 +432,16 @@ test("closes with Escape or outside click and returns focus only when appropriat
   resized.media.setWidth(761);
   assert.equal(resized.controller.isOpen(), false);
   assert.equal(resized.toggle.getAttribute("aria-expanded"), "false");
+
+  const collapsed = navigationHarness({ width: 761 });
+  collapsed.links[2].focus();
+  collapsed.media.setWidth(760);
+  assert.equal(collapsed.controller.isOpen(), false);
+  assert.equal(
+    collapsed.document.activeElement,
+    collapsed.toggle,
+    "collapsing desktop navigation returns focus from its newly hidden link",
+  );
 
   const programmatic = navigationHarness();
   const workspaceControl = new FakeTarget("workspace", programmatic.document);
@@ -850,6 +861,22 @@ test("native Chromium keeps every task reachable without viewport overflow", {
     assert.equal(result.menuDisplay, "grid");
     assert.equal(result.overflow, false);
     assert.equal(result.links.every(({ visible }) => visible), true);
+
+    await evaluate("document.querySelector('#task-navigation .nav-tab').focus()");
+    await devtools.send("Emulation.setDeviceMetricsOverride", {
+      width: 760,
+      height: 900,
+      screenWidth: 760,
+      screenHeight: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await delay(50);
+    assert.equal(
+      await evaluate("document.activeElement.id"),
+      "mobile-nav-toggle",
+      "crossing into the mobile breakpoint returns focus from the collapsed menu",
+    );
 
     await setViewport({ cssWidth: 640, deviceScaleFactor: 2, screenWidth: 1280 });
     await evaluate("document.querySelector('#mobile-nav-toggle').click()");
