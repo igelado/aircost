@@ -2954,6 +2954,7 @@ label span,
   display: none !important;
 }
 
+/* Fully contain hidden table captions so they cannot widen the app shell. */
 .sr-only {
   position: absolute;
   top: 0;
