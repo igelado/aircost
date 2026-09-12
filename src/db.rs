@@ -13,6 +13,8 @@ use sqlx::{Connection, Executor, PgConnection, PgPool, SqliteConnection, SqliteP
 
 use crate::models::User;
 
+pub(crate) mod executor;
+
 pub const DEFAULT_DATABASE_PATH: &str = "data/aircost.sqlite3";
 pub const DEFAULT_DATABASE_URL: &str = "sqlite://data/aircost.sqlite3";
 pub const DEVELOPER_EMAIL: &str = "developer@localhost";
@@ -2603,31 +2605,31 @@ impl AppDb {
         }
     }
 
+    // MNT-007B will replace callers' local transaction branching with this API.
+    #[allow(dead_code)]
+    pub(crate) async fn begin(&self) -> sqlx::Result<executor::DbTransaction> {
+        match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                Ok(executor::DbTransaction::Sqlite(pool.begin().await?))
+            }
+            DatabaseBackend::Postgres(pool) => {
+                Ok(executor::DbTransaction::Postgres(pool.begin().await?))
+            }
+        }
+    }
+
     pub async fn current_user(&self, identity: Option<&str>) -> Result<User> {
         let identity = identity.unwrap_or(DEVELOPER_EMAIL);
-        let sql = self.sql(
+        let user = executor::db_query!(
+            row_optional(User),
+            self,
             r#"
             SELECT id, email, display_name, auth_provider, auth_subject
             FROM users
-            WHERE email = ? OR auth_subject = ?
+            WHERE email = $1 OR auth_subject = $1
             "#,
-        );
-        let user = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
-                sqlx::query_as::<_, User>(&sql)
-                    .bind(identity)
-                    .bind(identity)
-                    .fetch_optional(pool)
-                    .await?
-            }
-            DatabaseBackend::Postgres(pool) => {
-                sqlx::query_as::<_, User>(&sql)
-                    .bind(identity)
-                    .bind(identity)
-                    .fetch_optional(pool)
-                    .await?
-            }
-        };
+            [identity]
+        )?;
         user.with_context(|| format!("unknown user: {identity}"))
     }
 
@@ -15818,6 +15820,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(installed_at_after, installed_at_before);
+
+        let user = db.current_user(None).await.unwrap();
+        assert_eq!(user.email, super::DEVELOPER_EMAIL);
+        let mut transaction = db.begin().await.unwrap();
+        let shared_value: i64 = super::executor::db_query!(
+            scalar_one(i64),
+            &mut transaction,
+            "SELECT COUNT(*) FROM users WHERE id = $2 OR id = $1 OR id = $2",
+            [i64::MIN, user.id]
+        )
+        .unwrap();
+        assert_eq!(shared_value, 1);
+        transaction.rollback().await.unwrap();
     }
 
     async fn assert_postgres_reference_migration_rerun_rejected(pool: &sqlx::PgPool) -> String {
