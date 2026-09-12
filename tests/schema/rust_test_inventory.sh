@@ -18,36 +18,38 @@ empty_postgres_contract_tests=(
   db::tests::diagnostic_postgres_connections_default_to_read_only
   db::tests::postgres_active_replay_freeze_rejects_truncate_cascade
   db::tests::postgres_all_receipt_timestamps_survive_two_normal_startups
+  db::tests::postgres_canonical_schema_passes_end_to_end_startup
   db::tests::postgres_correction_validation_rejects_altered_search_path_and_namespace
   db::tests::postgres_database_identity_recognizes_aliases_for_ordinary_role
-  db::tests::postgres_faa_reference_startup_attests_exact_objects
+  db::tests::postgres_faa_reference_doctor_attests_exact_objects
   db::tests::postgres_generic_feature_label_migration_audits_without_model_updates
   db::tests::postgres_grounded_capability_functions_resist_hostile_search_path_and_tampering
   db::tests::postgres_inherited_child_receipt_cannot_satisfy_parent_ledger
-  db::tests::postgres_late_initialization_failure_rolls_back_all_ddl
+  db::tests::postgres_late_fresh_initialization_failure_rolls_back_all_ddl
+  db::tests::postgres_partial_schema_is_rejected_without_mutation
+  db::tests::postgres_reference_cutover_validation_rejects_adversarial_mutations
   db::tests::postgres_listing_replay_fresh_migrated_idempotent_and_hostile_search_path
   db::tests::postgres_listing_replay_installed_at_survives_two_normal_startups
   db::tests::postgres_listing_replay_rerun_rejects_unexpected_indexes_and_triggers
-  db::tests::postgres_listing_replay_startup_rejects_weakened_column_constraint_and_index
+  db::tests::postgres_listing_replay_doctor_rejects_weakened_column_constraint_and_index
   db::tests::postgres_reference_cutover_rejects_null_marker_fields_without_healing
   db::tests::postgres_replay_inventory_orders_repeatable_read_and_read_committed_writers
   db::tests::postgres_replay_ledger_rejects_invalid_state_outcome_pairings
   db::tests::postgres_startup_pins_search_path_and_ignores_attacker_shadows
   db::tests::postgres_startup_rejects_anchor_receipt_xor_and_hostile_markers_without_mutation
   db::tests::postgres_startup_rejects_noncanonical_ledger_storage_without_mutation
-  db::tests::postgres_startup_rejects_same_named_noop_approved_concrete_model_function
-  db::tests::postgres_startup_rejects_visual_artifact_constraint_tampering
+  db::tests::postgres_doctor_rejects_same_named_noop_approved_concrete_model_function
+  db::tests::postgres_doctor_rejects_visual_artifact_constraint_tampering
   db::tests::postgres_startup_waits_for_writer_and_fresh_startups_serialize
+  db::tests::postgres_versioned_migration_history_is_exact_and_hostile_shapes_fail_closed
+  db::tests::postgres_startup_rejects_unsafe_public_schema_authority_without_mutation
   listing::replay::export::tests::postgres_export_matches_the_sqlite_readiness_contract
   listing::replay::run::tests::postgres_production_acquire_and_release_uses_backend_placeholders
   listings::tests::postgres_visual_artifact_bind_waits_for_newer_faa_snapshot_and_refuses_stale_pair
-)
-
-canonical_postgres_contract_tests=(
-  db::tests::postgres_canonical_schema_passes_end_to_end_startup
-  db::tests::postgres_reference_cutover_validation_rejects_adversarial_mutations
   tests::import_faa_registry_dry_run_keeps_postgres_rows_and_markers_unchanged
 )
+
+canonical_postgres_contract_tests=()
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -171,8 +173,8 @@ if ! diff -u \
 fi
 
 postgres_test_count="$((${#empty_postgres_contract_tests[@]} + ${#canonical_postgres_contract_tests[@]}))"
-if [[ "$postgres_test_count" -ne 32 ]]; then
-  printf 'expected the registered PostgreSQL inventory to contain 32 tests, found %d\n' \
+if [[ "$postgres_test_count" -ne 35 ]]; then
+  printf 'expected the registered PostgreSQL inventory to contain 35 tests, found %d\n' \
     "$postgres_test_count" >&2
   exit 1
 fi

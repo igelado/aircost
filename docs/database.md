@@ -5,6 +5,146 @@ Schemas live in `schema/sqlite.sql` and `schema/postgres.sql`; `src/db.rs`
 loads the correct schema on
 startup and seeds the developer user plus baseline depreciation profiles.
 
+## Versioned migration operations
+
+`migrations/manifest.tsv` is the authoritative global order. It currently
+registers 34 logical migrations and the exact SHA-256 of 33 SQLite and 34
+PostgreSQL files. Sequence 27, `20260819_faa_reference_reachability`, is the
+declared PostgreSQL-only entry; backend histories retain the global sequence,
+so SQLite intentionally has no row 27. The manifest order is deliberate and is
+not inferred from filenames. In particular, the deployed order around August
+19 is dispositions, identity corrections, PostgreSQL FAA reachability, FAA
+record-hash domain, replay runs, then reference cutover.
+
+`schema_migration_history` is distinct from `schema_migration_contracts`.
+History rows identify exact migration file bytes and record an immutable
+installation time with provenance `applied`, `canonical`, or
+`shape_attested_legacy_adoption`; the older contract fingerprints continue to
+identify object and data contracts. An exact bootstrap receipt in the older
+ledger independently proves that ordered history was installed, so dropping
+or replacing the history table cannot be mistaken for a pre-history database.
+Its v1 fingerprint is SHA-256 over this newline-terminated contract payload:
+
+```text
+aircost-versioned-migration-history-v1
+ordered-manifest-prefix
+immutable-history-receipts
+independent-schema-migration-contract-marker
+atomic-body-and-history-receipt
+```
+
+A genuinely empty database is initialized once from the canonical schema and
+the complete backend-specific manifest in one transaction. A normal warm
+startup verifies only the migration-control plane: the exact ordered history
+prefix, independent bootstrap marker, control-ledger definitions and immutable
+guards, and manifest-owned contract receipts. PostgreSQL also requires the
+current role to control `public` and refuses foreign `CREATE` authority there.
+Before reporting a pending executable suffix, startup resolves every body from
+the binary's sequence/name/backend-keyed registry and validates its declared
+checksum and runner-safe statements.
+It does not replay canonical DDL, rewrite seeds, apply a migration, or perform
+the exhaustive domain-object audit. Unknown history rows, duplicates, gaps,
+reordered names, checksum drift, invalid provenance, partial bootstrap state,
+or hostile control-ledger definitions fail closed before mutation.
+
+Sequences 1 through 33 are historical adoption metadata and are never
+executed by the runner. The supported legacy baseline is a database whose
+complete current schema and existing contract receipts pass exact attestation.
+`db migrate --apply` records that attestation honestly and executes only the
+sequence-34 history bootstrap, atomically with its history receipts. An older
+or partially applied historical shape is not advertised as runnable: use
+`db doctor`, export what is recoverable, and restore into a clean current
+database. This boundary includes the SQLite 20260729 interrupted state in
+which only `schema_migration_contracts` was created before that historical
+script's transaction began.
+
+Inspect without writes from one read-only snapshot:
+
+```sh
+AIRCOST_DATABASE_URL=sqlite://data/aircost.sqlite3 \
+  cargo run --bin aircost-admin -- db doctor
+AIRCOST_DATABASE_URL="$POSTGRES_DATABASE_URL" \
+  cargo run --bin aircost-admin -- db doctor
+```
+
+Migration is also a dry run by default. Back up and rehearse the exact target,
+review every reported name and digest, and retain the same
+`AIRCOST_DATABASE_URL`. For a pending or adoptable database, doctor serializes
+a nonsecret `target_identity_sha256`, explicit `backup_guidance`, and the only
+supported apply command:
+
+```sh
+export AIRCOST_DATABASE_URL=sqlite://data/aircost.sqlite3
+cargo run --bin aircost-admin -- db migrate
+TARGET_IDENTITY_SHA256="$(
+  cargo run --bin aircost-admin -- db doctor | jq -er '.target_identity_sha256'
+)"
+# After making and rehearsing the backup described by doctor:
+cargo run --bin aircost-admin -- db migrate --apply \
+  --expected-target-sha256 "$TARGET_IDENTITY_SHA256"
+```
+
+The guarded command has no database URL or credentials in its arguments. It
+requires `AIRCOST_DATABASE_URL` when `--database` is omitted and refuses to use
+the default database in that case. The token is SHA-256 over a
+domain-separated v1 target identity obtained from the live connection: the
+canonical SQLite main filename, or PostgreSQL's cluster system identifier and
+database OID. It reveals neither the URL nor the underlying identity. A
+mismatch fails inside the serialized migration transaction before its first
+write. Fresh and current reports provide no apply command or backup guidance.
+Corrupt, unsupported, and failed data-attestation states provide no command and
+serialize `export_restore_guidance` that forbids historical/adopt-only replay
+and directs the operator to export recoverable data and restore a canonical
+verified backup. Packaging faults instead direct installation or rebuilding of
+the matching application release without changing the database. Unsafe
+PostgreSQL schema authority directs a database administrator to make the
+migration role the `public` schema owner or grant it immediately usable,
+inheritable membership in the schema-owner role, and revoke `CREATE` on schema
+`public` from foreign grantees before rerunning doctor; neither case is
+misreported as a data-restoration problem.
+
+Executable bodies are compiled into the binary and resolved by exact manifest
+sequence, logical name, and backend. The runner re-hashes a registered body
+before advertising or executing it and rejects missing, duplicate,
+backend-inapplicable, adopt-only, or checksum-mismatched entries. Runtime
+behavior therefore does not depend on the working directory or separately
+installed migration files. PostgreSQL uses a dedicated-controller advisory
+lock and a canonical
+`pg_catalog,public,pg_temp` search path;
+SQLite uses `BEGIN IMMEDIATE` with foreign keys enabled. Each future body and
+its receipt commit in the same transaction. If a later migration fails, prior
+commits remain valid and the next run resumes at the first uncommitted suffix.
+
+The manifest's nine columns also classify contract receipts as `required`,
+`optional_exact`, or `none`. Required receipts must be present with the exact
+version and fingerprint. Four adopt-only receipts are optional because
+canonical initialization never installed them but historically upgraded
+databases did:
+
+| Sequence | Logical name | Exact receipt |
+| --- | --- | --- |
+| 16 | `20260802_default_avionics_candidate_quarantine` | `2:b8a6ecd15acc0ce14f67bf37ff4387c0ded4d1c6669d2fc4698b6c0a6c209ba4` |
+| 19 | `20260805_listing_avionics_association_corroborations` | `1:2c4661b8bf76e1a28d5ab5c636ed100f5d73f845c44b9515e5f46c5827e66fc9` |
+| 20 | `20260806_listing_avionics_collision_closure` | `1:363fd039068667cca351c0009c0621e55942186a5d63804cf0e7da8212fa26b3` |
+| 23 | `20260809_listing_verification_runs` | `1:a8beda24d71517ba07e4a81b2802b2fef97296ae6b2256a7ff493d6af5235232` |
+
+When present, each exact optional tuple and its original `installed_at` must
+survive. A manifest-owned `none` receipt is forbidden, while genuinely
+unregistered legacy receipts are preserved.
+`tests/schema/test_versioned_migration_manifest.sh` recomputes every registered
+migration SHA-256, rejects missing or unregistered bodies, and cross-checks all
+required and optional-exact receipt tuples against both backend scripts.
+
+Warm-start performance is enforced below one second on both backends. Before
+this control-plane split, 11 sequential PostgreSQL warm connects on
+`postgres:17.11-trixie` pinned at image digest
+`sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675`
+measured p50 2,560,987 microseconds and p95
+2,836,238 microseconds. The reduced gate, measured the same way on 2026-09-11,
+was p50 137 milliseconds and p95 156 milliseconds; the environment-backed test
+asserts p95 below one second. The SQLite fresh-history test separately asserts
+one unchanged warm reconnect below one second.
+
 ## Core Tables
 
 `users`
@@ -145,7 +285,7 @@ immutable, and materialization compare-and-sets against the member's pinned
 checkpoint hash. A succeeded materialization must retain its non-null resulting
 listing ID. Both that result and the exact materialization receipt use
 `ON DELETE RESTRICT`, so replay provenance prevents deletion of the listing it
-proves was produced. Startup attests both complete replay
+proves was produced. `db doctor` attests both complete replay
 table definitions on SQLite and the exact PostgreSQL column/type/nullability/
 default/identity, primary-key, unique, foreign-key/delete-action, check-
 vocabulary/hash, and full index/backing-index contracts, including key versus
@@ -744,9 +884,10 @@ Dry run uses a diagnostic database connection rather than the normal startup
 path. SQLite must already exist and is opened read-only without schema
 initialization, migrations, WAL creation, or seed writes. PostgreSQL sessions
 set `default_transaction_read_only=on` before the first query and likewise do
-not initialize or migrate the schema. A dry run therefore diagnoses the exact
-installed contract; it cannot create a missing SQLite database or repair an
-old one as a side effect.
+not initialize or migrate the schema. The connection requires an exact current
+migration-control plane; the importer then performs its operation-specific
+domain checks. It cannot create a missing SQLite database or repair an old one
+as a side effect.
 
 The importer derives the release date from the shared, validated ZIP member
 date for `MASTER.txt`, `ACFTREF.txt`, and `ENGINE.txt`; there is no operator
@@ -867,27 +1008,13 @@ migrations/20260720_valuation_data_hardening.sqlite.sql
 migrations/20260720_valuation_data_hardening.postgres.sql
 ```
 
-Back up the database and apply the matching file during a maintenance window.
-The application does not run it automatically. Existing listings are
+The filenames are archival provenance; the versioned runner never executes
+this adopt-only migration. Use `aircost-admin db doctor` and the supported
+`db migrate --apply` workflow above. Existing listings are
 deliberately quarantined, and legacy price/spec/component value rows are marked
 unreviewed and valuation-ineligible; the migration never guesses provenance.
 Review or reprocess those rows before changing them to `ready`, then create a
 new frozen snapshot and explicitly fit, validate, and activate a candidate.
-
-For SQLite, first check whether the one-time migration has already run:
-
-```sh
-sqlite3 -readonly data/aircost.sqlite3 \
-  "SELECT EXISTS(SELECT 1 FROM pragma_table_info('aircraft_sale_listings') WHERE name='ingestion_state');"
-```
-
-Run the migration only when that query returns `0`, and use fail-fast mode so
-the CLI cannot continue after a statement error:
-
-```sh
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260720_valuation_data_hardening.sqlite.sql"
-```
 
 The migration tolerates additive suite/fact tables already created by a newer
 binary, but it is not rerunnable because SQLite does not support
@@ -906,18 +1033,8 @@ It preserves every legacy model and association but marks all legacy identities
 `unreviewed`. It does not infer identifiers, promote rows, merge labels, or
 delete data. New listing, default-avionics, and suite links require approved
 identities, and valuation/training reads exclude legacy-unreviewed identities.
-Apply it before deploying a binary that expects the catalog columns.
-
-For SQLite, preflight and apply in fail-fast mode:
-
-```sh
-sqlite3 -readonly data/aircost.sqlite3 \
-  "SELECT EXISTS(SELECT 1 FROM pragma_table_info('avionics_models') WHERE name='catalog_status');"
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260721_avionics_catalog_curation.sqlite.sql"
-```
-
-Run the migration only when the preflight query returns `0`. Then use
+These files are adopt-only provenance. Use `db doctor` and the manifest-driven
+migrator; do not replay them manually. Then use
 the automatic `verify-listings` workflow below to classify stored listing
 equipment and replace associations safely. The former mechanical
 `normalize-avionics` command was removed: typography-only maker/model matches
@@ -939,17 +1056,8 @@ composite `NAV/COM` class is decomposed into the atomic `NAV` and `COM`
 capabilities; no other additional capability is inferred. Same-name legacy
 rows remain unreviewed rather than being merged mechanically; approved catalog
 products are unique by manufacturer/name as well as by normalized manufacturer
-identifier. Apply the migration after the curated-catalog migration and before
-deploying code that reads capability memberships.
-
-For SQLite, run it only when this preflight query returns `0`:
-
-```sh
-sqlite3 -readonly data/aircost.sqlite3 \
-  "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='avionics_model_types');"
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260721_avionics_multi_type.sqlite.sql"
-```
+identifier. The manifest records this migration after curated-catalog
+curation. The file is adopt-only and is not a supported manual repair path.
 
 ## Listing Pending-Review Migration
 
@@ -964,17 +1072,9 @@ migrations/20260724_listing_pending_reviews.postgres.sql
 It extends the listing ingestion-state constraint with `pending_review` and
 creates `aircraft_sale_listing_pending_reviews`. It does not populate the
 table, classify legacy equipment, change listing-avionics links, or create FAA
-cache tables. Apply it after the aircraft-reference and avionics catalog
-migrations and before deploying code that can stage review bundles.
-
-Back up SQLite and apply in fail-fast mode:
-
-```sh
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260724_listing_pending_reviews.sqlite.sql"
-sqlite3 -readonly data/aircost.sqlite3 \
-  "PRAGMA foreign_key_check; SELECT ingestion_state, COUNT(*) FROM aircraft_sale_listings GROUP BY ingestion_state;"
-```
+cache tables. Its place after the aircraft-reference and avionics catalog
+migrations is preserved by the manifest. The files are adopt-only provenance,
+not executable repair instructions.
 
 Both backend migrations are idempotent. The SQLite version rebuilds
 `aircraft_sale_listings` to extend its check constraint, preserves IDs and
@@ -991,25 +1091,15 @@ migrations/20260725_identity_deduplication_postconditions.sqlite.sql
 migrations/20260725_identity_deduplication_postconditions.postgres.sql
 ```
 
-Apply it after the catalog, aircraft-reference, and pending-review migrations
-and before running legacy catalog consolidation. It intentionally leaves
+Its manifest order follows the catalog, aircraft-reference, and pending-review
+migrations. It intentionally leaves
 unreviewed collisions on non-ready listings in place. Existing invalid ready
 rows are preserved but quarantined and unverified with a repair reason. The
 migration never merges products or approves an identity.
 
-For SQLite, back up the database, rehearse on a copy, and use fail-fast mode:
-
-```sh
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260725_identity_deduplication_postconditions.sqlite.sql"
-sqlite3 -readonly data/aircost.sqlite3 \
-  "PRAGMA foreign_key_check; PRAGMA integrity_check; SELECT COUNT(*) FROM avionics_catalog_consolidation_guard;"
-```
-
-The final guard count must be zero outside an active consolidation transaction.
-Startup preflight requires the canonical-key, approved-identity, guard, and
-validated-authorization objects so an old database reports the exact migration
-command rather than failing later with a missing-table error.
+The historical files are adopt-only and must not be replayed manually. Doctor
+requires the canonical-key, approved-identity, guard, and validated-authorization
+objects; a partial legacy database is routed to export and canonical restore.
 
 `aircost-admin audit-avionics-duplicates` is read-only and reports collisions
 by stored keys, current canonical maker/product keys, and exact maker-scoped
@@ -1162,18 +1252,19 @@ and—where identifiers change—the exact current FAA snapshot and source-recor
 digest. Visual decisions additionally retain the complete one-photo resolution
 audit. The current listing is updated only in the same transaction after all
 guards pass; source-evidence corroboration advances observation history without
-rewriting the retained submission. Apply
-`migrations/20260819_aircraft_listing_identity_corrections.*.sql` before using
-the repair endpoints on an existing database.
+rewriting the retained submission. The historical
+`migrations/20260819_aircraft_listing_identity_corrections.*.sql` filenames are
+adopt-only provenance and must not be applied directly. Existing databases use
+the guarded manifest-driven `db migrate --apply` workflow above.
 
 The migration is idempotent only for its exact initial version-1 contract. A
 preexisting same-name correction table without that contract is rejected
-instead of being adopted. Startup independently validates the contract, both
+instead of being adopted. `db doctor` independently validates the contract, both
 unique indexes and their ordered columns, decision and referenced-observation
 immutability triggers, and the receipt-gate definition. PostgreSQL installs
 these routines and relations in `public`, fully qualifies every application
 relation referenced by the routines, and pins each routine to
-`search_path=pg_catalog`. Startup also checks the exact relation and routine
+`search_path=pg_catalog`. Doctor also checks the exact relation and routine
 namespaces/OIDs, function configuration, and complete function source.
 
 Correction-referenced identity observations are database-immutable; unrelated
@@ -1398,26 +1489,12 @@ leases are requeued with an incremented attempt count. Cancellation changes
 queued items to `cancelled`; an already-running item finishes under its current
 lease while the run is `cancelling`, after which the run becomes `cancelled`.
 
-Fresh databases receive the tables from the canonical schema. Existing
-databases use the matching additive, idempotent migration:
+Fresh databases receive the tables from the canonical schema. The matching
+historical migration filenames are retained as adopt-only provenance:
 
 ```text
 migrations/20260809_listing_verification_runs.sqlite.sql
 migrations/20260809_listing_verification_runs.postgres.sql
-```
-
-For SQLite, apply the migration in fail-fast mode and verify its contract and
-integrity:
-
-```sh
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260809_listing_verification_runs.sqlite.sql"
-sqlite3 -readonly data/aircost.sqlite3 \
-  "SELECT contract_version, contract_fingerprint
-     FROM schema_migration_contracts
-    WHERE migration_name = '20260809_listing_verification_runs';
-   PRAGMA foreign_key_check;
-   PRAGMA integrity_check;"
 ```
 
 The migration does not create a run, alter a listing, call a provider, or add
@@ -1426,8 +1503,7 @@ usage rows.
 ## Durable Listing Replay Runs
 
 Fresh databases receive the manifest replay ledger from the canonical schema.
-Existing databases must apply the matching additive migration before starting
-the new binary:
+The matching historical migration filenames are adopt-only provenance:
 
 ```text
 migrations/20260819_listing_replay_runs.sqlite.sql
@@ -1438,21 +1514,8 @@ The migration refuses a mismatched contract and refuses partially pre-existing
 replay objects without the exact installed contract. A marker-present rerun
 attests the complete canonical tables, constraints, foreign-key targets and
 actions, indexes, and absence of unexpected attached behavior before any replay
-DDL. It never updates the existing marker's `installed_at`. It is safe to apply
-a second time only after the exact contract and complete objects exist. For
-SQLite, back up the database, run it in fail-fast mode, then check the contract,
-foreign keys, and integrity:
-
-```sh
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260819_listing_replay_runs.sqlite.sql"
-sqlite3 -readonly data/aircost.sqlite3 \
-  "SELECT contract_version, contract_fingerprint
-     FROM schema_migration_contracts
-    WHERE migration_name = '20260819_listing_replay_runs';
-   PRAGMA foreign_key_check;
-   PRAGMA integrity_check;"
-```
+DDL. It never updates the existing marker's `installed_at`. Doctor validates
+the exact contract and complete objects; do not rerun the historical file.
 
 The migration creates no replay run, listing, provider call, or copied capture
 payload.
@@ -1471,11 +1534,13 @@ It does not delete or rewrite listings, and it deliberately does not copy or
 approve legacy manufacturers, models, variants, specs, price points, or default
 avionics. Existing listings therefore do not need to be re-added. The FAA
 tables start empty and must be populated with `import-faa-registry` after the
-migration. Existing databases must be migrated before starting a binary that
-expects the clean catalog; fresh databases receive the same schema directly.
+migration. The filenames below record adopt-only manifest/history provenance.
+An existing database is eligible only when the complete frozen legacy baseline
+attests exactly; `db doctor` directs any partial or drifted state to export and
+canonical restore. Fresh databases receive the same schema directly.
 
-After the base catalog migration, install the FAA projection reachability and
-record-hash-domain contracts in order:
+Historically, the FAA projection reachability and record-hash-domain contracts
+followed the base catalog in this manifest order:
 
 ```text
 migrations/20260819_faa_reference_reachability.postgres.sql
@@ -1483,9 +1548,9 @@ migrations/20260820_faa_record_hash_domain.postgres.sql
 migrations/20260820_faa_record_hash_domain.sqlite.sql
 ```
 
-PostgreSQL databases apply both PostgreSQL files in that order. SQLite applies
-the SQLite record-domain file; the reachability contract is already enforced
-by the SQLite base objects. Each migration accepts only its exact predecessor
+The manifest records the PostgreSQL files in that order. SQLite has only the
+record-domain entry; the reachability contract is already enforced by the
+SQLite base objects. Each migration accepts only its exact predecessor
 shape and preserves the original `installed_at` on an exact rerun. A missing,
 nonempty legacy FAA projection is deliberately rejected: delete only those
 derived FAA projection rows and regenerate them by importing the exact retained
@@ -1494,22 +1559,9 @@ relabel a legacy projection. The archive bytes and domain are both inputs to
 the authoritative hashes, so only importer regeneration establishes the new
 identity.
 
-Back up the database and test the matching migration on a copy. For SQLite,
-representative clean-catalog and FAA tables should all be absent before the
-one-time migration:
-
-```sh
-sqlite3 -readonly data/aircost.sqlite3 \
-  "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('curation_evidence_sources','aircraft_makes','aircraft_reference_configuration_versions','faa_registry_snapshots','faa_registry_aircraft','faa_registry_aircraft_references','faa_registry_engine_references','faa_registry_coverage');"
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260722_aircraft_reference_catalog.sqlite.sql"
-```
-
-Run the migration only when the first query returns `0`. A partial count is an
-inconsistent schema and must be investigated instead of rerunning blindly.
-Afterward, the count should be `8` and `PRAGMA foreign_key_check` should return
-no rows. For Postgres, apply the Postgres file with the client's stop-on-error
-option during the same maintenance workflow.
+A partial catalog is an inconsistent legacy schema and must be investigated
+instead of replaying a historical file. `db doctor` reports this state as
+unsupported and directs the operator to export and canonical restore.
 
 Snapshot and projection rows are append-only. Database constraints require an
 exact `regulator_primary` evidence source whose official FAA URL and content
@@ -1522,25 +1574,19 @@ An earlier draft of this migration also created
 `aircraft_curation_interaction_runs` and nullable references from decisions and
 profile proposals. No runtime path reads or writes those fields: request
 accounting belongs in `gemini_api_usage`, while approved source facts belong in
-`curation_evidence_sources` and `curation_evidence_claims`. Databases that
-received that draft should apply the matching idempotent cleanup migration:
+`curation_evidence_sources` and `curation_evidence_claims`. The cleanup's
+historical filenames are:
 
 ```text
 migrations/20260727_remove_unused_aircraft_curation_runs.sqlite.sql
 migrations/20260727_remove_unused_aircraft_curation_runs.postgres.sql
 ```
 
-For SQLite, back up the database and run:
-
-```sh
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260727_remove_unused_aircraft_curation_runs.sqlite.sql" \
-  "PRAGMA foreign_key_check;"
-```
-
 The cleanup preserves decisions, proposals, validated evidence, and usage
 accounting. It removes only the unused request/response dossier table and its
-two unused foreign-key columns, and is safe to run more than once.
+two unused foreign-key columns. Its historical implementation was idempotent,
+but the files are adopt-only provenance and are not a supported replay path;
+use the guarded manifest workflow for existing databases.
 
 The optional-dimension decision semantics are upgraded independently by:
 
@@ -1555,22 +1601,8 @@ generation and package decisions only. Canonical historical `not_an_entity`
 rows remain generic `reject`/`rejected` decisions because they were not
 validated under the new token, grounding, and catalog-relationship predicates;
 they are never retroactively approved. The migration fails closed on malformed
-legacy combinations and is safe to rerun. Rehearse it on a backup before
-applying it to a stopped writer:
-
-```sh
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260728_aircraft_identity_no_supported_selection.sqlite.sql" \
-  "PRAGMA foreign_key_check;" \
-  "PRAGMA integrity_check;"
-```
-
-For PostgreSQL, use:
-
-```sh
-psql -v ON_ERROR_STOP=1 "$DATABASE_URL" \
-  -f migrations/20260728_aircraft_identity_no_supported_selection.postgres.sql
-```
+legacy combinations. It is adopt-only under the versioned runner; its old
+rerun behavior is not an operator repair path.
 
 ## Aircraft Catalog Retrieval-Key Repair
 
@@ -1597,27 +1629,11 @@ alias. It does not merge or delete rows and preserves catalog IDs, approval
 decisions, assignments, projections, and aliases. Only the update side of the
 assigned/projected immutability barrier is suspended inside the repair
 transaction; delete protection remains active and the full barriers are
-restored before commit. The migration is safe to rerun.
+restored before commit. That historical file is adopt-only; the supported
+runner does not replay it.
 
-Stop writers, make a backup, and apply the SQLite repair with:
-
-```sh
-backup_path="data/aircost.pre-aircraft-catalog-retrieval-keys-$(date +%Y%m%d%H%M%S).sqlite3"
-cp --reflink=auto data/aircost.sqlite3 "$backup_path"
-sqlite3 -bail data/aircost.sqlite3 \
-  "PRAGMA foreign_keys=ON;" \
-  ".read migrations/20260729_aircraft_catalog_retrieval_keys.sqlite.sql" \
-  "SELECT id, name, normalized_name FROM aircraft_makes ORDER BY id;" \
-  "PRAGMA foreign_key_check;" \
-  "PRAGMA integrity_check;"
-```
-
-For PostgreSQL, use:
-
-```sh
-psql -v ON_ERROR_STOP=1 "$DATABASE_URL" \
-  -f migrations/20260729_aircraft_catalog_retrieval_keys.postgres.sql
-```
+The files are adopt-only provenance. A partial retrieval-key legacy state is
+not repaired by replay; diagnose it and restore a canonical database.
 
 ## Listing Aircraft Identity Assignment Migration
 
@@ -1649,8 +1665,8 @@ aliases are immutable. Both runtime admission and the database `ready` gate
 repeat this check. The ready-update trigger includes `model_year`, so changing a
 year cannot retain a stale make alias, generation, or factory-package scope.
 
-Apply the matching file after backing up and rehearsing on a copy. Existing
-listings are retained. A pre-migration `ready` row without a valid current
+The files document the historical transition and are not manually replayable.
+Existing listings are retained. A pre-migration `ready` row without a valid current
 assignment is unverified and quarantined with a precise migration reason; it
 is never grandfathered or deleted. Direct SQL also cannot insert or restore a
 `ready` row without the current assignment. Because the live curated hierarchy
@@ -1679,7 +1695,7 @@ fingerprint—including a null value exposed by a weakened receipt table—abort
 before subsequent domain statements execute. Operators must investigate a
 mismatch instead of rerunning a migration to heal the marker.
 
-Each of the 27 receipt-bearing PostgreSQL historical migration files pins its
+Each of the 25 receipt-bearing PostgreSQL historical migration files pins its
 transaction-local search path to `public`, `pg_catalog`, and an explicitly last
 `pg_temp`, then holds a transaction-wide `SHARE ROW EXCLUSIVE` lock on
 `public.schema_migration_contracts` from before its guard through the final
@@ -1689,7 +1705,7 @@ objects; shadows on the caller's search path are likewise ignored. The caller's
 search path is restored at commit. A ledger writer that started first must
 commit before the guard reads the receipt, while a later writer waits until the
 migration commits. The guard and domain statements therefore cannot observe
-different committed receipt states during one standalone rerun. Each of the 26
+different committed receipt states during one standalone rerun. Each of the 24
 receipt-bearing SQLite migration files obtains the corresponding write
 serialization from `BEGIN IMMEDIATE`.
 
@@ -1699,40 +1715,52 @@ reuse-attestation migrations. They update `installed_at` only while moving the
 exact predecessor fingerprint to the exact version-2 fingerprint. An exact
 version-2 rerun is a no-op, and any other predecessor is rejected.
 
-Canonical schema application during process startup is a separate provenance
-contract. Before executing canonical DDL, startup classifies every active
-migration as `Fresh`, `Installed`, or `Invalid`: only joint absence of its
-anchor and receipt is fresh, while an installed migration requires both its
-anchor and the exact receipt version and fingerprint. Every partial pairing,
-mismatch, or null marker is invalid. An existing receipt ledger must also match
-the canonical backend definition, including its table kind, columns, types,
-nullability, collation, timestamp default, primary key, check definitions and
-constraint flags. PostgreSQL additionally requires a permanent, non-inherited
-ordinary table and exactly one canonical permanent btree primary-key index,
-including its key, collation, operator class, options, and validity flags.
-Receipt reads use `ONLY public.schema_migration_contracts`, so a child table
-cannot supply a missing parent receipt. Invalid provenance is also any attached
-behavior: SQLite forbids ledger triggers and explicit indexes, while PostgreSQL
-forbids extra indexes, user triggers, rewrite rules, row-level security and
-policies, partition attachment, identity columns, and generated columns.
+Startup has three deliberately different paths. A genuinely fresh database
+receives canonical DDL, canonical history, receipts, and seed data once, on one
+serialized transaction. A supported pre-history database is never replayed:
+`db migrate --apply` first runs the frozen sequence-34 legacy-baseline
+attestation, installs the history bootstrap, and then applies any later suffix
+in manifest order. A warm versioned startup executes no canonical DDL and makes
+no seed or migration writes.
 
-Startup performs both complete provenance gates, every canonical DDL statement,
-and the developer seed on one real SQLx transaction connection. SQLite starts
-with `BEGIN IMMEDIATE`. PostgreSQL first takes the process-wide session advisory
-lock, determines whether the qualified public ledger exists, then starts a
-repeatable-read transaction; an existing ledger is locked in `SHARE ROW
-EXCLUSIVE` mode before the first transaction snapshot read. The transaction
-pins its local search path, runs the full preflight, applies the schema, and runs
-the full postflight before commit. PostgreSQL explicitly releases and verifies
-the session lock, and discards the connection on every path so a failed unlock
-cannot leak lock ownership into the pool. A failed preflight or late DDL/seed/
-postflight error rolls back all startup changes. Canonical receipt seeds are
-insert-only, so normal startup preserves every original `installed_at` value;
-unknown historical receipts are allowed and preserved rather than rewritten.
-Every normal and diagnostic PostgreSQL pool connection pins `search_path` to
-`public, pg_catalog, pg_temp` (with `pg_temp` explicitly last), so URL or role
-defaults cannot redirect preflight lookups or canonical DDL into
-attacker-controlled schemas.
+The warm gate verifies the exact history table and independent bootstrap
+marker, the immutable backend-filtered manifest prefix, and contract receipts
+owned by that installed prefix. A receipt registered to a pending migration is
+a partial installation and fails closed. Optional-exact historical receipts and
+unregistered legacy receipts are allowed only under their documented policy;
+every preexisting row—including `installed_at`—is preserved byte-for-byte
+across a migration transaction. A future migration adds a new immutable
+receipt under its own logical name; it must not rewrite an older receipt.
+
+Warm startup deliberately does not attest every domain trigger, routine, view,
+table, constraint, or index. That exhaustive current-state audit belongs to the
+read-only `db doctor` and CI schema-contract tests. PostgreSQL doctor also
+rejects nondefault public routine/view authority, per-column view ACLs, and
+non-`_RETURN` view rewrite rules. The one-time legacy-adoption preflight keeps
+the frozen full sequence-34 attestation because it must prove a pre-history
+database is safe to stamp; it is not the recurring warm path.
+
+Full object, seed, and domain-contract attestation belongs to `db doctor`, fresh
+initialization, and the frozen legacy-adoption preflight. Doctor runs from one
+raw read-only snapshot and can diagnose malformed, missing, or pending history
+that normal and public diagnostic connections refuse. Domain-only drift remains
+readable by normal and diagnostic connections but makes doctor invalid.
+Historical filenames in
+doctor output are provenance only: sequences 1–33 are adopt-only and must never
+be applied as a repair. Export recoverable data and restore a canonical backup
+for partial or drifted legacy states.
+
+SQLite serialization uses `BEGIN IMMEDIATE`. PostgreSQL holds the process-wide
+session advisory lock on a dedicated controller connection before the runner
+opens each repeatable-read snapshot; migration SQL therefore cannot release
+the controller's lock. The runner pins `pg_catalog, public, pg_temp` and locks
+the existing contract and history ledgers before its first snapshot read to
+wait out non-cooperating writers. Lock release is explicitly verified. Each
+executable body is checksum-verified before it is advertised, and its DDL, new
+history row, declared new contract receipt, receipt/history provenance
+postconditions, PostgreSQL public-schema authority check, and SQLite foreign-key
+check commit atomically. Failure closes or rolls back the runner session so
+PRAGMA or session state cannot leak.
 
 ## Listing Aircraft Compatibility Projection Migration
 
@@ -1744,8 +1772,9 @@ migrations/20260726_listing_aircraft_compatibility_projection.sqlite.sql
 migrations/20260726_listing_aircraft_compatibility_projection.postgres.sql
 ```
 
-Apply the matching file only after the `20260725_listing_aircraft_identity`
-identity v2 migration. Unresolved new listings use one immutable, schema-owned
+The manifest places this transition after the
+`20260725_listing_aircraft_identity` identity v2 migration. Both files are
+adopt-only. Unresolved new listings use one immutable, schema-owned
 placeholder hierarchy (`-1/-1/-1`). Parsed or manually entered labels are
 instead retained append-only in
 `aircraft_listing_identity_input_observations`. Those observations are
@@ -1787,46 +1816,9 @@ path unless a later evidence-backed operation explicitly consolidates or
 deletes them. They remain pending or quarantined and cannot become ready
 listings or valuation inputs merely because their text looks similar.
 
-Stop writers and back up the target before applying either backend migration.
-For SQLite, rehearse the exact order on a disposable copy:
-
-```sh
-rehearsal_db="$(mktemp /tmp/aircost-compatibility.XXXXXX.sqlite3)"
-cp data/aircost.sqlite3 "$rehearsal_db"
-sqlite3 -bail "$rehearsal_db" \
-  ".read migrations/20260725_listing_aircraft_identity.sqlite.sql" \
-  ".read migrations/20260726_listing_aircraft_compatibility_projection.sqlite.sql" \
-  "PRAGMA foreign_key_check;" \
-  "PRAGMA integrity_check;"
-rm -f "$rehearsal_db"
-```
-
-After a successful rehearsal, apply the same two files to the backed-up live
-database:
-
-```sh
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260725_listing_aircraft_identity.sqlite.sql" \
-  ".read migrations/20260726_listing_aircraft_compatibility_projection.sqlite.sql"
-```
-
-For PostgreSQL, restore a production backup into a disposable rehearsal
-database and run:
-
-```sh
-psql -v ON_ERROR_STOP=1 "$REHEARSAL_DATABASE_URL" \
-  -f migrations/20260725_listing_aircraft_identity.postgres.sql \
-  -f migrations/20260726_listing_aircraft_compatibility_projection.postgres.sql
-```
-
-Run the same fail-fast command against the stopped, backed-up live PostgreSQL
-database only after the rehearsal passes:
-
-```sh
-psql -v ON_ERROR_STOP=1 "$DATABASE_URL" \
-  -f migrations/20260725_listing_aircraft_identity.postgres.sql \
-  -f migrations/20260726_listing_aircraft_compatibility_projection.postgres.sql
-```
+Do not execute either historical file. A supported pre-history database must
+already match this exact sequence-34 shape before it can be attested and
+adopted.
 
 Verify either backend with:
 
@@ -1873,8 +1865,8 @@ rows from `PRAGMA foreign_key_check` and `ok` from `PRAGMA integrity_check`.
 
 ## Reference Catalog Publication Cutover
 
-Fresh databases include the strict reference publication contract. Upgrade an
-existing database with the backend-specific migration:
+Fresh databases include the strict reference publication contract. The
+backend-specific historical filenames are adopt-only provenance:
 
 ```text
 migrations/20260819_reference_catalog_cutover.sqlite.sql
@@ -1889,25 +1881,8 @@ airframe-depreciation, fit-metadata, and component-depreciation tables; none of
 their rows are copied into the immutable catalog. Any error, including a late
 contract-write failure, restores all seven legacy tables and their old triggers.
 Bounded applicability created outside the final universal serial-key contract
-fails the preflight before destructive work. Rehearse the SQLite migration on a
-consistent disposable backup:
-
-```sh
-rehearsal_db="$(mktemp /tmp/aircost-reference-cutover.XXXXXX.sqlite3)"
-sqlite3 data/aircost.sqlite3 ".backup '$rehearsal_db'"
-sqlite3 -bail "$rehearsal_db" \
-  ".read migrations/20260819_reference_catalog_cutover.sqlite.sql" \
-  "PRAGMA foreign_key_check;" \
-  "PRAGMA integrity_check;"
-rm -f "$rehearsal_db"
-```
-
-For PostgreSQL, restore a backup into a rehearsal database and run:
-
-```sh
-psql -v ON_ERROR_STOP=1 "$REHEARSAL_DATABASE_URL" \
-  -f migrations/20260819_reference_catalog_cutover.postgres.sql
-```
+fails attestation. Do not replay this destructive historical migration; use
+doctor and export/restore for a partial cutover.
 
 After the migration, grounded research and adjudication hand off a normalized
 JSON draft containing only approved decision IDs, validated evidence-claim
@@ -1982,8 +1957,8 @@ and serving. The final query must return no rows.
 ## Avionics Generic Feature-Label Migration
 
 Fresh databases reject the closed feature-only avionics vocabulary at both the
-application and database boundaries. Upgrade an existing database with the
-matching backend migration before starting the new binary:
+application and database boundaries. The matching historical filenames are
+adopt-only provenance:
 
 ```text
 migrations/20260824_avionics_generic_feature_labels.sqlite.sql
@@ -1997,23 +1972,17 @@ model updates, rewrite, demote, or delete a row, and therefore does not
 invalidate listing authorization proofs for otherwise valid products. If a
 label such as `Synthetic Vision`, Garmin's feature-only `SVT` shorthand,
 `SafeTaxi`, `FliteCharts`, or generic `ADS-B In/Out` is already approved,
-explicitly correct or demote that row and rerun the migration. Concrete labels
+explicitly correct or demote that row, then run `db doctor`; do not replay the
+historical migration. Concrete labels
 that merely include a feature annotation, such as
 `GTX 345 ADS-B In/Out`, remain admissible because the policy requires exact
 whole-label equality.
 
-```sh
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260824_avionics_generic_feature_labels.sqlite.sql" \
-  "PRAGMA foreign_key_check;" \
-  "PRAGMA integrity_check;"
-```
-
 ## Gemini Usage Accounting Migration
 
 Fresh databases receive `gemini_api_usage` from `schema/sqlite.sql` or
-`schema/postgres.sql`. Existing databases need the matching additive migration
-before any Gemini-enabled workflow or an executed benchmark can record usage:
+`schema/postgres.sql`. The matching historical filenames are adopt-only
+provenance:
 
 ```text
 migrations/20260723_gemini_usage_accounting.sqlite.sql
@@ -2022,18 +1991,8 @@ migrations/20260723_gemini_usage_accounting.postgres.sql
 
 The migration is idempotent and creates only the accounting table and its
 indexes; it does not alter listing, plugin, curation, catalog, or valuation
-data. Back up the database first. For SQLite, inspect the target and apply in
-fail-fast mode:
-
-```sh
-sqlite3 -readonly data/aircost.sqlite3 \
-  "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='gemini_api_usage');"
-sqlite3 -bail data/aircost.sqlite3 \
-  ".read migrations/20260723_gemini_usage_accounting.sqlite.sql"
-```
-
-For Postgres, apply the Postgres file with the client's stop-on-error option.
-The schema requires the estimated cost and pricing snapshot to be either both
+data. Do not replay it manually. The schema requires the estimated cost and
+pricing snapshot to be either both
 present or both null. If the provider omits any counter required for pricing,
 both remain null so unknown cost is distinguishable from a real zero-cost
 request.
@@ -2044,16 +2003,16 @@ request.
 table for current retained avionics occurrences. Its stable coordinate is the
 exact extraction hash plus occurrence array index and primary/replacement role.
 It stores only a verified product link or a bounded discard decision; unresolved
-observations remain solely in the pending-review bundle. Existing databases
-must apply the matching
-`20260819_listing_avionics_dispositions.{sqlite,postgres}.sql` migration before
-starting a binary that writes these receipts.
+observations remain solely in the pending-review bundle. Its historical
+`20260819_listing_avionics_dispositions.{sqlite,postgres}.sql` files are
+adopt-only; supported upgrades use the manifest-driven workflow.
 
 - Prefer non-null columns only for facts actually required and known at write
   time. Preserve unavailable observations as null; never turn an unknown
   component time into zero.
-- Do not embed migrations in Rust runtime code. During active development it is
-  acceptable to update schemas and reset local data.
+- Keep migration metadata in the manifest. Compile only `atomic` executable
+  bodies into the runner, keyed by exact sequence, logical name, and backend;
+  `adopt_only` bodies remain archival source and are never executable.
 - Avoid obsolete compatibility fields. If a field is no longer used, remove it
   from the schema and write path.
 - Do not store canonical/non-canonical duplicates unless both are needed by an

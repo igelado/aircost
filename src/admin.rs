@@ -32,7 +32,9 @@ use aircost_rs::avionics::{
     enrich_missing_avionics_metadata,
 };
 use aircost_rs::cleanup::cleanup_orphan_records;
-use aircost_rs::db::{database_url_from_arg, database_urls_equal, DEFAULT_DATABASE_PATH};
+use aircost_rs::db::{
+    database_url_from_arg, database_urls_equal, DEFAULT_DATABASE_PATH, DEFAULT_DATABASE_URL,
+};
 use aircost_rs::extract::GeminiListingExtractor;
 use aircost_rs::fit::fit_structural_valuation;
 use aircost_rs::gemini::benchmark::{
@@ -93,6 +95,23 @@ where
 async fn main() -> Result<()> {
     let command = parse_args(env::args().skip(1))?;
     match command {
+        AdminCommand::DbDoctor { database } => {
+            let report = aircost_rs::db::AppDb::migration_doctor(&database).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        AdminCommand::DbMigrate {
+            database,
+            apply,
+            expected_target_sha256,
+        } => {
+            let report = aircost_rs::db::AppDb::migrate_database(
+                &database,
+                apply,
+                expected_target_sha256.as_deref(),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         AdminCommand::PublishAircraftReference {
             database,
             draft,
@@ -993,6 +1012,14 @@ async fn import_faa_registry(
 
 #[derive(Debug)]
 enum AdminCommand {
+    DbDoctor {
+        database: String,
+    },
+    DbMigrate {
+        database: String,
+        apply: bool,
+        expected_target_sha256: Option<String>,
+    },
     PublishAircraftReference {
         database: String,
         draft: PathBuf,
@@ -1214,6 +1241,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
     };
 
     match command.as_str() {
+        "db" => parse_db_args(args),
         "publish-aircraft-reference" => parse_publish_aircraft_reference_args(args),
         "export-replay-manifest" => parse_export_replay_manifest_args(args),
         "import-replay-manifest" => parse_import_replay_manifest_args(args),
@@ -1242,6 +1270,96 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
         }
         _ => bail!("unknown admin command: {command}"),
     }
+}
+
+fn parse_db_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
+    parse_db_args_with_database_environment(args, std::env::var("AIRCOST_DATABASE_URL").ok())
+}
+
+fn parse_db_args_with_database_environment(
+    args: impl IntoIterator<Item = String>,
+    environment_database: Option<String>,
+) -> Result<AdminCommand> {
+    let mut args = args.into_iter();
+    let subcommand = args.next().context("db requires doctor or migrate")?;
+    let mut database = None;
+    let mut apply = false;
+    let mut execution_mode = None;
+    let mut expected_target_sha256 = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--database" | "--database-url" => {
+                database = Some(args.next().context("--database requires a value")?);
+            }
+            "--apply" | "--dry-run" if subcommand == "migrate" => {
+                if let Some(previous) = execution_mode {
+                    if previous == arg {
+                        bail!("{arg} may be supplied only once");
+                    }
+                    bail!("choose exactly one of --dry-run or --apply");
+                }
+                apply = arg == "--apply";
+                execution_mode = Some(arg);
+            }
+            "--expected-target-sha256" if subcommand == "migrate" => {
+                if expected_target_sha256.is_some() {
+                    bail!("--expected-target-sha256 may be supplied only once");
+                }
+                let value = args
+                    .next()
+                    .context("--expected-target-sha256 requires a value")?;
+                if value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    bail!("--expected-target-sha256 must be exactly 64 lowercase hexadecimal characters");
+                }
+                expected_target_sha256 = Some(value);
+            }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => bail!("unknown db {subcommand} argument: {arg}"),
+        }
+    }
+    if subcommand == "migrate" && apply && expected_target_sha256.is_none() {
+        bail!("db migrate --apply requires --expected-target-sha256");
+    }
+    match subcommand.as_str() {
+        "doctor" => Ok(AdminCommand::DbDoctor {
+            database: database_url_from_arg(database),
+        }),
+        "migrate" => Ok(AdminCommand::DbMigrate {
+            database: migration_database_url_from_sources(
+                database,
+                expected_target_sha256.as_deref(),
+                environment_database,
+            )?,
+            apply,
+            expected_target_sha256,
+        }),
+        _ => bail!("unknown db subcommand: {subcommand}"),
+    }
+}
+
+fn migration_database_url_from_sources(
+    explicit_database: Option<String>,
+    expected_target_sha256: Option<&str>,
+    environment_database: Option<String>,
+) -> Result<String> {
+    let selected = match (explicit_database, environment_database) {
+        (Some(database), _) => database,
+        (None, Some(database)) => database,
+        (None, None) if expected_target_sha256.is_some() => {
+            bail!(
+                "--expected-target-sha256 without --database requires AIRCOST_DATABASE_URL; refusing to use the default database"
+            )
+        }
+        (None, None) => DEFAULT_DATABASE_URL.to_owned(),
+    };
+    Ok(database_url_from_arg(Some(selected)))
 }
 
 fn parse_publish_aircraft_reference_args(
@@ -2438,7 +2556,7 @@ fn parse_enrich_avionics_args(args: impl IntoIterator<Item = String>) -> Result<
 
 fn print_usage() {
     println!(
-        "Usage:\n  aircost-admin publish-aircraft-reference --draft NORMALIZED.json [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin export-replay-manifest (--all-bound [--expected-capture-count COUNT] | --submission-id ID...) --output FILE [--readiness-output FILE] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Evaluates capture inventory and authenticity from one database snapshot. Dry-run prints readiness and writes nothing; --apply publishes a manifest only when ready and can publish the readiness report separately.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin seed-verified-catalog --source-database SOURCE --database TARGET [--catalog-fingerprint-sha256 HEX] [--dry-run | --apply]\n    Dry-run discovers the current verified catalog fingerprint without requiring it. After review, --apply requires that exact pinned fingerprint and installs only its catalog closure into the clean replay target. The operation is provider-free, serialized, transactional, and rejects a rerun.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; cumulative_gemini_usage reports historical phase usage rather than an apply forecast. Stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run validates the capture and checkpoint without provider calls and does not forecast --apply provider requirements. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls and does not forecast --apply provider requirements. --apply uses create-only normal admission and may make provider requests during aircraft or avionics analysis; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]"
+        "Usage:\n  aircost-admin db doctor [--database {DEFAULT_DATABASE_PATH}]\n    Inspects migration history and current schema from one read-only snapshot, including malformed or pending databases.\n  aircost-admin db migrate [--dry-run | --apply --expected-target-sha256 HEX] [--database {DEFAULT_DATABASE_PATH}]\n    Verifies the exact ordered suffix and compiled checksummed bodies. Dry-run is the default. A doctor-generated apply command requires AIRCOST_DATABASE_URL, binds the inspected target by nonsecret SHA-256, and must be used only after making and rehearsing a backup.\n  aircost-admin publish-aircraft-reference --draft NORMALIZED.json [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin export-replay-manifest (--all-bound [--expected-capture-count COUNT] | --submission-id ID...) --output FILE [--readiness-output FILE] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Evaluates capture inventory and authenticity from one database snapshot. Dry-run prints readiness and writes nothing; --apply publishes a manifest only when ready and can publish the readiness report separately.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin seed-verified-catalog --source-database SOURCE --database TARGET [--catalog-fingerprint-sha256 HEX] [--dry-run | --apply]\n    Dry-run discovers the current verified catalog fingerprint without requiring it. After review, --apply requires that exact pinned fingerprint and installs only its catalog closure into the clean replay target. The operation is provider-free, serialized, transactional, and rejects a rerun.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; cumulative_gemini_usage reports historical phase usage rather than an apply forecast. Stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run validates the capture and checkpoint without provider calls and does not forecast --apply provider requirements. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls and does not forecast --apply provider requirements. --apply uses create-only normal admission and may make provider requests during aircraft or avionics analysis; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]"
     );
     println!(
         "  aircost-admin stage-listing-reviews [--limit 100] [--listing-id LISTING_ID] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Prepares pending reviews from retained extraction data without Gemini, catalog writes, or listing-link writes; dry-run is the default."
@@ -2555,6 +2673,195 @@ mod tests {
     }
 
     #[test]
+    fn db_cli_supports_read_only_doctor_and_explicit_migration_apply() {
+        let target_sha256 = "0123456789abcdef".repeat(4);
+        assert!(matches!(
+            parse_args(
+                ["db", "doctor", "--database", "sqlite::memory:"]
+                    .into_iter()
+                    .map(str::to_string)
+            )
+            .unwrap(),
+            AdminCommand::DbDoctor {
+                ref database,
+            }
+            if database == "sqlite::memory:"
+        ));
+        assert!(matches!(
+            parse_args(
+                ["db", "migrate", "--database", "legacy.sqlite3"]
+                    .into_iter()
+                    .map(str::to_string)
+            )
+            .unwrap(),
+            AdminCommand::DbMigrate {
+                ref database,
+                apply: false,
+                ..
+            }
+            if database == "sqlite://legacy.sqlite3"
+        ));
+        assert!(matches!(
+            parse_args(
+                [
+                    "db",
+                    "migrate",
+                    "--apply",
+                    "--database",
+                    "legacy.sqlite3",
+                    "--expected-target-sha256",
+                    &target_sha256,
+                ]
+                    .into_iter()
+                    .map(str::to_string)
+            )
+            .unwrap(),
+            AdminCommand::DbMigrate {
+                apply: true,
+                expected_target_sha256: Some(ref expected),
+                ..
+            } if expected == &target_sha256
+        ));
+        assert!(parse_args(["db", "doctor", "--apply"].into_iter().map(str::to_string)).is_err());
+        let missing_target_guard = parse_args(
+            ["db", "migrate", "--apply", "--database", "legacy.sqlite3"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_target_guard.contains("--apply requires --expected-target-sha256"),
+            "{missing_target_guard}"
+        );
+        for (modes, expected_error) in [
+            (
+                ["--dry-run", "--dry-run"],
+                "--dry-run may be supplied only once",
+            ),
+            (["--apply", "--apply"], "--apply may be supplied only once"),
+            (
+                ["--dry-run", "--apply"],
+                "choose exactly one of --dry-run or --apply",
+            ),
+            (
+                ["--apply", "--dry-run"],
+                "choose exactly one of --dry-run or --apply",
+            ),
+        ] {
+            let error = parse_args(
+                ["db", "migrate", modes[0], modes[1]]
+                    .into_iter()
+                    .map(str::to_string),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected_error), "{error}");
+        }
+        assert!(
+            migration_database_url_from_sources(None, Some(&target_sha256), None)
+                .unwrap_err()
+                .to_string()
+                .contains("requires AIRCOST_DATABASE_URL")
+        );
+        let missing_environment = parse_db_args_with_database_environment(
+            [
+                "migrate",
+                "--apply",
+                "--expected-target-sha256",
+                &target_sha256,
+            ]
+            .into_iter()
+            .map(str::to_string),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_environment.contains("requires AIRCOST_DATABASE_URL"),
+            "{missing_environment}"
+        );
+        assert_eq!(
+            migration_database_url_from_sources(
+                None,
+                Some(&target_sha256),
+                Some("selected.sqlite3".to_owned()),
+            )
+            .unwrap(),
+            "sqlite://selected.sqlite3"
+        );
+        assert_eq!(
+            migration_database_url_from_sources(
+                Some("explicit.sqlite3".to_owned()),
+                Some(&target_sha256),
+                Some("conflicting-environment.sqlite3".to_owned()),
+            )
+            .unwrap(),
+            "sqlite://explicit.sqlite3"
+        );
+        let explicit_overrides_environment = parse_db_args_with_database_environment(
+            [
+                "migrate",
+                "--apply",
+                "--expected-target-sha256",
+                &target_sha256,
+                "--database",
+                "explicit.sqlite3",
+            ]
+            .into_iter()
+            .map(str::to_string),
+            Some("conflicting-environment.sqlite3".to_owned()),
+        )
+        .unwrap();
+        assert!(matches!(
+            explicit_overrides_environment,
+            AdminCommand::DbMigrate { database, .. }
+                if database == "sqlite://explicit.sqlite3"
+        ));
+        for malformed in [
+            "0",
+            "A23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "g23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ] {
+            let error = parse_args(
+                [
+                    "db",
+                    "migrate",
+                    "--database",
+                    "legacy.sqlite3",
+                    "--expected-target-sha256",
+                    malformed,
+                ]
+                .into_iter()
+                .map(str::to_string),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("64 lowercase hexadecimal"), "{error}");
+        }
+        let duplicate = parse_args(
+            [
+                "db",
+                "migrate",
+                "--database",
+                "legacy.sqlite3",
+                "--expected-target-sha256",
+                &target_sha256,
+                "--expected-target-sha256",
+                &target_sha256,
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            duplicate.contains("may be supplied only once"),
+            "{duplicate}"
+        );
+    }
+
+    #[test]
     fn publish_aircraft_reference_cli_requires_draft_and_explicit_apply() {
         let error = parse_args(
             ["publish-aircraft-reference"]
@@ -2649,6 +2956,11 @@ mod tests {
     async fn import_faa_registry_dry_run_keeps_postgres_rows_and_markers_unchanged() {
         let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
             .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        aircost_rs::db::AppDb::connect(&database_url)
+            .await
+            .unwrap()
+            .close()
+            .await;
         let archive_path = unique_test_path("faa-pg-dry-run", "zip");
         write_faa_archive_fixture(&archive_path);
         let pool = sqlx::postgres::PgPoolOptions::new()

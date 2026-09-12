@@ -18,6 +18,7 @@ sqlite_tests=(
   test_listing_avionics_association_corroborations.sh
   test_listing_avionics_collision_closure.sh
   test_listing_pending_reviews.sh
+  test_versioned_migration_manifest.sh
 )
 
 postgres_tests=(
