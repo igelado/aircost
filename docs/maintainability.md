@@ -289,7 +289,9 @@ Completion evidence:
   passed against the pinned PostgreSQL 17.11 service.
 - CI evidence: `fast`, `sqlite-contracts`, `postgres-contracts`, and `dnn` all
   passed for the primary implementation in Actions run
-  [34659645043](https://github.com/igelado/aircost/actions/runs/34659645043).
+  [34659645043](https://github.com/igelado/aircost/actions/runs/34659645043)
+  and for the follow-up in Actions run
+  [34664597761](https://github.com/igelado/aircost/actions/runs/34664597761).
 
 ### MNT-004 — Bound list reads and remove global cleanup from requests
 
@@ -433,7 +435,7 @@ Acceptance criteria:
 - Active branch: `codex/mnt-007a-db-executor-core`
 - Area: database abstraction
 - Backend scope: both
-- Depends on: none
+- Depends on: MNT-003
 
 Evidence:
 
