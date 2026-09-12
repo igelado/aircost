@@ -76,11 +76,11 @@ measurements when an item is completed.
 | --- | --- | --- | --- | --- | --- | --- |
 | MNT-001 | P0 | open | unassigned | persistence | both | Atomic application transactions |
 | MNT-002 | P0 | open | unassigned | review | both | One authoritative review-aspect model |
-| MNT-003 | P0 | in_progress | coder | database | both | Versioned, repairable startup and migrations |
+| MNT-003 | P0 | done | coder | database | both | Versioned, repairable startup and migrations |
 | MNT-004 | P0 | open | unassigned | listings | both | Bounded list reads and targeted cleanup |
 | MNT-005 | P0 | done | coder | tests/CI | both | CI executes the supported test inventory |
 | MNT-006 | P1 | open | unassigned | aircraft | both | One canonical aircraft identity write model |
-| MNT-007 | P1 | open | unassigned | database | both | Shared dual-backend execution boundary |
+| MNT-007 | P1 | in_progress | coder | database | both | Shared dual-backend execution boundary |
 | MNT-008 | P1 | open | unassigned | listing | both | Finish the legacy listing-module migration |
 | MNT-009 | P1 | open | unassigned | API/domain | none | Typed commands, pages, and error contracts |
 | MNT-010 | P1 | open | unassigned | catalog | both | One source for shared vocabularies and rules |
@@ -212,9 +212,8 @@ Acceptance criteria:
 ### MNT-003 — Replace schema replay with a versioned, repairable migration path
 
 - Priority: P0
-- Status: in_progress
+- Status: done
 - Owner: coder
-- Active branch: `codex/mnt-003-versioned-migrations`
 - Area: database/startup
 - Backend scope: both
 - Depends on: MNT-005
@@ -250,16 +249,49 @@ Preserved invariants:
 
 Acceptance criteria:
 
-- [ ] An up-to-date database does not replay `CREATE IF NOT EXISTS` schema SQL.
-- [ ] Startup reports the ordered pending migration set and one executable
+- [x] An up-to-date database does not replay `CREATE IF NOT EXISTS` schema SQL.
+- [x] Startup reports the ordered pending migration set and one executable
       command, rather than naming a migration that cannot repair the state.
-- [ ] `aircost-admin db doctor` reports ledger, shape, and repair diagnostics
+- [x] `aircost-admin db doctor` reports ledger, shape, and repair diagnostics
       without writing; migration apply supports dry-run and backup guidance.
-- [ ] Current-state object contracts come from canonical schema/manifest data,
+- [x] Current-state object contracts come from canonical schema/manifest data,
       not embedded historical migration bodies.
-- [ ] Warm startup of an up-to-date local SQLite database is below one second;
+- [x] Warm startup of an up-to-date local SQLite database is below one second;
       a PostgreSQL threshold is measured and recorded before implementation.
-- [ ] Hostile-schema and interrupted-migration tests pass for both backends.
+- [x] Hostile-schema and interrupted-migration tests pass for both backends.
+
+Completion evidence:
+
+- Owner: coder
+- PR/commit: [PR #163](https://github.com/igelado/aircost/pull/163) / merge
+  `0c9f1ab4f21767fa7d2a6c6031bcef6c1a680a30`; exact implementation head
+  `92a26c4ba53014c52efd8d2ee6cacbaa1c9c5601`. P2 follow-up
+  [PR #164](https://github.com/igelado/aircost/pull/164) / merge
+  `bc9a5e08153f98969fa949ffe6e562f3d1e4b7d0`; exact implementation head
+  `7de33e14e8e9ce03910cce938338e370cc168551`.
+- Completed: 2026-09-11
+- Before: warm PostgreSQL startup measured p50/p95
+  2,560,987/2,836,238 microseconds while startup replayed and attested the
+  canonical schema on every connection.
+- After: an immutable ordered ledger admits existing history and executes only
+  pending migrations; fresh databases apply the canonical schema once, while
+  the doctor command owns exhaustive diagnostics. Warm PostgreSQL startup
+  measured p50/p95 137/156 ms, and warm SQLite startup remained below one
+  second.
+- Follow-up: PR #164 made SQLite target identity byte-preserving on Unix, so a
+  database path containing raw non-UTF-8 bytes is hashed and revalidated
+  without lossy string conversion or a false identity match.
+- SQLite verification: manifest provenance, transactional migration,
+  interruption, hostile-control-table, history-immutability, and target-bound
+  apply coverage passed, including the raw non-UTF-8 identity regression.
+- PostgreSQL verification: manifest, advisory-serialization, hostile-schema,
+  read-only diagnostic, authority, interruption, and warm-start coverage
+  passed against the pinned PostgreSQL 17.11 service.
+- CI evidence: `fast`, `sqlite-contracts`, `postgres-contracts`, and `dnn` all
+  passed for the primary implementation in Actions run
+  [34659645043](https://github.com/igelado/aircost/actions/runs/34659645043)
+  and for the follow-up in Actions run
+  [34664597761](https://github.com/igelado/aircost/actions/runs/34664597761).
 
 ### MNT-004 — Bound list reads and remove global cleanup from requests
 
@@ -398,11 +430,12 @@ Acceptance criteria:
 ### MNT-007 — Centralize dual-backend execution without erasing dialect safety
 
 - Priority: P1
-- Status: open
-- Owner: unassigned
+- Status: in_progress
+- Owner: coder
+- Active branch: `codex/mnt-007a-db-executor-core`
 - Area: database abstraction
 - Backend scope: both
-- Depends on: none
+- Depends on: MNT-003
 
 Evidence:
 

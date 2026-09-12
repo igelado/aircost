@@ -116,7 +116,7 @@ explicit plan amendment.
 | Unit | Owner / branch | Must be merged first | File fence / integration note |
 |---|---|---|---|
 | MNT-005 | `coder` (Parfit review) — `codex/mnt-005-ci-test-inventory` | register branch | `.github/workflows/test.yml`, schema-test runner/registry, PG/DNN test selection; no migration redesign |
-| MNT-003 | `architect` -> `coder` (Parfit review) — `codex/mnt-003-versioned-migrations` | MNT-005 | `src/db.rs`, DB portions of `src/admin.rs`, `schema/**`, `migrations/**`, DB contract tests, `docs/database.md` |
+| MNT-003 | `architect` -> `coder` (Parfit review) — `codex/mnt-003-versioned-migrations` | MNT-005 | `src/db.rs`, DB portions of `src/admin.rs`, `schema/**`, `migrations/**`, DB contract tests, `docs/database.md`; approved exceptions: `src/catalog/projection/seed.rs` only for recognizing and validating exact ordered history, and `src/aircraft/reference/persistence.rs` only for test-only `AppDb` PostgreSQL fixture initialization |
 | MNT-018A | `coder` (Parfit review) — `codex/mnt-018a-pin-toolchains` | MNT-005 | CI toolchain/runner pins, `rust-toolchain.toml`, one Node version file, verification docs |
 | MNT-007A | `architect` -> `coder` (Lovelace review) — `codex/mnt-007a-db-executor-core` | MNT-003 | `src/db.rs`, new `src/db/**`; freeze the executor/transaction API after merge |
 | MNT-007B | `coder` (Lovelace review) — `codex/mnt-007b-db-executor-adoption` | MNT-007A | ordinary CRUD dispatch call sites and deletion of local macros; backend-specific SQL remains explicit |
