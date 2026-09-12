@@ -930,6 +930,52 @@ fn migration_target_identity_sha256(kind: DatabaseKind, identity: &[u8]) -> Stri
     format!("{:x}", digest.finalize())
 }
 
+fn sqlite_path_identity_bytes(path: &Path) -> Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        return Ok(path.as_os_str().as_bytes().to_vec());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        // Serialize every UTF-16 code unit in big-endian order so Windows paths,
+        // including unpaired surrogates, have an explicit lossless byte identity.
+        return Ok(path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_be_bytes)
+            .collect());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        path.to_str().map(|path| path.as_bytes().to_vec()).context(
+            "canonical SQLite database path cannot be represented losslessly on this platform",
+        )
+    }
+}
+
+fn sqlite_filename_path(filename: Vec<u8>) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        return Ok(PathBuf::from(OsString::from_vec(filename)));
+    }
+
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(filename)
+            .map(PathBuf::from)
+            .context("opened SQLite database filename is not valid UTF-8 on this platform")
+    }
+}
+
 fn validate_expected_target_sha256(value: &str) -> Result<()> {
     if value.len() == 64
         && value
@@ -2270,7 +2316,7 @@ impl AppDb {
     ) -> Result<String> {
         match &mut *connection {
             GateConnection::Sqlite(connection) => {
-                let rows = sqlx::query_as::<_, (i64, String, String)>("PRAGMA database_list")
+                let rows = sqlx::query_as::<_, (i64, String, Vec<u8>)>("PRAGMA database_list")
                     .fetch_all(&mut **connection)
                     .await?;
                 let filename = rows
@@ -2280,14 +2326,10 @@ impl AppDb {
                 let identity = if filename.is_empty() {
                     b"memory".to_vec()
                 } else {
-                    Path::new(&filename)
+                    let canonical_path = sqlite_filename_path(filename)?
                         .canonicalize()
-                        .with_context(|| {
-                            format!("could not canonicalize opened SQLite database {filename}")
-                        })?
-                        .to_string_lossy()
-                        .as_bytes()
-                        .to_vec()
+                        .context("could not canonicalize opened SQLite database path")?;
+                    sqlite_path_identity_bytes(&canonical_path)?
                 };
                 Ok(migration_target_identity_sha256(
                     DatabaseKind::Sqlite,
@@ -12764,8 +12806,8 @@ mod tests {
         canonical_sql_definition, canonical_startup_migration_contract_receipts,
         database_urls_equal, migration_required_message, migration_target_identity_sha256,
         postgres_approved_concrete_model_object_payload, postgres_reference_owned_objects_query,
-        split_sql_statements, sqlite_migration_definition, sqlite_table_definition,
-        target_bound_migration_command,
+        split_sql_statements, sqlite_migration_definition, sqlite_path_identity_bytes,
+        sqlite_table_definition, target_bound_migration_command,
         versioned_avionics_approved_concrete_model_object_fingerprint, AppDb, DatabaseBackend,
         DatabaseKind, MigrationReport, PostgresApprovedConcreteModelTriggerDefinition,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT,
@@ -12929,6 +12971,130 @@ mod tests {
             migration_target_identity_sha256(DatabaseKind::Sqlite, b"same"),
             migration_target_identity_sha256(DatabaseKind::Postgres, b"same")
         );
+        assert_eq!(
+            migration_target_identity_sha256(DatabaseKind::Sqlite, b"memory"),
+            "c123b2c95d37646b43faaee185e084feb312e642f1ba3d779e982cbb104b3c0c"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_path_identity_preserves_distinct_invalid_utf8_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(
+            sqlite_path_identity_bytes(std::path::Path::new("/srv/aircost.sqlite3")).unwrap(),
+            b"/srv/aircost.sqlite3"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory
+            .path()
+            .join(OsStr::from_bytes(b"target-\x80.sqlite3"));
+        let second_path = directory
+            .path()
+            .join(OsStr::from_bytes(b"target-\x81.sqlite3"));
+        std::fs::write(&first_path, b"first").unwrap();
+        std::fs::write(&second_path, b"second").unwrap();
+
+        let first_identity =
+            sqlite_path_identity_bytes(&first_path.canonicalize().unwrap()).unwrap();
+        let second_identity =
+            sqlite_path_identity_bytes(&second_path.canonicalize().unwrap()).unwrap();
+
+        assert_ne!(first_identity, second_identity);
+        assert!(std::str::from_utf8(&first_identity).is_err());
+        assert!(std::str::from_utf8(&second_identity).is_err());
+        assert_ne!(
+            migration_target_identity_sha256(DatabaseKind::Sqlite, &first_identity),
+            migration_target_identity_sha256(DatabaseKind::Sqlite, &second_identity)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sqlite_path_identity_serializes_windows_utf16_losslessly() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let first_path = PathBuf::from(OsString::from_wide(&[0x0061, 0xd800]));
+        let second_path = PathBuf::from(OsString::from_wide(&[0x0061, 0xd801]));
+        let first_identity = sqlite_path_identity_bytes(&first_path).unwrap();
+        let second_identity = sqlite_path_identity_bytes(&second_path).unwrap();
+
+        assert_eq!(first_identity, [0x00, 0x61, 0xd8, 0x00]);
+        assert_eq!(second_identity, [0x00, 0x61, 0xd8, 0x01]);
+        assert_ne!(
+            migration_target_identity_sha256(DatabaseKind::Sqlite, &first_identity),
+            migration_target_identity_sha256(DatabaseKind::Sqlite, &second_identity)
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_target_identity_keeps_sqlite_memory_sentinel() {
+        let db = sqlite_db_with_statements(&[]).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let mut connection = pool.acquire().await.unwrap();
+        let mut gate = super::GateConnection::Sqlite(&mut connection);
+
+        assert_eq!(
+            db.migration_target_identity_sha256_on(&mut gate)
+                .await
+                .unwrap(),
+            "c123b2c95d37646b43faaee185e084feb312e642f1ba3d779e982cbb104b3c0c"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_migration_guard_tracks_invalid_utf8_symlink_retargets() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first_setup_path = directory.path().join("first-setup.sqlite3");
+        let second_setup_path = directory.path().join("second-setup.sqlite3");
+        for database_path in [&first_setup_path, &second_setup_path] {
+            let database_url = format!("sqlite://{}", database_path.display());
+            AppDb::connect(&database_url).await.unwrap().close().await;
+        }
+
+        let first_target = directory
+            .path()
+            .join(OsStr::from_bytes(b"target-\x80.sqlite3"));
+        let second_target = directory
+            .path()
+            .join(OsStr::from_bytes(b"target-\x81.sqlite3"));
+        std::fs::rename(first_setup_path, &first_target).unwrap();
+        std::fs::rename(second_setup_path, &second_target).unwrap();
+
+        let alias = directory.path().join("active.sqlite3");
+        let alias_url = format!("sqlite://{}", alias.display());
+        symlink(&first_target, &alias).unwrap();
+        let first_report = AppDb::migration_doctor(&alias_url).await.unwrap();
+
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&second_target, &alias).unwrap();
+        let second_report = AppDb::migration_doctor(&alias_url).await.unwrap();
+
+        assert_ne!(
+            first_report.target_identity_sha256,
+            second_report.target_identity_sha256
+        );
+        assert!(!serde_json::to_string(&first_report)
+            .unwrap()
+            .contains(&alias_url));
+        let second_before = std::fs::read(&second_target).unwrap();
+        let error =
+            AppDb::migrate_database(&alias_url, true, Some(&first_report.target_identity_sha256))
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("migration target identity does not match"));
+        assert_eq!(std::fs::read(&second_target).unwrap(), second_before);
     }
 
     #[tokio::test]
